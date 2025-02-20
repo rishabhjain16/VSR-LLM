@@ -22,9 +22,12 @@ cd VSR-LLM
 pip install -r requirements.txt
 cd fairseq
 pip install --editable ./
-pip install omegaconf==2.0.4 
+pip install pip==24.0 
 pip install hydra-core==1.0.7 
+pip install omegaconf==2.0.4 
 pip install numpy==1.23.0
+pip install -U bitsandbytes
+pip install protobuf==3.20
  
 ```
 
