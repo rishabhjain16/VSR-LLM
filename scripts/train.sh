@@ -7,15 +7,16 @@
 
 
 # set variables
-DATA_PATH=???   # path to train dataset dir
-OUT_PATH=???    # output path to save 
+DATA_PATH=/home/rjain/data/lrs3    # path to train dataset dir
+
+OUT_PATH=/home/rjain/Experiments/VSR-LLM/checkpoints/training/output_AV_VOX_433_with_Vicuna1.5_lrs2_50kupdates_8bit    # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
-LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf   # path to llama checkpoint
-PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert
 
-# start training
+LLM_PATH=${ROOT}/checkpoints/vicuna-7b-v1.5
+PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert large_lrs3_iter5
+
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 fairseq-hydra-train \
     --config-dir ${SRC}/conf \

@@ -14,13 +14,18 @@ Move the checkpoint to [`checkpoints`](checkpoints/).
 ## Preparation
 
 ```
-conda create -n vsp-llm python=3.9 -y
-conda activate vsp-llm
-git clone https://github.com/Sally-SH/VSP-LLM.git
-cd VSP-LLM
+conda create -n vsr-llm python=3.9 -y
+conda activate vsr-llm
+git clone https://github.com/rishabhjain16/VSR-LLM.git
+cd VSR-LLM
+(If your pip version > 24.1, please run "pip install --upgrade pip==24.0")
 pip install -r requirements.txt
 cd fairseq
 pip install --editable ./
+pip install omegaconf==2.0.4 
+pip install hydra-core==1.0.7 
+pip install numpy==1.23.0
+ 
 ```
 
 - Download AV-HuBERT pre-trained model `AV-HuBERT Large (LSR3 + VoxCeleb2)` from [here](http://facebookresearch.github.io/av_hubert).

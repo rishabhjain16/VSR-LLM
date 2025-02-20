@@ -285,19 +285,19 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
         encoder.w2v_model.remove_pretraining_modules()
         
-        # bnb_config = BitsAndBytesConfig(
-        #     load_in_4bit=True,
-        #     bnb_4bit_use_double_quant=True,
-        #     bnb_4bit_quant_type="nf4",
-        #     bnb_4bit_compute_dtype=torch.bfloat16
-        # )
-
         bnb_config = BitsAndBytesConfig(
-            load_in_8bit=True,  # Load in 8-bit instead of 4-bit
-            bnb_8bit_use_double_quant=True,  # Use double quantization
-            bnb_8bit_quant_type="nf8",  # Assume nf8 is a valid quantization type for 8-bit
-            bnb_8bit_compute_dtype=torch.bfloat16  # Use float16 for computation
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
         )
+
+        # bnb_config = BitsAndBytesConfig(
+        #     load_in_8bit=True,  # Load in 8-bit instead of 4-bit
+        #     bnb_8bit_use_double_quant=True,  # Use double quantization
+        #     bnb_8bit_quant_type="nf8",  # Assume nf8 is a valid quantization type for 8-bit
+        #     bnb_8bit_compute_dtype=torch.bfloat16  # Use float16 for computation
+        # )
 
         decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path, quantization_config=bnb_config)            
         #decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path)            
