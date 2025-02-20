@@ -1,12 +1,9 @@
 # VSP-LLM (Visual Speech Processing incorporated with LLMs)
 
-This is the PyTorch code for [Where Visual Speech Meets Language: VSP-LLM Framework for Efficient and Context-Aware Visual Speech Processing](https://arxiv.org/abs/2402.15151). This code is developed on the code of [AV-HuBERT](https://github.com/facebookresearch/av_hubert).
 
 ## Introduction
 
-We propose a novel framework, namely Visual Speech Processing incorporated with LLMs (VSP-LLM), to maximize the context modeling ability by bringing the overwhelming power of LLMs. Specifically, VSP-LLM is designed to perform multi-tasks of visual speech recognition and translation, where the given instructions control the type of task. The input video is mapped to the input latent space of a LLM by employing a self-supervised visual speech model. Focused on the fact that there is redundant information in input frames, we propose a novel deduplication method that reduces the embedded visual features by employing visual speech units. Through the proposed deduplication and Low Rank Adaptors (LoRA), VSP-LLM can be trained in a computationally efficient manner.
-
-![vsr-vst](docs/demo.gif)
+WORK IN PROGRESS
 
 ## Model checkpoint
 
