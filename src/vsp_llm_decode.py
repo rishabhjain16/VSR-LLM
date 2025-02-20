@@ -109,9 +109,43 @@ def _main(cfg, output_file):
 
     utils.import_user_module(cfg.common)
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.override.llm_ckpt_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.override.llm_ckpt_path
+    )
+
+    # # Ensure the pad token exists; if not, add it
+    # if tokenizer.pad_token is None:
+    #     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    # # Set pad_token and padding_side separately
+    # tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.padding_side = "left"
+    # tokenizer.truncation_side = "left"
+
     model_override_cfg = {'model':{'llm_ckpt_path':cfg.override.llm_ckpt_path}}
+
+    # model_override_cfg = {
+    #     'model': {
+    #         'llm_ckpt_path': cfg.override.llm_ckpt_path,
+    #         'generation_params': {
+    #             'remove_invalid_values': True,
+    #             #'early_stopping': True,
+    #             #'no_repeat_ngram_size': 4,
+    #             #'max_new_tokens': cfg.generation.max_len_b,
+    #             #'min_length': 1,
+    #             'num_beams': cfg.generation.beam,
+    #             'length_penalty': cfg.generation.lenpen
+    #         }
+    #     }
+    # }
+    def post_process_output(hyp):
+        # Remove padding tokens
+        hyp = hyp.replace(tokenizer.pad_token, "")
+        # Remove trailing hashes
+        hyp = hyp.rstrip('#')
+        return hyp
+    
     models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([cfg.common_eval.path],model_override_cfg,strict=False)
+    task.post_process = post_process_output
     models = [model.eval() for model in models]
     saved_cfg.task.modalities = cfg.override.modalities
     task = tasks.setup_task(saved_cfg.task)
@@ -155,7 +189,7 @@ def _main(cfg, output_file):
 
     # Load dataset (possibly sharded)
     cfg.dataset.batch_size = 1
-    cfg.dataset.max_tokens = 1000
+    cfg.dataset.max_tokens = 2000
     itr = task.get_batch_iterator(
         dataset=task.dataset(cfg.dataset.gen_subset),
         max_tokens=cfg.dataset.max_tokens,
@@ -186,7 +220,11 @@ def _main(cfg, output_file):
         chars = dictionary.string(x, extra_symbols_to_ignore=symbols_ignore)
         words = " ".join("".join(chars.split()).replace('|', ' ').split())
         return words
-
+    
+    def post_process(text):
+        # Remove trailing '#' and '!'
+        return text.rstrip('#').rstrip('!').strip()
+    
     num_sentences = 0
     has_target = True
     wps_meter = TimeMeter()
@@ -198,19 +236,62 @@ def _main(cfg, output_file):
             continue
         
         sample['net_input']['source']['video'] = sample['net_input']['source']['video'].to(torch.half)
-        best_hypo = model.generate(target_list=sample["target"], 
-                                   num_beams=cfg.generation.beam, 
-                                   length_penalty=cfg.generation.lenpen,
-                                   **sample["net_input"])
+        
+        # best_hypo = model.generate(
+        #     target_list=sample["target"], 
+        #     num_beams=cfg.generation.beam, 
+        #     length_penalty=cfg.generation.lenpen,
+        #     pad_token_id=tokenizer.pad_token_id,       # Correctly set pad_token_id
+        #     eos_token_id=tokenizer.eos_token_id,       # Correctly set eos_token_id
+        #     attention_mask=sample["net_input"].get("attention_mask"),
+        #     **sample["net_input"]
+        # )
+        eos_token_id = tokenizer.convert_tokens_to_ids("Transcript:")
+        best_hypo = model.generate(
+            target_list=sample["target"], 
+            num_beams=cfg.generation.beam,
+            #max_length=cfg.generation.max_len_b,
+            #min_length=cfg.generation.min_len,
+            length_penalty=cfg.generation.lenpen,
+            #no_repeat_ngram_size=cfg.generation.no_repeat_ngram_size,
+            #temperature=0.1 ,  # Added temperature
+            #repetition_penalty=1.5,  # Increased penalty
+            #top_p=0.9,  # Added nucleus sampling
+            #pad_token_id=tokenizer.pad_token_id,
+            #eos_token_id=eos_token_id,
+            #attention_mask=sample["net_input"].get("attention_mask"),
+            **sample["net_input"]
+        )
+        import re
+
+        def clean_hyp_output(hyp_text):     
+            hyp_text = re.sub(r"[#]+", "", hyp_text)  # Remove '#' artifacts
+            sentences = hyp_text.split(". ")  # Split by sentence
+            seen = set()
+            cleaned_hyp = []
+
+            for sentence in sentences:
+                if sentence not in seen:
+                    cleaned_hyp.append(sentence)
+                    seen.add(sentence)
+
+            return ". ".join(cleaned_hyp).strip()
+        
         best_hypo = tokenizer.batch_decode(
                 best_hypo, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
+        #best_hypo = [post_process(hyp) for hyp in best_hypo]
+        #best_hypo = [clean_hyp_output(hyp) for hyp in best_hypo]
+        #best_hypo = [hyp.rstrip('#').rstrip('!') for hyp in best_hypo]
         for i in range(len(sample["id"])):
             result_dict['utt_id'].append(sample['utt_id'][i])
             target = sample['target'][i].masked_fill(
                 sample['target'][i] == -100, 0
             )
             ref_sent = tokenizer.decode(target.int().cpu(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            #ref_sent = ref_sent.rstrip('#').rstrip('!')
+            #ref_sent = post_process(ref_sent)
+            #ref_sent = clean_hyp_output(ref_sent)
             result_dict['ref'].append(ref_sent)
             hypo_str = best_hypo[i]
             instruction = tokenizer.decode(sample['net_input']['source']['text'][i].int().cpu(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
@@ -237,6 +318,7 @@ def _main(cfg, output_file):
             fo.write(f"err / num_ref_words = {n_err} / {n_total}\n\n")
             fo.write(f"{yaml_str}")
         logger.info(f"WER: {wer}%")
+        logger.info("Tokenizer name: %s", getattr(tokenizer, "name_or_path", "Unknown"))
     else:
         bleu = sacrebleu.corpus_bleu(result_dict['hypo'], [result_dict['ref']])
         bleu_score = bleu.score

@@ -21,6 +21,7 @@ from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.models import BaseFairseqModel, FairseqEncoder, register_model
 from fairseq.models.hubert.hubert import MASKING_DISTRIBUTION_CHOICES
 from omegaconf import II, MISSING
+import contextlib
 
 logger = logging.getLogger(__name__)
 
@@ -284,14 +285,22 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
         encoder.w2v_model.remove_pretraining_modules()
         
+        # bnb_config = BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_quant_type="nf4",
+        #     bnb_4bit_compute_dtype=torch.bfloat16
+        # )
+
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16
+            load_in_8bit=True,  # Load in 8-bit instead of 4-bit
+            bnb_8bit_use_double_quant=True,  # Use double quantization
+            bnb_8bit_quant_type="nf8",  # Assume nf8 is a valid quantization type for 8-bit
+            bnb_8bit_compute_dtype=torch.bfloat16  # Use float16 for computation
         )
 
         decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path, quantization_config=bnb_config)            
+        #decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path)            
 
         config = LoraConfig(
             r=16, 
@@ -350,11 +359,13 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
     @torch.no_grad()
     def generate(self,
                 num_beams=20,
+                #no_repeat_ngram_size=3,
                 max_length=30,
                 min_length=1,
                 top_p=0.9,
                 repetition_penalty=1.0,
                 length_penalty=0.0,
+                #length_penalty=1,
                   **kwargs,
                 ):
         output = self.encoder(**kwargs)
@@ -379,15 +390,27 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         instruction_embedding = self.decoder.model.model.embed_tokens(instruction)
         llm_input = torch.cat((instruction_embedding, reduced_enc_out), dim=1) 
 
+        if 'pad_token_id' not in kwargs:
+            kwargs['pad_token_id'] = self.decoder.config.pad_token_id
+        if 'eos_token_id' not in kwargs:
+            kwargs['eos_token_id'] = self.decoder.config.eos_token_id
+
         self.decoder.config.use_cache = True
+        #max_new_tokens = 128
+        #max_new_tokens= min(kwargs['source']['text'].shape[1] * 2, 512) 
         outputs = self.decoder.generate(inputs_embeds=llm_input,
                         top_p=top_p,
                         num_beams=num_beams,
-                        max_new_tokens=max_length,
+                        #max_length=max_length,
                         min_length=min_length,
+                        max_new_tokens=max_length,
                         repetition_penalty=repetition_penalty,
                         do_sample=True,
+                        early_stopping=True,
                         length_penalty=length_penalty,
+                        #pad_token_id=kwargs['pad_token_id'],
+                        #eos_token_id=kwargs['eos_token_id'],
+                        #attention_mask=kwargs.get('attention_mask', None)
                         )
 
         return outputs

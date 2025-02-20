@@ -93,7 +93,6 @@ def load_label(label_path, inds, tot):
         labels = [labels[i] for i in inds]
     return labels
 
-
 def load_label_offset(label_path, inds, tot):
     with open(label_path) as f:
         code_lengths = [len(line.encode("utf-8")) for line in f]
@@ -143,6 +142,7 @@ def verify_label_lengths(
             f"total {num_invalid} (audio, label) pairs with mismatched lengths"
         )
 
+from transformers import AutoTokenizer
 
 class VSP_LLM_dataset(FairseqDataset):
     def __init__(
@@ -174,6 +174,16 @@ class VSP_LLM_dataset(FairseqDataset):
             noise_snr=0,
             noise_num=1
     ):
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path, trust_remote_code=True, use_fast=False)
+        # Ensure the pad token exists; if not, add it
+        if self.llm_tokenizer.pad_token is None:
+            self.llm_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        
+        # Set pad_token and padding_side separately
+        self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
+        self.llm_tokenizer.padding_side = "left"
+        self.llm_tokenizer.truncation_side = "left"
+
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
             if isinstance(label_rates, int)
@@ -185,7 +195,6 @@ class VSP_LLM_dataset(FairseqDataset):
         self.stack_order_audio = stack_order_audio
         self.shuffle = shuffle
         self.random_crop = random_crop
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path)
         self.num_labels = len(label_paths)
         self.single_target = single_target
         self.store_labels = store_labels
@@ -341,8 +350,45 @@ class VSP_LLM_dataset(FairseqDataset):
         mixed = mixed.astype(np.int16)
         return mixed
 
-
     def __getitem__(self, index):
+        video_feats, audio_feats = self.load_feature(self.names[index])
+        audio_feats, video_feats = torch.from_numpy(audio_feats.astype(np.float32)) if audio_feats is not None else None, torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
+        if self.normalize and 'audio' in self.modalities:
+            with torch.no_grad():
+                audio_feats = F.layer_norm(audio_feats, audio_feats.shape[1:])
+        cluster_counts = self.load_units(index)
+        labels = [self.llm_tokenizer(self.label_list[0][index], return_tensors="pt").input_ids[0]]
+        labels = [torch.cat((labels[0], torch.tensor([2]).long()))]
+        
+        fid = self.names[index][1].split(':')[1]
+        # Define the system message
+        #system_message = "Please transcribe the following video input to English text."
+
+        # Define the user message
+        #user_message = "Input: {video_input}"
+
+        # Construct the prompt using Llama 3's format
+        # prompt = (
+        #     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+        #     f"{system_message}<|eot_id|><|start_header_id|>user<|end_header_id|>\n"
+        #     f"{user_message}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        # )
+        prompt = "Recognize these video-input lip reading features in English. Input : "
+
+        #prompt = f"<|start_header_id|>user<|end_header_id|> Recognize this speech in English. Input : <|eot_id|>"
+        # Tokenize the prompt
+        ##txt_feats = self.llm_tokenizer(prompt, return_tensors="pt",truncation=True, max_length=500).input_ids[0]
+
+        #prompt = f"<|start_header_id|>user<|end_header_id|> Recognize this speech in English. Input : <|eot_id|>"
+        #txt_feats = self.llm_tokenizer(prompt, return_tensors="pt").input_ids[0]
+        #txt_feats = self.llm_tokenizer(f"Recognize this speech in English. Input : ", return_tensors="pt").input_ids[0]
+
+        txt_feats = self.llm_tokenizer(prompt, return_tensors="pt").input_ids[0]
+
+        
+        return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, "cluster_counts": cluster_counts, "label_list": labels, 'text_source':[txt_feats]}
+    
+    def __getitem__Old(self, index):
         video_feats, audio_feats = self.load_feature(self.names[index])
         audio_feats, video_feats = torch.from_numpy(audio_feats.astype(np.float32)) if audio_feats is not None else None, torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
         if self.normalize and 'audio' in self.modalities:
