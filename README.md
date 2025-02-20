@@ -4,7 +4,8 @@
 ## Introduction
 
 WORK IN PROGRESS
-
+This code is Forked from: https://github.com/Sally-SH/VSP-LLM
+We are working to update it for specific usecase of using Avhubert for Visucal Speech Recognition
 ## Model checkpoint
 
 You can find checkpoint of our model in [here](https://drive.google.com/drive/folders/1aBnm8XOWlRAGjPwcK2mYEGd8insNCx13?usp=sharing).
