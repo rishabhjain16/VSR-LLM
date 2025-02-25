@@ -312,3 +312,6 @@ for data_filename in tqdm(filenames):
                 )
             )
 f.close()
+
+
+# Example Usage: python preprocess_lrs2_in_lrs3_style.py --data-dir /data/ssd2/data_rishabh/lrs2 --landmarks-dir /data/ssd2/data_rishabh/lrs2/LRS2_landmarks --detector mediapipe --root-dir /data/ssd2/data_rishabh/lrs2/training --dataset lrs2 --subset val

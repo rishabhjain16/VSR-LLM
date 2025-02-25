@@ -21,6 +21,8 @@ Before feeding the raw stream into our model, each video sequence has to undergo
 
 ```Shell
 pip install -r requirements.txt
+pip install torch torchvision torchaudio pytorch-lightning sentencepiece av 
+pip install opencv-python==4.6.0.66
 ```
 
 2. Install [retinaface](./tools) or [mediapipe](https://pypi.org/project/mediapipe/) tracker.
@@ -51,6 +53,12 @@ python preprocess_lrs2lrs3.py \
     --seg-duration [seg_duration] \
     --groups [n] \
     --job-index [j]
+```
+
+This was the original script, however I have modified it to run it more smoothly:
+
+```
+python preprocess_lrs2_in_lrs3_style.py --data-dir /data/ssd2/data_rishabh/lrs2 --landmarks-dir /data/ssd2/data_rishabh/lrs2/LRS2_landmarks --detector mediapipe --root-dir /data/ssd2/data_rishabh/lrs2/training --dataset lrs2 --subset val
 ```
 
 ### Arguments

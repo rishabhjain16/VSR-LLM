@@ -80,7 +80,7 @@ def main():
         else:
             train.append(data_item)
 
-    output_dir = f"{args.lrs2}/lrs2_sentence"
+    output_dir = f"{args.lrs2}/data_lrs2"
     print("Setting up processed data directory")
     setup_target(output_dir, train, valid, test)
 

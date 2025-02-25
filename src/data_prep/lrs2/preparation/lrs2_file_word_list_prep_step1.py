@@ -54,7 +54,7 @@ def get_file_label(lrs2_root):
 # Main function
 def main():
     # Set the root directory for LRS2 dataset
-    lrs2_root = '/data/ssd2/data_rishabh/lrs2/processed/'
+    lrs2_root = '/data/ssd2/data_rishabh/lrs2/segmented/'
 
     # Run the function to generate file.list and label.list
     get_file_label(lrs2_root)
