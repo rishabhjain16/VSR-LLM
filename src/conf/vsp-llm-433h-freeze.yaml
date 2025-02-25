@@ -54,7 +54,7 @@ criterion:
 
 optimization:
   max_update: 30000
-  lr: [0.0005]
+  lr: [0.00005]
   sentence_avg: true
   update_freq: [8]
 
