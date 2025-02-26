@@ -1,6 +1,6 @@
 Cleaning and processing wildVSR dataset for inference:
 
-1. Download the dataset from [here](https://github.com/wildsr/wildsr-wildvrs-dataset)
+1. Download the dataset from [here](https://github.com/YasserdahouML/VSR_test_set)
 2. Extract the dataset
 3. Run the script to clean and process the dataset
 
@@ -9,7 +9,7 @@ python test_prep.py /path/to/wildVSR/dataset
 ```
 This will create a test.tsv and test.wrd file in the output directory.
 
-4. After running the script, you will have to run Clustering script to get the labels for the dataset. Follow the procedure method in [Clustering](../src/clustering/README.md)
+4. After running the script, you will have to run Clustering script to get the labels for the dataset. Follow the procedure method in [Clustering](https://github.com/rishabhjain16/VSR-LLM/tree/main/src/clustering)
 
 4.1 Extract the features for the wildVSR dataset. Use the following script in clustering folder.
 
