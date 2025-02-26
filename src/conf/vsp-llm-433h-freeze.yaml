@@ -44,8 +44,8 @@ dataset:
   validate_after_updates: 0
   validate_interval: 1
   train_subset: train
-  valid_subset: test
-  batch_size: 1
+  valid_subset: valid
+  batch_size: 4
 
 criterion:
   _name: decoder_only_language_modeling_loss
@@ -53,8 +53,8 @@ criterion:
   label_smoothing: 0.1
 
 optimization:
-  max_update: 30000
-  lr: [0.00005]
+  max_update: 35000
+  lr: [0.0005]
   sentence_avg: true
   update_freq: [8]
 
@@ -90,7 +90,7 @@ model:
   feature_grad_mult: 1.0
   encoder_embed_dim: 1024
   decoder_embed_dim: 4096
-  freeze_finetune_updates: 40000
+  freeze_finetune_updates: 25000
 
 
 hydra:

@@ -167,3 +167,7 @@ outputs/
 checkpoints/
 decode/
 
+
+scripts/decode.sh
+scripts/train.sh
+src/conf/vsp-llm-433h-freeze.yaml

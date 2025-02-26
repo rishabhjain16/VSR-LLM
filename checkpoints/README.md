@@ -5,7 +5,8 @@ Please move the following checkpoints to here.
 - VSP-LLM checkpoints (checkpoint_freeze.pt, checkpoint_finetune.pt)
 
 
-# To download models from Hugging Face:
+
+To download models from Hugginf Face:
 
 1. pip install -U "huggingface_hub[cli]" 
 2. git config --global credential.helper store 
