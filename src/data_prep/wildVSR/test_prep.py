@@ -1,6 +1,18 @@
 import os
 import sys
 import json
+import unicodedata
+import re
+
+# Function to normalize text
+def normalize_text(text):
+    # Convert text to lowercase
+    text = text.lower()
+    # Remove punctuation and special characters
+    text = re.sub(r'[^\w\s]', '', text)
+    # Normalize unicode characters
+    text = unicodedata.normalize("NFKD", text)
+    return text
 
 # Check if directory path is provided
 if len(sys.argv) < 2:
@@ -98,7 +110,8 @@ try:
     output_wrd = os.path.join(output_dir, "test.wrd")
     with open(output_wrd, 'w') as f:
         for transcript in data.values():
-            f.write(f"{transcript}\n")
+            normalized_transcript = normalize_text(transcript)
+            f.write(f"{normalized_transcript}\n")
     
     print(f"Created {output_tsv} with {len(data)} entries")
     print(f"Created {output_wrd} with {len(data)} entries")
