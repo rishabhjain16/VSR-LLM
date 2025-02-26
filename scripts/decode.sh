@@ -13,17 +13,23 @@ MODEL_SRC=${ROOT}/src
 
 #LLM_PATH=${ROOT}/checkpoints/vicuna-7b-v1.5    # path to llama checkpoint
 LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf  
-DATA_ROOT=/home/rjain/data/lrs3/433h_data/    # path to test dataset dir
+#DATA_ROOT=/home/rjain/data/lrs3/433h_data/    # path to test dataset dir
 #DATA_ROOT=/home/rishabh/Desktop/Dataset/lrs2likelrs3/lrs2_video_seg16s/data_lrs2
+DATA_ROOT=/home/rishabh/Desktop/Datasets/WildVSR/test_data
 
+
+MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt  
 #MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
-MODEL_PATH=/home/rjain/Experiments/VSR-LLM/checkpoints/training/output_AV_VOX_433_with_Vicuna1.5_test/checkpoints/checkpoint_best.pt
+#MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
 ##MODEL_PATH=/home/rjain/experiments/VSR-LLM/checkpoints/checkpoint_finetune.pt
 #MODEL_PATH=/home/rjain/experiments/VSR-LLM/checkpoints/checkpoint_vicuna_lrs3_50k.pt
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_l3Prompt/checkpoints/checkpoint_best.pt
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_UnordodoxPromptNew_bs4/checkpoints/checkpoint_best.pt
+
+
 #OUT_PATH=${ROOT}/decode/decode_vsp_433_freeze_my_training_llama_3.2_1B_T3_l3_UnordPrompt_infer_normal_prompt_9feb_lrs3_ck_8_70k_debug_lrs3    # output path to save
-OUT_PATH=${ROOT}/checkpoints/decode/decode_test_mytrained_lora_32
+#OUT_PATH=${ROOT}/checkpoints/decode/decode_test_mytrained_lora_32
+OUT_PATH=${ROOT}/checkpoints/decode/decode_test
 
 # fix variables based on langauge
 if [[ $LANG == *"-"* ]] ; then
