@@ -1,5 +1,5 @@
 
-unit_pth = r"/data/ssd2/data_rishabh/lrs2/processed/lrs2/lrs2_video_seg24s/km_labels_lrs2/valid_0_1.km"
+unit_pth = r"/home/rishabh/Desktop/Datasets/WildVSR/test_data/test_0_1.km"
 units = open(unit_pth).readlines()
 count_list = []
 for unit_line in units:

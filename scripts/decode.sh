@@ -16,9 +16,9 @@ DATA_ROOT=/data/ssd2/data_rishabh/lrs3/433h_data   # path to test dataset dir
 # DATA_ROOT=/data/ssd2/data_rishabh/lrs2/processed/lrs2/lrs2_video_seg24s/lrs2_data
 #DATA_ROOT=/home/rishabh/Desktop/Dataset/lrs2likelrs3/lrs2_video_seg16s/data_lrs2
 
-#MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
+MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt  # path to trained model
 
-MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
+#MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_l3Prompt/checkpoints/checkpoint_best.pt
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_UnordodoxPromptNew_bs4/checkpoints/checkpoint_best.pt
 #OUT_PATH=${ROOT}/decode/decode_vsp_433_freeze_my_training_llama_3.2_1B_T3_l3_UnordPrompt_infer_normal_prompt_9feb_lrs3_ck_8_70k_debug_lrs3    # output path to save
