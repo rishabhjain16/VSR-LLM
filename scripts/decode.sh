@@ -11,10 +11,13 @@ LANG=en    # language direction (e.g 'en' for VSR task / 'en-es' for En to Es VS
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 MODEL_SRC=${ROOT}/src
 
+
+
 LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf    # path to llama checkpoint
-DATA_ROOT=/data/ssd2/data_rishabh/lrs3/433h_data   # path to test dataset dir
+#DATA_ROOT=/data/ssd2/data_rishabh/lrs3/433h_data   # path to test dataset dir
 # DATA_ROOT=/data/ssd2/data_rishabh/lrs2/processed/lrs2/lrs2_video_seg24s/lrs2_data
 #DATA_ROOT=/home/rishabh/Desktop/Dataset/lrs2likelrs3/lrs2_video_seg16s/data_lrs2
+DATA_ROOT=/home/rishabh/Desktop/Datasets/WildVSR/test_data
 
 MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt  # path to trained model
 
