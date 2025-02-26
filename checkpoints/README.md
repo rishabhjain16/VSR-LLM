@@ -6,7 +6,7 @@ Please move the following checkpoints to here.
 
 
 
-To download models from Hugginf Face:
+To download models from Hugging Face:
 
 1. pip install -U "huggingface_hub[cli]" 
 2. git config --global credential.helper store 

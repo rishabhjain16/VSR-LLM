@@ -12,7 +12,7 @@ ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 MODEL_SRC=${ROOT}/src
 
 #LLM_PATH=${ROOT}/checkpoints/vicuna-7b-v1.5    # path to llama checkpoint
-LLM_PATH=${ROOT}/checkpoints/vicuna-7b-v1.5
+LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf  
 DATA_ROOT=/home/rjain/data/lrs3/433h_data/    # path to test dataset dir
 #DATA_ROOT=/home/rishabh/Desktop/Dataset/lrs2likelrs3/lrs2_video_seg16s/data_lrs2
 
