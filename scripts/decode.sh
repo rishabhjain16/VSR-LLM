@@ -15,8 +15,7 @@ MODEL_SRC=${ROOT}/src
 LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf  
 #DATA_ROOT=/home/rjain/data/lrs3/433h_data/    # path to test dataset dir
 #DATA_ROOT=/home/rishabh/Desktop/Dataset/lrs2likelrs3/lrs2_video_seg16s/data_lrs2
-DATA_ROOT=/home/rishabh/Desktop/Datasets/WildVSR/test_data
-
+DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data
 
 MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt  
 #MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
