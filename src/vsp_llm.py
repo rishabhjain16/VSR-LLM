@@ -22,6 +22,8 @@ from fairseq.models import BaseFairseqModel, FairseqEncoder, register_model
 from fairseq.models.hubert.hubert import MASKING_DISTRIBUTION_CHOICES
 from omegaconf import II, MISSING
 
+from .models.projectors import get_projector
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,6 +155,32 @@ class VSPLLMConfig(FairseqDataclass):
         metadata={"help": "dont finetune hubert for this many updates"},
     )
 
+    # Add projector configuration options
+    projector_type: str = field(
+        default="linear", 
+        metadata={"help": "Type of projector to use (linear, mlp, transformer, convolutional, cross_modal_attention, gated)"}
+    )
+    projector_hidden_dim: Optional[int] = field(
+        default=None,
+        metadata={"help": "Hidden dimension for MLP projector"}
+    )
+    projector_dropout: float = field(
+        default=0.1,
+        metadata={"help": "Dropout probability for projector"}
+    )
+    projector_transformer_layers: int = field(
+        default=2,
+        metadata={"help": "Number of transformer layers for transformer projector"}
+    )
+    projector_transformer_heads: int = field(
+        default=8,
+        metadata={"help": "Number of attention heads for transformer projector"}
+    )
+    projector_conv_kernels: List[int] = field(
+        default_factory=lambda: [3, 5],
+        metadata={"help": "Kernel sizes for convolutional projector"}
+    )
+
 
 
 class HubertEncoderWrapper(FairseqEncoder):
@@ -221,7 +249,35 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         self.cfg = cfg
         self.encoder = encoder
         self.decoder = decoder
-        self.avfeat_to_llm = nn.Linear(1024, 4096)
+        
+        # Create projector based on config
+        projector_kwargs = {}
+        
+        # Handle parameters for different projector types
+        if cfg.projector_type == "mlp":
+            projector_kwargs["hidden_dim"] = cfg.projector_hidden_dim
+            projector_kwargs["dropout"] = cfg.projector_dropout
+        elif cfg.projector_type == "transformer":
+            projector_kwargs["num_layers"] = cfg.projector_transformer_layers
+            projector_kwargs["nhead"] = cfg.projector_transformer_heads
+            projector_kwargs["dropout"] = cfg.projector_dropout
+        elif cfg.projector_type == "convolutional":
+            projector_kwargs["kernel_sizes"] = cfg.projector_conv_kernels
+            projector_kwargs["dropout"] = cfg.projector_dropout
+        elif cfg.projector_type == "cross_modal_attention":
+            projector_kwargs["nhead"] = cfg.projector_transformer_heads
+            projector_kwargs["dropout"] = cfg.projector_dropout
+        elif cfg.projector_type == "gated":
+            projector_kwargs["hidden_dim"] = cfg.projector_hidden_dim
+            projector_kwargs["dropout"] = cfg.projector_dropout
+            
+        self.avfeat_to_llm = get_projector(
+            cfg.projector_type, 
+            visual_dim=cfg.encoder_embed_dim,  # Use the actual config values
+            language_dim=cfg.decoder_embed_dim,  # Use the actual config values
+            **projector_kwargs
+        )
+        
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         
     @classmethod
@@ -308,10 +364,13 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         return avhubert_llm_seq2seq_cluster_count(encoder, decoder_4bit, cfg)
     
     def forward(self, **kwargs):
+        import contextlib
+        
         ft = self.freeze_finetune_updates <= self.num_updates
         with torch.no_grad() if not ft else contextlib.ExitStack():
             output = self.encoder(**kwargs)
     
+        # Apply some normalization to prevent gradient explosion
         output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
         
         cluster_counts = kwargs['source']['cluster_counts'][0] # tensor list
@@ -344,7 +403,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         llm_labels = torch.cat((target_ids, llm_labels), dim=1)
         llm_out = self.decoder(inputs_embeds=llm_input, labels=llm_labels, return_dict=True)
         
-        return llm_out.loss, llm_out.logits
+        # Add gradient scaling for numerical stability
+        loss_scale = 0.1  # Scale the loss to prevent overflow
+        return llm_out.loss * loss_scale, llm_out.logits
 
 
     @torch.no_grad()

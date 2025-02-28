@@ -45,7 +45,7 @@ dataset:
   validate_interval: 1
   train_subset: train
   valid_subset: test
-  batch_size: 4
+  batch_size: 1
 
 criterion:
   _name: decoder_only_language_modeling_loss
@@ -91,7 +91,16 @@ model:
   encoder_embed_dim: 1024
   decoder_embed_dim: 4096
   freeze_finetune_updates: 18000
-
+  
+  # Default projector configuration 
+  projector_type: "linear"
+  
+  # Uncomment these as needed for other projector types
+  # projector_hidden_dim: 2048
+  # projector_dropout: 0.1
+  # projector_transformer_layers: 2
+  # projector_transformer_heads: 8
+  # projector_conv_kernels: [3, 5]
 
 hydra:
   job:

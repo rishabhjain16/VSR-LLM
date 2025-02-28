@@ -6,6 +6,10 @@ common:
   log_interval: 200
   tensorboard_logdir: tblog
   seed: 1337
+  # amp: True
+  # fp16_init_scale: 4
+  # fp16_scale_window: 256
+  # fp16_scale_tolerance: 0.25
   user_dir: ???
 
 checkpoint:
@@ -45,7 +49,7 @@ dataset:
   validate_interval: 1
   train_subset: train
   valid_subset: valid
-  batch_size: 4
+  batch_size: 1
 
 criterion:
   _name: decoder_only_language_modeling_loss
@@ -57,11 +61,13 @@ optimization:
   lr: [0.0005]
   sentence_avg: true
   update_freq: [8]
+  clip_norm: 0.5  # Add gradient clipping
 
 optimizer:
   _name: adam
   adam_betas: (0.9,0.98)
   adam_eps: 1e-08
+  weight_decay: 0.001  # Add weight decay to regularize
 
 lr_scheduler:
   _name: tri_stage
@@ -92,6 +98,19 @@ model:
   decoder_embed_dim: 4096
   freeze_finetune_updates: 25000
 
+  # Add projector configuration
+  projector_type: "linear"  # Default projector type
+  
+  # Default parameters for MLP projector
+  projector_hidden_dim: 2048
+  projector_dropout: 0.1
+  
+  # Default parameters for transformer projector
+  projector_transformer_layers: 2
+  projector_transformer_heads: 8
+  
+  # Default parameters for convolutional projector
+  projector_conv_kernels: [3, 5]
 
 hydra:
   job:
