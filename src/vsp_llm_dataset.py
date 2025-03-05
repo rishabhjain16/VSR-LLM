@@ -103,6 +103,63 @@ def load_label_offset(label_path, inds, tot):
         offsets = [(offsets[i], offsets[i + 1]) for i in inds]
     return offsets
 
+# Add function to determine model-specific prompt template
+def get_prompt_template(model_name_or_path):
+    """
+    Returns the appropriate prompt template based on the model architecture.
+    Different models require different prompting styles for optimal performance.
+    
+    Args:
+        model_name_or_path: Path to the model or model name
+    
+    Returns:
+        A function that formats the prompt appropriately for the model
+    """
+    model_name = os.path.basename(model_name_or_path).lower()
+    
+    # Determine the model family
+    if "llama-3" in model_name or "meta-llama-3" in model_name:
+        # Llama 3 format
+        def llama3_format(task_description):
+            return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n{task_description}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        return llama3_format
+        
+    elif "llama-2" in model_name or "llama2" in model_name:
+        # Llama 2 format
+        def llama2_format(task_description):
+            return f"<s>[INST] {task_description} [/INST] "
+        return llama2_format
+        
+    elif "mistral" in model_name:
+        # Mistral format
+        def mistral_format(task_description):
+            return f"<s>[INST] {task_description} [/INST]"
+        return mistral_format
+        
+    elif "vicuna" in model_name:
+        # Vicuna format
+        def vicuna_format(task_description):
+            return f"USER: {task_description}\nASSISTANT: "
+        return vicuna_format
+        
+    elif "falcon" in model_name:
+        # Falcon format
+        def falcon_format(task_description):
+            return f"User: {task_description}\nAssistant: "
+        return falcon_format
+    
+    elif "gpt-j" in model_name or "gptj" in model_name:
+        # GPT-J format - simple prompt
+        def gptj_format(task_description):
+            return f"{task_description}\nAnswer: "
+        return gptj_format
+        
+    else:
+        # Generic format for other models
+        def generic_format(task_description):
+            return f"{task_description} "
+        return generic_format
+
 
 def verify_label_lengths(
     audio_sizes,
@@ -174,15 +231,32 @@ class VSP_LLM_dataset(FairseqDataset):
             noise_snr=0,
             noise_num=1
     ):
+        # Load tokenizer with appropriate settings for any model
         self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path, trust_remote_code=True, use_fast=False)
+        
+        # Handling different tokenizer configurations based on model type
+        self.model_name = os.path.basename(llm_ckpt_path).lower()
+        
+        # Get the appropriate prompt template for this model
+        self.prompt_formatter = get_prompt_template(llm_ckpt_path)
+        
         # Ensure the pad token exists; if not, add it
         if self.llm_tokenizer.pad_token is None:
-            self.llm_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            # Different models might need different pad token handling
+            if hasattr(self.llm_tokenizer, 'eos_token') and self.llm_tokenizer.eos_token is not None:
+                self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
+            else:
+                self.llm_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         
-        # Set pad_token and padding_side separately
-        self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
+        # Set padding_side and truncation_side
         self.llm_tokenizer.padding_side = "left"
         self.llm_tokenizer.truncation_side = "left"
+        
+        # Log information about the tokenizer
+        logger.info(f"Loaded tokenizer for model: {self.model_name}")
+        logger.info(f"Pad token: {self.llm_tokenizer.pad_token}, Pad token ID: {self.llm_tokenizer.pad_token_id}")
+        logger.info(f"EOS token: {self.llm_tokenizer.eos_token}, EOS token ID: {self.llm_tokenizer.eos_token_id}")
+        logger.info(f"Vocabulary size: {len(self.llm_tokenizer)}")
 
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
@@ -361,30 +435,15 @@ class VSP_LLM_dataset(FairseqDataset):
         labels = [torch.cat((labels[0], torch.tensor([2]).long()))]
         
         fid = self.names[index][1].split(':')[1]
-        # Define the system message
-        #system_message = "Please transcribe the following video input to English text."
-
-        # Define the user message
-        #user_message = "Input: {video_input}"
-
-        # Construct the prompt using Llama 3's format
-        # prompt = (
-        #     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
-        #     f"{system_message}<|eot_id|><|start_header_id|>user<|end_header_id|>\n"
-        #     f"{user_message}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
-        # )
-        prompt = "Recognize these video-input lip reading features in English. Input : "
-
-        #prompt = f"<|start_header_id|>user<|end_header_id|> Recognize this speech in English. Input : <|eot_id|>"
-        # Tokenize the prompt
-        ##txt_feats = self.llm_tokenizer(prompt, return_tensors="pt",truncation=True, max_length=500).input_ids[0]
-
-        #prompt = f"<|start_header_id|>user<|end_header_id|> Recognize this speech in English. Input : <|eot_id|>"
-        #txt_feats = self.llm_tokenizer(prompt, return_tensors="pt").input_ids[0]
-        #txt_feats = self.llm_tokenizer(f"Recognize this speech in English. Input : ", return_tensors="pt").input_ids[0]
-
-        txt_feats = self.llm_tokenizer(prompt, return_tensors="pt").input_ids[0]
-
+        
+        # Create a task description for lip reading
+        task_description = "Recognize these video-input lip reading features in English."
+        
+        # Apply the model-specific prompt format
+        formatted_prompt = self.prompt_formatter(task_description)
+        
+        # Tokenize the prompt using the model's tokenizer
+        txt_feats = self.llm_tokenizer(formatted_prompt, return_tensors="pt").input_ids[0]
         
         return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, "cluster_counts": cluster_counts, "label_list": labels, 'text_source':[txt_feats]}
     

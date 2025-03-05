@@ -173,12 +173,17 @@ def _main(cfg, output_file):
         task.cfg.data = cfg.override.data
     if cfg.override.label_dir is not None:
         task.cfg.label_dir = cfg.override.label_dir
+    
+    # Log information about the LLM model being used
+    model_path = cfg.override.llm_ckpt_path
+    model_name = os.path.basename(model_path)
+    logger.info(f"Using LLM model: {model_name} from path: {model_path}")
+    
     task.load_dataset('test', task_cfg=cfg.task)
 
     lms = [None]
 
     # Optimize ensemble for generation
-
     for model in chain(models, lms):
         if model is None:
             continue

@@ -32,9 +32,48 @@ pip install protobuf==3.20
 ```
 
 - Download AV-HuBERT pre-trained model `AV-HuBERT Large (LSR3 + VoxCeleb2)` from [here](http://facebookresearch.github.io/av_hubert).
-- Download LLaMA2-7B from [here](https://huggingface.co/meta-llama/Llama-2-7b-hf).
+- Download your preferred LLM from Hugging Face. The code supports multiple LLMs:
+  - LLaMA models: [LLaMA-2-7b](https://huggingface.co/meta-llama/Llama-2-7b-hf), [LLaMA-3](https://huggingface.co/meta-llama/Llama-3-8b-hf)
+  - Mistral models: [Mistral-7B](https://huggingface.co/mistralai/Mistral-7B-v0.1)
+  - And other compatible LLMs from Hugging Face
 
-Move the AV-HuBERT pre-trained model checkpoint and the LLaMA2-7B checkpoint to [`checkpoints`](checkpoints/).
+Move the AV-HuBERT pre-trained model checkpoint and the LLM checkpoint to [`checkpoints`](checkpoints/).
+
+## Using Different LLMs
+
+This codebase now supports using different LLMs from Hugging Face. To use a different LLM:
+
+1. Download your preferred LLM from Hugging Face
+2. Specify the LLM type and path in your configuration:
+
+```bash
+# For training
+python train.py ... \
+  --llm-ckpt-path /path/to/your/llm \
+  --llm-type llama3  # or mistral, vicuna, etc.
+
+# For decoding
+python decode.py ... \
+  --llm-ckpt-path /path/to/your/llm \
+  --llm-type llama3  # or mistral, vicuna, etc.
+```
+
+The code will automatically:
+- Detect the appropriate embedding dimensions for the model
+- Configure the tokenizer correctly for the model
+- Set up the right LoRA configuration for fine-tuning
+
+### Supported LLM Types
+
+- `llama`: LLaMA, LLaMA-2, LLaMA-3 models
+- `mistral`: Mistral models
+- `vicuna`: Vicuna models
+- `falcon`: Falcon models
+- `mpt`: MPT models
+- `bloom`: BLOOM models
+- `opt`: OPT models
+- `gpt-neox`: GPT-NeoX models
+- `gpt2`: GPT-2 models
 
 ## Data preprocessing
 Follow [Auto-AVSR preparation](https://github.com/mpc001/auto_avsr/tree/main/preparation) to preprocess the LRS3 dataset.\

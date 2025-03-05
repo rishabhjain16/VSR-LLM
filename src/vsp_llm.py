@@ -221,7 +221,13 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         self.cfg = cfg
         self.encoder = encoder
         self.decoder = decoder
-        self.avfeat_to_llm = nn.Linear(1024, 4096)
+        # Get hidden size dynamically from the decoder's configuration
+        if hasattr(decoder, 'config') and hasattr(decoder.config, 'hidden_size'):
+            hidden_size = decoder.config.hidden_size
+        else:
+            # Fallback to default for Llama models
+            hidden_size = 4096
+        self.avfeat_to_llm = nn.Linear(1024, hidden_size)
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         
     @classmethod
@@ -293,10 +299,29 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
         decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path, quantization_config=bnb_config)            
 
+        # Determine target modules based on model architecture
+        if hasattr(decoder_4bit.config, 'model_type'):
+            model_type = decoder_4bit.config.model_type.lower()
+            
+            # Default target modules for different model architectures
+            target_modules_map = {
+                'llama': ["q_proj", "v_proj", "k_proj"],
+                'mistral': ["q_proj", "v_proj", "k_proj"],
+                'gpt2': ["c_attn"],
+                'gptj': ["q_proj", "v_proj", "k_proj"],
+                'gpt_neox': ["query_key_value"],
+                'default': ["q_proj", "v_proj", "k_proj"]
+            }
+            
+            target_modules = target_modules_map.get(model_type, target_modules_map['default'])
+        else:
+            # Fallback to default target modules
+            target_modules = ["q_proj", "v_proj", "k_proj"]
+
         config = LoraConfig(
             r=16, 
             lora_alpha=32, 
-            target_modules=["q_proj", "v_proj", "k_proj"], 
+            target_modules=target_modules, 
             lora_dropout=0.05, 
             bias="none", 
             task_type="CAUSAL_LM" 
@@ -330,10 +355,34 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         reduced_enc_out = torch.cat(results_tensor, dim=1)      
         B, T, D = reduced_enc_out.size()
         instruction = kwargs['source']['text']
-        instruction_embedding = self.decoder.model.model.embed_tokens(instruction)
+        
+        # Get instruction embedding with model structure awareness
+        try:
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                instruction_embedding = self.decoder.model.model.embed_tokens(instruction)
+            elif hasattr(self.decoder, 'model'):
+                instruction_embedding = self.decoder.model.embed_tokens(instruction)
+            else:
+                instruction_embedding = self.decoder.embed_tokens(instruction)
+        except AttributeError:
+            # Fallback to get_input_embeddings method
+            embedding_layer = self.decoder.get_input_embeddings()
+            instruction_embedding = embedding_layer(instruction)
 
         labels = kwargs['target_list'].clone()
-        labels_embedding = self.decoder.model.model.embed_tokens(labels)
+        
+        # Get labels embedding with model structure awareness
+        try:
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                labels_embedding = self.decoder.model.model.embed_tokens(labels)
+            elif hasattr(self.decoder, 'model'):
+                labels_embedding = self.decoder.model.embed_tokens(labels)
+            else:
+                labels_embedding = self.decoder.embed_tokens(labels)
+        except AttributeError:
+            # Fallback to get_input_embeddings method
+            embedding_layer = self.decoder.get_input_embeddings()
+            labels_embedding = embedding_layer(labels)
 
         llm_input = torch.cat((instruction_embedding, reduced_enc_out, labels_embedding), dim=1)
         llm_labels = labels.clone()
@@ -376,7 +425,20 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         reduced_enc_out = torch.cat(results_tensor, dim=1)     
         B, T, D = reduced_enc_out.size()
         instruction = kwargs['source']['text']
-        instruction_embedding = self.decoder.model.model.embed_tokens(instruction)
+        
+        # Get instruction embedding with model structure awareness
+        try:
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                instruction_embedding = self.decoder.model.model.embed_tokens(instruction)
+            elif hasattr(self.decoder, 'model'):
+                instruction_embedding = self.decoder.model.embed_tokens(instruction)
+            else:
+                instruction_embedding = self.decoder.embed_tokens(instruction)
+        except AttributeError:
+            # Fallback to get_input_embeddings method
+            embedding_layer = self.decoder.get_input_embeddings()
+            instruction_embedding = embedding_layer(instruction)
+            
         llm_input = torch.cat((instruction_embedding, reduced_enc_out), dim=1) 
 
         self.decoder.config.use_cache = True

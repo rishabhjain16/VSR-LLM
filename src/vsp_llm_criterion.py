@@ -102,4 +102,3 @@ class decoder_only_language_modeling_loss(FairseqCriterion):
         to True will improves distributed training speed.
         """
         return False
-
