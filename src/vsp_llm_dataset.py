@@ -231,32 +231,67 @@ class VSP_LLM_dataset(FairseqDataset):
             noise_snr=0,
             noise_num=1
     ):
-        # Load tokenizer with appropriate settings for any model
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path, trust_remote_code=True, use_fast=False)
+        # Load tokenizer with explicit type checking
+        logger.info(f"Loading tokenizer from {llm_ckpt_path}")
         
-        # Handling different tokenizer configurations based on model type
-        self.model_name = os.path.basename(llm_ckpt_path).lower()
+        # Check if the path exists
+        if not os.path.exists(llm_ckpt_path):
+            raise RuntimeError(f"Model path does not exist: {llm_ckpt_path}")
+            
+        # Try to load the tokenizer with error checking and explicit model type detection
+        self.llm_tokenizer = None
         
-        # Get the appropriate prompt template for this model
-        self.prompt_formatter = get_prompt_template(llm_ckpt_path)
+        # Check for common model types to use appropriate tokenizer loading
+        model_name = os.path.basename(llm_ckpt_path).lower()
         
-        # Ensure the pad token exists; if not, add it
-        if self.llm_tokenizer.pad_token is None:
-            # Different models might need different pad token handling
+        try:
+            # For Llama models, try direct loading from the model path with specific configs
+            if "llama" in model_name:
+                logger.info("Detected Llama model, using specific loading configuration")
+                from transformers import LlamaTokenizer
+                try:
+                    self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_ckpt_path)
+                except:
+                    # Fall back to AutoTokenizer if LlamaTokenizer fails
+                    self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path)
+            else:
+                # Default loading for other models
+                self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path, trust_remote_code=True, use_fast=False)
+                
+            # Perform explicit type check
+            if self.llm_tokenizer is None or not hasattr(self.llm_tokenizer, '__class__'):
+                raise RuntimeError(f"Tokenizer loaded as invalid type: {type(self.llm_tokenizer)}")
+                
+            # Add debug info
+            logger.info(f"Successfully loaded tokenizer of type: {type(self.llm_tokenizer).__name__}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer: {e}")
+            raise RuntimeError(f"Could not load tokenizer from {llm_ckpt_path}: {e}")
+        
+        # Set up pad token if needed
+        if not hasattr(self.llm_tokenizer, 'pad_token') or self.llm_tokenizer.pad_token is None:
+            # Try to use eos_token as pad_token if available
             if hasattr(self.llm_tokenizer, 'eos_token') and self.llm_tokenizer.eos_token is not None:
+                logger.info(f"Setting pad_token to eos_token: {self.llm_tokenizer.eos_token}")
                 self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
             else:
+                logger.info("Adding [PAD] as pad_token")
                 self.llm_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         
         # Set padding_side and truncation_side
         self.llm_tokenizer.padding_side = "left"
         self.llm_tokenizer.truncation_side = "left"
         
-        # Log information about the tokenizer
-        logger.info(f"Loaded tokenizer for model: {self.model_name}")
+        # Log tokenizer information
+        logger.info(f"Loaded tokenizer for model: {os.path.basename(llm_ckpt_path)}")
         logger.info(f"Pad token: {self.llm_tokenizer.pad_token}, Pad token ID: {self.llm_tokenizer.pad_token_id}")
         logger.info(f"EOS token: {self.llm_tokenizer.eos_token}, EOS token ID: {self.llm_tokenizer.eos_token_id}")
         logger.info(f"Vocabulary size: {len(self.llm_tokenizer)}")
+        
+        # Get the appropriate prompt template for this model
+        self.model_name = model_name
+        self.prompt_formatter = get_prompt_template(llm_ckpt_path)
 
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
