@@ -13,6 +13,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 from einops import repeat
+import datetime
 
 from dataclasses import dataclass, field
 from fairseq import checkpoint_utils, tasks, utils
@@ -23,8 +24,54 @@ from fairseq.models.hubert.hubert import MASKING_DISTRIBUTION_CHOICES
 from omegaconf import II, MISSING
 import contextlib
 
-logger = logging.getLogger(__name__)
+# Import our new module for LoRA target module selection
+from .vsp_lora import get_target_modules, LORA_CONFIG
 
+# Configure logging to output to both console and file
+def setup_logging(log_dir="logs"):
+    """
+    Set up logging to capture terminal output to a file
+    """
+    # Create logs directory if it doesn't exist
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Generate a log filename with timestamp
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f"vsp_llm_{timestamp}.log")
+    
+    # Configure root logger to output to both console and file
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicate logs
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Create file handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(
+        logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s', 
+                          datefmt='%Y-%m-%d %H:%M:%S')
+    )
+    
+    # Create console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(
+        logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+                          datefmt='%Y-%m-%d %H:%M:%S')
+    )
+    
+    # Add both handlers to the root logger
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Log file created at: {log_file}")
+    return log_file
+
+# Initialize logging when the module is imported
+log_file = setup_logging()
+logger = logging.getLogger(__name__)
 
 MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(
     ["static", "uniform", "normal", "poisson"]
@@ -300,32 +347,28 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
         decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path, quantization_config=bnb_config)            
 
-        # Determine target modules based on model architecture
+        # Use our new function to get target modules based on model architecture
         if hasattr(decoder_4bit.config, 'model_type'):
             model_type = decoder_4bit.config.model_type.lower()
-            
-            # Default target modules for different model architectures
-            target_modules_map = {
-                'llama': ["q_proj", "v_proj", "k_proj"],
-                'mistral': ["q_proj", "v_proj", "k_proj"],
-                'gpt2': ["c_attn"],
-                'gptj': ["q_proj", "v_proj", "k_proj"],
-                'gpt_neox': ["query_key_value"],
-                'default': ["q_proj", "v_proj", "k_proj"]
-            }
-            
-            target_modules = target_modules_map.get(model_type, target_modules_map['default'])
+            print(f"\n=== Training LoRA on model type: {model_type} ===")
         else:
-            # Fallback to default target modules
-            target_modules = ["q_proj", "v_proj", "k_proj"]
-
+            model_type = "unknown"
+            print("\n=== Training LoRA on unknown model type ===")
+        
+        # Get target modules using our new helper function
+        target_modules = get_target_modules(decoder_4bit, verbose=True)
+        print(f"=== LoRA target modules: {target_modules} ===\n")
+        
+        # Use fixed LoRA parameters from vsp_lora.py
+        from .vsp_lora import LORA_CONFIG
+        
         config = LoraConfig(
-            r=16, 
-            lora_alpha=32, 
+            r=LORA_CONFIG['r'], 
+            lora_alpha=LORA_CONFIG['lora_alpha'], 
             target_modules=target_modules, 
-            lora_dropout=0.05, 
-            bias="none", 
-            task_type="CAUSAL_LM" 
+            lora_dropout=LORA_CONFIG['lora_dropout'], 
+            bias=LORA_CONFIG['bias'], 
+            task_type=LORA_CONFIG['task_type'] 
         )
 
         decoder_4bit = get_peft_model(decoder_4bit, config)

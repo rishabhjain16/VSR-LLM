@@ -7,9 +7,9 @@
 
 
 # set variables
-DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
+DATA_PATH=/data/ssd2/data_rishabh/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_tokenizer_fix    # output path to save
+OUT_PATH=//home/rijain@ad.mee.tcd.ie/Experiments/VSR-LLM/checkpoints/training/phi4_lrs3   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
