@@ -28,7 +28,7 @@ This document provides a comprehensive overview of the complete VSR-LLM system a
 │                      │              │                          │                         │
 │                      │    Text      │                          │                         │
 │                      │   Tokens     │─────────────────────────▶│                         │
-│                      │              │                          │                         │
+│                      │(Instructions)│                          │                         │
 │                      └──────────────┘                          │                         │
 │                                                                │                         │
 │                                                                ▼                         │
@@ -42,18 +42,25 @@ This document provides a comprehensive overview of the complete VSR-LLM system a
 │  │  │ Embeddings  │ + │   Features      │ + │  Embeddings   │                    │     │
 │  │  │             │   │                 │   │               │                    │     │
 │  │  └─────────────┘   └─────────────────┘   └───────────────┘                    │     │
-│  │                                                                                │     │
-│  │                                                                                │     │
-│  └───────────────────────────────────────┬────────────────────────────────────────┘     │
-│                                          │                                               │
-│                                          ▼                                               │
+│  │                                          ▲                                    │     │
+│  │                                          │                                    │     │
+│  └─────────────────────────────────────────┬┼────────────────────────────────────┘     │
+│                                            ││                                           │
+│  ┌────────────────┐                        ││                                           │
+│  │                │                        ││                                           │
+│  │  Ground Truth  │────────────────────────┘│                                           │
+│  │  Text Labels   │                         │                                           │
+│  │                │                         │                                           │
+│  └────────────────┘                         │                                           │
+│                                             ▼                                           │
 │  ┌─────────────────────────────────────────────────────────────┐                        │
 │  │                     Loss Calculation                         │                        │
 │  │                                                             │                        │
-│  │  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐     │                        │
-│  │  │ Language     │   │ Contrastive  │   │ Auxiliary    │     │                        │
-│  │  │ Modeling Loss│ + │ Loss (opt.)  │ + │ Losses (opt.)│     │                        │
-│  │  └──────────────┘   └──────────────┘   └──────────────┘     │                        │
+│  │  ┌───────────────────────────────┐   ┌──────────────────┐   │                        │
+│  │  │ Language Modeling Loss        │   │ Auxiliary Losses │   │                        │
+│  │  │ (Compare LLM outputs with     │ + │ (Contrastive,    │   │                        │
+│  │  │  ground truth text labels)    │   │  Reconstruction) │   │                        │
+│  │  └───────────────────────────────┘   └──────────────────┘   │                        │
 │  │                                                             │                        │
 │  └─────────────────────────────────────────────────────────────┘                        │
 │                                                                                          │
@@ -66,83 +73,135 @@ The VSR-LLM system processes data in the following sequence:
 
 1. **Input Processing**:
    - **Visual Input**: Images or video frames are processed through a frozen visual encoder to extract features.
-   - **Text Input**: Instruction text is tokenized and processed for text-aware projectors.
+   - **Text Input (Instructions)**: Instruction text is tokenized and processed for text-aware projectors.
+   - **Text Labels**: Ground truth captions or descriptions are processed for training.
 
 2. **Feature Projection**:
    - The visual features are passed through the selected projector (from the various options in the projector catalog).
-   - For text-aware projectors, text tokens are also passed to guide the projection process.
+   - For text-aware projectors, text instruction tokens are also passed to guide the projection process.
    - The projector transforms the visual features into a format compatible with the LLM embedding space.
 
 3. **Language Model Integration**:
    - The projected features are combined with instruction embeddings and label embeddings.
    - This combined input is passed to the language model for processing.
 
-4. **Output Generation**:
+4. **Output Generation and Loss Calculation**:
+   - During training, the model produces logits which are compared against ground truth text labels.
    - During inference, the language model generates text output based on the visual inputs.
-   - During training, the model produces logits for loss calculation.
 
-## Training Pipeline
+## Training Pipeline with Label Processing
 
 ```
 ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
 │                      │     │                      │     │                      │
 │    Data Loading      │────▶│   Feature Extraction │────▶│  Projector Forward   │
-│                      │     │                      │     │                      │
+│   (Images + Text     │     │   (Visual + Text)    │     │                      │
+│    Labels)           │     │                      │     │                      │
 └──────────────────────┘     └──────────────────────┘     └──────────┬───────────┘
                                                                      │
-                                                                     ▼
-┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
-│                      │     │                      │     │                      │
-│   Parameter Update   │◀────│   Loss Calculation   │◀────│    LLM Forward       │
-│                      │     │                      │     │                      │
-└──────────────────────┘     └──────────────────────┘     └──────────────────────┘
+        ┌─────────────────────────────────────────────────┐          │
+        │                                                 │          │
+        │  Text Label Processing                          │          │
+        │  ┌─────────────┐     ┌─────────────┐           │          │
+        │  │ Tokenization│────▶│ Embedding   │           │          │
+        │  └─────────────┘     └──────┬──────┘           │          │
+        │                             │                  │          │
+        └─────────────────────────────┼──────────────────┘          │
+                                      │                             │
+                                      ▼                             ▼
+                             ┌──────────────────────┐     ┌──────────────────────┐
+                             │                      │     │                      │
+                             │  Create Target       │     │    LLM Forward       │
+                             │  Label Sequence      │     │                      │
+                             │                      │     │                      │
+                             └──────────┬───────────┘     └──────────┬───────────┘
+                                        │                            │
+                                        └────────────┐   ┌───────────┘
+                                                     ▼   ▼
+                                           ┌──────────────────────┐     ┌──────────────────────┐
+                                           │                      │     │                      │
+                                           │   Loss Calculation   │────▶│   Parameter Update   │
+                                           │                      │     │                      │
+                                           └──────────────────────┘     └──────────────────────┘
 ```
 
-The training pipeline consists of:
+The training pipeline with label processing consists of:
 
 1. **Data Loading**:
    - Loads image-text pairs from the dataset
+   - Each pair includes the image and corresponding ground truth text label/caption
    - Applies appropriate preprocessing and augmentation
-   - Prepares instruction templates and label formats
+   - Prepares instruction templates
 
 2. **Feature Extraction**:
    - Passes images through the frozen visual encoder
    - Tokenizes and processes instruction text
    - Applies any necessary normalization
 
-3. **Projector Forward Pass**:
+3. **Text Label Processing**:
+   - Tokenizes the ground truth text labels
+   - Converts tokens to embeddings for LLM input
+   - Creates target label sequence for loss calculation
+
+4. **Projector Forward Pass**:
    - Runs the visual features through the selected projector
    - For text-aware projectors, incorporates instruction text
    - Produces projected features aligned with LLM embedding space
 
-4. **LLM Forward Pass**:
+5. **LLM Forward Pass**:
    - Combines instruction embeddings, projected features, and label embeddings
    - Passes this combined input through the LLM
    - Produces logits for next-token prediction
 
-5. **Loss Calculation**:
-   - Computes language modeling loss (cross-entropy)
+6. **Loss Calculation**:
+   - Computes language modeling loss by comparing logits with ground truth text labels
    - May include additional losses like contrastive or auxiliary losses
    - Combines losses according to weighting scheme
 
-6. **Parameter Update**:
+7. **Parameter Update**:
    - Computes gradients through backpropagation
    - Only updates parameters in the projector while keeping LLM frozen
    - Applies optimization step with learning rate scheduling
 
 ## Loss Calculation
 
-### Primary Loss: Language Modeling
+### Primary Loss: Language Modeling with Text Labels
 
 The main loss is the language modeling (LM) loss, calculated as:
 
 ```
-LM Loss = CrossEntropyLoss(logits, target_labels)
+LM Loss = CrossEntropyLoss(logits, ground_truth_text_labels)
 ```
 
 Where:
 - `logits` are the model's predictions (output from the LLM)
-- `target_labels` are the ground truth next tokens in the sequence
+- `ground_truth_text_labels` are the target tokens from the dataset text captions/descriptions
+
+This process works as follows:
+
+```
+┌────────────────┐     ┌────────────────┐     ┌────────────────┐     ┌────────────────┐
+│                │     │                │     │                │     │                │
+│ Ground Truth  │────▶│ Tokenization   │────▶│ Create Target  │────▶│ Compare with   │
+│ Text Labels   │     │                │     │ Label Sequence │     │ Model Output   │
+│                │     │                │     │                │     │                │
+└────────────────┘     └────────────────┘     └────────────────┘     └────────────────┘
+                                                                             │
+                                                                             │
+                                                                             ▼
+                                                                     ┌────────────────┐
+                                                                     │                │
+                                                                     │ Cross-Entropy  │
+                                                                     │ Loss           │
+                                                                     │                │
+                                                                     └────────────────┘
+```
+
+For example, if the ground truth text label is "A cat sitting on a mat":
+1. It's tokenized into token IDs
+2. A target label sequence is created for autoregressive prediction
+3. The LLM predicts the next token at each position
+4. Cross-entropy loss compares each prediction against the true next token
 
 ### Optional Auxiliary Losses
 
@@ -225,13 +284,20 @@ During inference:
                        │  Create input sequence   │────▶│  LLM Forward Pass  │
                        │                          │     │                    │
                        └──────────────────────────┘     └──────────┬─────────┘
-                                                                   │
-                                                                   ▼
-                                                        ┌────────────────────┐
-                                                        │                    │
-                                                        │    Decode Output   │
-                                                        │                    │
-                                                        └────────────────────┘
+                                 ▲                                 │
+                                 │                                 │
+                ┌────────────────┴─────────┐                      │
+                │                          │                      │
+                │  Text Labels             │                      │
+                │  (during training)       │                      │
+                │                          │                      │
+                └──────────────────────────┘                      │
+                                                                  ▼
+                                                       ┌────────────────────┐
+                                                       │                    │
+                                                       │    Decode Output   │
+                                                       │                    │
+                                                       └────────────────────┘
 ```
 
 ### Input Sequence Formation
@@ -240,7 +306,7 @@ The input to the LLM is created by concatenating:
 
 1. **Instruction Embeddings**: Text embeddings from a template like "Describe what you see in this image:"
 2. **Projected Features**: The output from the projector, representing visual content
-3. **Label Embeddings** (during training): Ground truth text embeddings
+3. **Label Embeddings** (during training): Ground truth text embeddings from the dataset
 
 The sequence is formatted as:
 ```
@@ -252,7 +318,7 @@ The sequence is formatted as:
 During forward pass:
 1. The LLM processes the combined input sequence
 2. The model predicts the next tokens in the sequence
-3. During training, these predictions are compared to ground truth
+3. During training, these predictions are compared to ground truth text labels
 4. During inference, the predictions are used for text generation
 
 The LLM itself is typically kept frozen during training, with only the projector parameters being updated. This efficient approach allows adaptation of the visual features to the LLM's embedding space without modifying the language model itself.
@@ -287,3 +353,77 @@ The LLM itself is typically kept frozen during training, with only the projector
 ```
 
 The key difference is that text-aware projectors integrate instruction text directly during the projection process, enabling more fine-grained control over visual feature extraction based on textual context. 
+
+## Complete Label Processing Flow
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                           Training Data Sample                                      │
+│                                                                                    │
+│  ┌───────────────┐            ┌──────────────────────┐                             │
+│  │               │            │                      │                             │
+│  │    Image      │            │   Ground Truth Text  │                             │
+│  │               │            │   "A cat on a mat"   │                             │
+│  │               │            │                      │                             │
+│  └───────┬───────┘            └──────────┬───────────┘                             │
+│          │                               │                                         │
+└──────────┼───────────────────────────────┼─────────────────────────────────────────┘
+           │                               │
+           ▼                               ▼
+┌──────────────────┐            ┌──────────────────────┐
+│                  │            │                      │
+│ Visual Encoder   │            │    Tokenization      │
+│                  │            │                      │
+└──────────┬───────┘            └──────────┬───────────┘
+           │                               │
+           ▼                               ▼
+┌──────────────────┐            ┌──────────────────────┐
+│                  │            │                      │
+│ Visual Features  │            │  Token IDs: [101,    │
+│                  │            │  2023, 2006, 1037,   │
+│                  │            │  17985, 102]         │
+└──────────┬───────┘            └──────────┬───────────┘
+           │                               │
+           ▼                               │
+┌──────────────────┐                       │
+│                  │                       │
+│    Projector     │                       │
+│                  │                       │
+└──────────┬───────┘                       │
+           │                               │
+           ▼                               ▼
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                    │
+│                           Language Model Processing                                │
+│                                                                                    │
+│   ┌─────────────┐     ┌───────────────┐      ┌───────────────┐                    │
+│   │ Instruction │     │  Projected    │      │  Label        │                    │
+│   │ Embeddings  │ +   │  Features     │  +   │  Embeddings   │                    │
+│   └─────────────┘     └───────────────┘      └───────────────┘                    │
+│                                                                                    │
+│                                   │                                                │
+│                                   ▼                                                │
+│                      ┌────────────────────────┐                                    │
+│                      │                        │                                    │
+│                      │     Model Outputs      │                                    │
+│                      │                        │                                    │
+│                      └────────────┬───────────┘                                    │
+│                                   │                                                │
+└───────────────────────────────────┼────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                        ┌────────────────────────┐
+                        │                        │
+                        │  Compare with Ground   │
+                        │  Truth Token IDs       │
+                        │                        │
+                        └────────────┬───────────┘
+                                     │
+                                     ▼
+                        ┌────────────────────────┐
+                        │                        │
+                        │  Language Modeling     │
+                        │  Loss                  │
+                        │                        │
+                        └────────────────────────┘
+``` 
