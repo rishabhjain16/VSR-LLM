@@ -29,7 +29,7 @@ SRC=${ROOT}/src
 # - "mistralai/Mistral-7B-v0.1"
 # - "stabilityai/stablelm-3b-4e1t"
 # - "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-HF_MODEL_ID="Llama-2-7b-hf"  # HuggingFace model ID
+HF_MODEL_ID="Qwen/Qwen2.5-7B-Instruct-1M"  # HuggingFace model ID
 CHECKPOINT_DIR="${ROOT}/checkpoints"
 
 # Check if the model exists locally, if not download it
@@ -64,10 +64,6 @@ if [ ! -d "${LLM_PATH}" ] || [ -z "$(ls -A ${LLM_PATH} 2>/dev/null)" ]; then
         echo "2. You don't have access to this gated model"
         echo "3. There's a network or permission issue"
         echo ""
-        echo "Try using an open model instead by changing HF_MODEL_ID to:"
-        echo "- 'mistralai/Mistral-7B-v0.1'"
-        echo "- 'stabilityai/stablelm-3b-4e1t'"
-        echo "- 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'"
         exit 1
     fi
     

@@ -21,6 +21,7 @@ from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.models import BaseFairseqModel, FairseqEncoder, register_model
 from fairseq.models.hubert.hubert import MASKING_DISTRIBUTION_CHOICES
 from omegaconf import II, MISSING
+import contextlib
 
 logger = logging.getLogger(__name__)
 
