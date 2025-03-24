@@ -27,50 +27,10 @@ import contextlib
 # Import our new module for LoRA target module selection
 from .vsp_lora import get_target_modules, LORA_CONFIG
 
-# Configure logging to output to both console and file
-def setup_logging(log_dir="logs"):
-    """
-    Set up logging to capture terminal output to a file
-    """
-    # Create logs directory if it doesn't exist
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Generate a log filename with timestamp
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = os.path.join(log_dir, f"vsp_llm_{timestamp}.log")
-    
-    # Configure root logger to output to both console and file
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    
-    # Remove existing handlers to avoid duplicate logs
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # Create file handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(
-        logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s', 
-                          datefmt='%Y-%m-%d %H:%M:%S')
-    )
-    
-    # Create console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(
-        logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s',
-                          datefmt='%Y-%m-%d %H:%M:%S')
-    )
-    
-    # Add both handlers to the root logger
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
-    
-    logger = logging.getLogger(__name__)
-    logger.info(f"Log file created at: {log_file}")
-    return log_file
+# Import the projector module
+from .vsp_projectors import get_projector
 
-# Initialize logging when the module is imported
-log_file = setup_logging()
+# Get logger
 logger = logging.getLogger(__name__)
 
 MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(
@@ -201,6 +161,32 @@ class VSPLLMConfig(FairseqDataclass):
         metadata={"help": "dont finetune hubert for this many updates"},
     )
 
+    # Add new fields for projector configuration
+    projector_type: str = field(
+        default="linear", 
+        metadata={"help": "Type of projector to use (linear, mlp, qformer, cross_attention, perceiver, adaptive_query, fusion_refinement)"}
+    )
+    projector_hidden_dim: Optional[int] = field(
+        default=None, 
+        metadata={"help": "Hidden dimension for projector (if applicable)"}
+    )
+    projector_num_layers: int = field(
+        default=2, 
+        metadata={"help": "Number of layers in projector (if applicable)"}
+    )
+    projector_num_heads: int = field(
+        default=8, 
+        metadata={"help": "Number of attention heads in projector (if applicable)"}
+    )
+    projector_dropout: float = field(
+        default=0.1, 
+        metadata={"help": "Dropout rate in projector (if applicable)"}
+    )
+    projector_num_queries: int = field(
+        default=32, 
+        metadata={"help": "Number of queries in query-based projectors (if applicable)"}
+    )
+
 
 
 class HubertEncoderWrapper(FairseqEncoder):
@@ -269,14 +255,42 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         self.cfg = cfg
         self.encoder = encoder
         self.decoder = decoder
+        
         # Get hidden size dynamically from the decoder's configuration
         if hasattr(decoder, 'config') and hasattr(decoder.config, 'hidden_size'):
             hidden_size = decoder.config.hidden_size
         else:
             # Fallback to default for Llama models
             hidden_size = 4096
-        self.avfeat_to_llm = nn.Linear(1024, hidden_size)
+            
+        # Import and initialize the projector
+        projector_kwargs = {
+            'input_dim': 1024,
+            'output_dim': hidden_size,
+        }
+        
+        # Add optional arguments if they're set in config
+        if cfg.projector_hidden_dim is not None:
+            projector_kwargs['hidden_dim'] = cfg.projector_hidden_dim
+        if cfg.projector_num_layers > 0:
+            projector_kwargs['num_layers'] = cfg.projector_num_layers
+        if cfg.projector_num_heads > 0:
+            projector_kwargs['num_heads'] = cfg.projector_num_heads
+        if cfg.projector_dropout > 0:
+            projector_kwargs['dropout'] = cfg.projector_dropout
+        if cfg.projector_num_queries > 0:
+            projector_kwargs['num_queries'] = cfg.projector_num_queries
+            
+        # Create the projector
+        self.avfeat_to_llm = get_projector(cfg.projector_type, **projector_kwargs)
+        # Log the projector type being used
+        logger.info(f"==========================================================")
+        logger.info(f"INITIALIZING MODEL WITH PROJECTOR TYPE: {cfg.projector_type}")
+        logger.info(f"==========================================================")
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
+        
+        # Track whether we've logged the projector shape
+        self.logged_projector_shape = False
         
     @classmethod
     def build_model(cls, cfg, task):
@@ -381,22 +395,69 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         with torch.no_grad() if not ft else contextlib.ExitStack():
             output = self.encoder(**kwargs)
     
-        output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
+        # Get the original size before applying projector
+        orig_seq_len = output['encoder_out'].size(1)
         
-        cluster_counts = kwargs['source']['cluster_counts'][0] # tensor list
+        # Check if we're using a text-aware projector
+        is_text_aware = 'text_aware' in self.cfg.projector_type
         
-        results_tensor = []
-        start_idx = 0
-        for clutser_num in cluster_counts:
-            end_idx = start_idx + clutser_num
-            slice = output['encoder_out'][:,start_idx:end_idx,:]
-            mean_tensor = torch.mean(slice, dim=1, keepdim=True)
-            results_tensor.append(mean_tensor)            
-            start_idx = end_idx
-
-        assert(cluster_counts.sum().item() == output['encoder_out'].size()[1])
-
-        reduced_enc_out = torch.cat(results_tensor, dim=1)      
+        # For text-aware projectors, always use text tokens
+        if is_text_aware:
+            # Get text tokens from kwargs - these should always be present
+            text_tokens = kwargs['source']['text']
+            
+            # Add debug info about text tokens
+            if not self.logged_projector_shape:
+                logger.info(f"Text tokens shape: {text_tokens.shape}, non-zero tokens: {(text_tokens != 0).sum().item()}")
+            
+            # Create attention mask (1 for real tokens, 0 for padding)
+            text_mask = (text_tokens != 0)
+            
+            # Only log this once per run
+            if not self.logged_projector_shape:
+                logger.info(f"Using text tokens with shape {text_tokens.shape} for text-aware projector")
+            
+            # Pass both video features and text to the projector - never fall back to vision-only
+            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
+        else:
+            # For non-text-aware projectors, just pass the video features
+            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
+        
+        # Check if we're using a query-based projector that changes sequence length
+        proj_seq_len = output['encoder_out'].size(1)
+        is_query_based = proj_seq_len != orig_seq_len
+        
+        # Handle different projector types
+        if is_query_based:
+            # For query-based projectors (QFormer, EnhancedQFormer, etc.) that return fixed number of tokens
+            # We skip the cluster-based aggregation as these projectors already aggregate
+            reduced_enc_out = output['encoder_out']
+            # Only log the shape once
+            if not self.logged_projector_shape:
+                logger.info(f"Using query-based projector output with shape: {reduced_enc_out.size()}")
+                self.logged_projector_shape = True
+        else:
+            # For projectors that maintain sequence length (Linear, MLP), use cluster-based aggregation
+            cluster_counts = kwargs['source']['cluster_counts'][0]  # tensor list
+            
+            results_tensor = []
+            start_idx = 0
+            for clutser_num in cluster_counts:
+                end_idx = start_idx + clutser_num
+                slice = output['encoder_out'][:,start_idx:end_idx,:]
+                mean_tensor = torch.mean(slice, dim=1, keepdim=True)
+                results_tensor.append(mean_tensor)            
+                start_idx = end_idx
+    
+            # Verify we processed the entire sequence for non-query projectors
+            assert(cluster_counts.sum().item() == proj_seq_len)
+    
+            reduced_enc_out = torch.cat(results_tensor, dim=1)
+            # Only log the shape once
+            if not self.logged_projector_shape:
+                logger.info(f"Using cluster-based aggregation with output shape: {reduced_enc_out.size()}")
+                self.logged_projector_shape = True
+        
         B, T, D = reduced_enc_out.size()
         instruction = kwargs['source']['text']
         
@@ -456,22 +517,53 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 **kwargs,
                 ):
         output = self.encoder(**kwargs)
-        output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
-        cluster_counts = kwargs['source']['cluster_counts'][0] # tensor list
         
-        results_tensor = []
-        start_idx = 0
-
-        for clutser_num in cluster_counts:
-            end_idx = start_idx + clutser_num
-            slice = output['encoder_out'][:,start_idx:end_idx,:]
-            mean_tensor = torch.mean(slice, dim=1, keepdim=True)
-            results_tensor.append(mean_tensor)            
-            start_idx = end_idx
-
-        assert(cluster_counts.sum().item() == output['encoder_out'].size()[1])
-
-        reduced_enc_out = torch.cat(results_tensor, dim=1)     
+        # Check if we're using a text-aware projector
+        is_text_aware = 'text_aware' in self.cfg.projector_type
+        
+        # For text-aware projectors, always use text tokens
+        if is_text_aware:
+            # Get text tokens from kwargs - these should always be present
+            text_tokens = kwargs['source']['text']
+            
+            # Add debug info about text tokens
+            logger.info(f"Generate - Text tokens shape: {text_tokens.shape}, non-zero tokens: {(text_tokens != 0).sum().item()}")
+            
+            # Create attention mask (1 for real tokens, 0 for padding)
+            text_mask = (text_tokens != 0)
+            logger.info(f"Using text tokens in generate() for text-aware projector")
+            
+            # Pass both video features and text to the projector - never fall back to vision-only
+            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
+        else:
+            # For non-text-aware projectors, just pass the video features
+            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
+            
+        # Handle different projector types
+        proj_seq_len = output['encoder_out'].size(1)
+        orig_seq_len = kwargs['source']['video'].size(1)  # Original sequence length
+        is_query_based = proj_seq_len != orig_seq_len
+        
+        if is_query_based:
+            # For query-based projectors, use the output directly
+            reduced_enc_out = output['encoder_out']
+        else:
+            # For projectors that maintain sequence length, use cluster-based aggregation
+            cluster_counts = kwargs['source']['cluster_counts'][0]  # tensor list
+            
+            results_tensor = []
+            start_idx = 0
+            for clutser_num in cluster_counts:
+                end_idx = start_idx + clutser_num
+                slice = output['encoder_out'][:,start_idx:end_idx,:]
+                mean_tensor = torch.mean(slice, dim=1, keepdim=True)
+                results_tensor.append(mean_tensor)            
+                start_idx = end_idx
+    
+            # Verify we processed the entire sequence
+            assert(cluster_counts.sum().item() == proj_seq_len)
+            reduced_enc_out = torch.cat(results_tensor, dim=1)
+        
         B, T, D = reduced_enc_out.size()
         instruction = kwargs['source']['text']
         
