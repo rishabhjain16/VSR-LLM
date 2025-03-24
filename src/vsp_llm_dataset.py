@@ -103,63 +103,6 @@ def load_label_offset(label_path, inds, tot):
         offsets = [(offsets[i], offsets[i + 1]) for i in inds]
     return offsets
 
-# Add function to determine model-specific prompt template
-def get_prompt_template(model_name_or_path):
-    """
-    Returns the appropriate prompt template based on the model architecture.
-    Different models require different prompting styles for optimal performance.
-    
-    Args:
-        model_name_or_path: Path to the model or model name
-    
-    Returns:
-        A function that formats the prompt appropriately for the model
-    """
-    model_name = os.path.basename(model_name_or_path).lower()
-    
-    # Determine the model family
-    if "llama-3" in model_name or "meta-llama-3" in model_name:
-        # Llama 3 format
-        def llama3_format(task_description):
-            return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n{task_description}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
-        return llama3_format
-        
-    elif "llama-2" in model_name or "llama2" in model_name:
-        # Llama 2 format
-        def llama2_format(task_description):
-            return f"<s>[INST] {task_description} [/INST] "
-        return llama2_format
-        
-    elif "mistral" in model_name:
-        # Mistral format
-        def mistral_format(task_description):
-            return f"<s>[INST] {task_description} [/INST]"
-        return mistral_format
-        
-    elif "vicuna" in model_name:
-        # Vicuna format
-        def vicuna_format(task_description):
-            return f"USER: {task_description}\nASSISTANT: "
-        return vicuna_format
-        
-    elif "falcon" in model_name:
-        # Falcon format
-        def falcon_format(task_description):
-            return f"User: {task_description}\nAssistant: "
-        return falcon_format
-    
-    elif "gpt-j" in model_name or "gptj" in model_name:
-        # GPT-J format - simple prompt
-        def gptj_format(task_description):
-            return f"{task_description}\nAnswer: "
-        return gptj_format
-        
-    else:
-        # Generic format for other models
-        def generic_format(task_description):
-            return f"{task_description} "
-        return generic_format
-
 
 def verify_label_lengths(
     audio_sizes,
@@ -243,42 +186,10 @@ class VSP_LLM_dataset(FairseqDataset):
         
         # Check for common model types to use appropriate tokenizer loading
         model_name = os.path.basename(llm_ckpt_path).lower()
-        
-        try:
-            # For Llama models, try direct loading from the model path with specific configs
-            if "llama" in model_name:
-                logger.info("Detected Llama model, using specific loading configuration")
-                from transformers import LlamaTokenizer
-                try:
-                    self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_ckpt_path)
-                except:
-                    # Fall back to AutoTokenizer if LlamaTokenizer fails
-                    self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path)
-            else:
-                # Default loading for other models
-                self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path, trust_remote_code=True, use_fast=False)
-                
-            # Perform explicit type check
-            if self.llm_tokenizer is None or not hasattr(self.llm_tokenizer, '__class__'):
-                raise RuntimeError(f"Tokenizer loaded as invalid type: {type(self.llm_tokenizer)}")
-                
-            # Add debug info
-            logger.info(f"Successfully loaded tokenizer of type: {type(self.llm_tokenizer).__name__}")
-            
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer: {e}")
-            raise RuntimeError(f"Could not load tokenizer from {llm_ckpt_path}: {e}")
-        
-        # Set up pad token if needed
-        if not hasattr(self.llm_tokenizer, 'pad_token') or self.llm_tokenizer.pad_token is None:
-            # Try to use eos_token as pad_token if available
-            if hasattr(self.llm_tokenizer, 'eos_token') and self.llm_tokenizer.eos_token is not None:
-                logger.info(f"Setting pad_token to eos_token: {self.llm_tokenizer.eos_token}")
-                self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
-            else:
-                logger.info("Adding [PAD] as pad_token")
-                self.llm_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_ckpt_path)       
+        self.llm_tokenizer.pad_token_id = self.llm_tokenizer.eos_token_id
+        self.llm_tokenizer.sep_token_id = self.llm_tokenizer.unk_token_id 
+
         # Set padding_side and truncation_side
         self.llm_tokenizer.padding_side = "left"
         self.llm_tokenizer.truncation_side = "left"
@@ -291,7 +202,6 @@ class VSP_LLM_dataset(FairseqDataset):
         
         # Get the appropriate prompt template for this model
         self.model_name = model_name
-        self.prompt_formatter = get_prompt_template(llm_ckpt_path)
 
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
@@ -467,18 +377,12 @@ class VSP_LLM_dataset(FairseqDataset):
                 audio_feats = F.layer_norm(audio_feats, audio_feats.shape[1:])
         cluster_counts = self.load_units(index)
         labels = [self.llm_tokenizer(self.label_list[0][index], return_tensors="pt").input_ids[0]]
-        labels = [torch.cat((labels[0], torch.tensor([2]).long()))]
+        labels = [torch.cat((labels[0], torch.tensor([self.llm_tokenizer.eos_token_id]).long()))]
         
         fid = self.names[index][1].split(':')[1]
         
-        # Create a task description for lip reading
-        task_description = "Recognize these video-input lip reading features in English."
-        
-        # Apply the model-specific prompt format
-        formatted_prompt = self.prompt_formatter(task_description)
-        
         # Tokenize the prompt using the model's tokenizer
-        txt_feats = self.llm_tokenizer(formatted_prompt, return_tensors="pt").input_ids[0]
+        txt_feats = self.llm_tokenizer("Recognize these video-input lip reading features in English. Input : ", return_tensors="pt").input_ids[0]
         
         return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, "cluster_counts": cluster_counts, "label_list": labels, 'text_source':[txt_feats]}
     
@@ -586,6 +490,9 @@ class VSP_LLM_dataset(FairseqDataset):
             batch["ntokens"] = ntokens_list[0]
             if self.is_s2s:
                 batch['target'], net_input['prev_output_tokens'] = targets_list[0][0], targets_list[0][1]
+                
+                # Use a consistent approach for all model types
+                # All models now expect the same set of inputs
                 batch['target_attn_mask'] = target_attn_mask
             else:
                 batch["target"] = targets_list[0]
@@ -648,28 +555,62 @@ class VSP_LLM_dataset(FairseqDataset):
 
 
     def collater_seq_label_llm(self, targets):
+        """
+        Model-agnostic collater function that works with all LLM architectures.
+        Uses a consistent approach for padding and token processing.
+        """
         lengths = torch.LongTensor([len(t) for t in targets])
         ntokens = lengths.sum().item()
-        pad, eos = 0, self.llm_tokenizer.eos_token_id
+        
+        # Use a consistent pad token approach for all models
+        try:
+            # Try to use the model's specified padding token first
+            if hasattr(self.llm_tokenizer, 'pad_token_id') and self.llm_tokenizer.pad_token_id is not None:
+                pad = self.llm_tokenizer.pad_token_id
+            else:
+                try:
+                    # Try special finetune pad token (some models use this)
+                    pad = self.llm_tokenizer("<|finetune_right_pad_id|>").input_ids[1]
+                except:
+                    # Fallback to eos token if no pad token (common for LLMs)
+                    pad = self.llm_tokenizer.eos_token_id
+        except Exception as e:
+            # Final fallback
+            logger.warning(f"Failed to detect pad token, using 0 as fallback. Error: {e}")
+            pad = 0
+                
+        eos = self.llm_tokenizer.eos_token_id
+        
+        # Collate the target tokens
         targets_ = data_utils.collate_tokens(targets, pad_idx=pad, eos_idx=eos, left_pad=False)
        
+        # Create prev_output_tokens by shifting targets
         new_targets = []
         for tar in targets:
             new_targets.append(tar[1:])
 
-        prev_output_tokens = data_utils.collate_tokens(new_targets, pad_idx=pad, eos_idx=eos, left_pad=False, move_eos_to_beginning=False)
+        prev_output_tokens = data_utils.collate_tokens(
+            new_targets, 
+            pad_idx=pad, 
+            eos_idx=eos, 
+            left_pad=False, 
+            move_eos_to_beginning=False
+        )
         
-        
+        # Apply a consistent processing approach for all models
+        # This combines the best aspects of both Llama2 and Llama3 approaches
         prev_list = []
         for prev_tokens in prev_output_tokens:
-            padding_start_idx = torch.sum(prev_tokens == 0) * -1
+            padding_start_idx = torch.sum(prev_tokens == pad) * -1
             if padding_start_idx == 0:
-                prev_list.append(torch.cat((prev_tokens, torch.tensor([2]).long())))
+                prev_list.append(torch.cat((prev_tokens, torch.tensor([eos]).long())))
             else:
-                prev_tokens[padding_start_idx] = 2
-                prev_list.append(torch.cat((prev_tokens, torch.tensor([0]).long())))
-        
+                prev_tokens[padding_start_idx] = eos
+                prev_list.append(torch.cat((prev_tokens, torch.tensor([pad]).long())))
+            
         prev_output_tokens = torch.stack(prev_list, dim=0)
+            
+        # Return collated tensors
         return (targets_, prev_output_tokens), lengths, ntokens
 
 

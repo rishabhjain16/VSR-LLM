@@ -385,15 +385,20 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             labels_embedding = embedding_layer(labels)
 
         llm_input = torch.cat((instruction_embedding, reduced_enc_out, labels_embedding), dim=1)
+        
+        # Prepare labels for loss calculation (used by all model types)
         llm_labels = labels.clone()
         llm_labels[llm_labels == 0] = -100
         
         _, instruction_embedding_t, _ = instruction_embedding.size()
         target_ids = torch.full((B, T + instruction_embedding_t),-100).long().to(labels.device)
         llm_labels = torch.cat((target_ids, llm_labels), dim=1)
+        
+        # Use a single code path for all models instead of model-specific branches
         llm_out = self.decoder(inputs_embeds=llm_input, labels=llm_labels, return_dict=True)
         
-        return llm_out.loss, llm_out.logits
+        # Return loss, logits, and labels for all model types
+        return llm_out.loss, llm_out.logits, llm_labels
 
 
     @torch.no_grad()
@@ -404,7 +409,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 top_p=0.9,
                 repetition_penalty=1.0,
                 length_penalty=0.0,
-                  **kwargs,
+                **kwargs,
                 ):
         output = self.encoder(**kwargs)
         output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
@@ -441,16 +446,18 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             
         llm_input = torch.cat((instruction_embedding, reduced_enc_out), dim=1) 
 
+        # Use a consistent approach for all models
         self.decoder.config.use_cache = True
-        outputs = self.decoder.generate(inputs_embeds=llm_input,
-                        top_p=top_p,
-                        num_beams=num_beams,
-                        max_new_tokens=max_length,
-                        min_length=min_length,
-                        repetition_penalty=repetition_penalty,
-                        do_sample=True,
-                        length_penalty=length_penalty,
-                        )
+        outputs = self.decoder.generate(
+            inputs_embeds=llm_input,
+            top_p=top_p,
+            num_beams=num_beams,
+            max_new_tokens=max_length,
+            min_length=min_length,
+            repetition_penalty=repetition_penalty,
+            do_sample=True,
+            length_penalty=length_penalty,
+        )
 
         return outputs
 

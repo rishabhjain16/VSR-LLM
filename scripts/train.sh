@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/output_AV_VOX_433_with_Llama3    # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_tokenizer_fix    # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -29,7 +29,7 @@ SRC=${ROOT}/src
 # - "mistralai/Mistral-7B-v0.1"
 # - "stabilityai/stablelm-3b-4e1t"
 # - "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-HF_MODEL_ID="meta-llama/Llama-2-13b-hf"  # HuggingFace model ID
+HF_MODEL_ID="Llama-2-7b-hf"  # HuggingFace model ID
 CHECKPOINT_DIR="${ROOT}/checkpoints"
 
 # Check if the model exists locally, if not download it
