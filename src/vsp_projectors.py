@@ -87,9 +87,15 @@ class QFormerProjector(BaseProjector):
         super().__init__(input_dim, output_dim)
         self.num_queries = num_queries
         
-        # Learnable query tokens
+        # Learnable query tokens with improved initialization
         self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, input_dim))
-        nn.init.normal_(self.query_tokens, std=0.02)
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        
+        # Input projection to handle potential dimension issues
+        self.input_proj = nn.Linear(input_dim, input_dim)
+        
+        # Layer norm for better stability
+        self.pre_norm = nn.LayerNorm(input_dim)
         
         # Transformer layers
         encoder_layer = nn.TransformerEncoderLayer(
@@ -99,16 +105,24 @@ class QFormerProjector(BaseProjector):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True
+            norm_first=True  # Pre-norm architecture for better stability
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         
         # Final projection to match LLM dimensions
         self.proj = nn.Linear(input_dim, output_dim)
         
+        # Initialize projection layer properly
+        nn.init.normal_(self.proj.weight, std=0.02)
+        nn.init.zeros_(self.proj.bias)
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, input_dim]
         B = x.size(0)
+        
+        # Apply input projection and normalization
+        x = self.input_proj(x)
+        x = self.pre_norm(x)
         
         # Expand query tokens to batch size
         query_tokens = self.query_tokens.expand(B, -1, -1)
@@ -116,12 +130,33 @@ class QFormerProjector(BaseProjector):
         # Concatenate query tokens with input
         x_with_query = torch.cat([query_tokens, x], dim=1)
         
-        # Create attention mask to prevent queries from attending to each other
+        # Create attention mask to allow queries to attend to all tokens
+        # while input features can only attend to themselves
         query_len, feat_len = self.num_queries, x.size(1)
         total_len = query_len + feat_len
         
+        # Create causal attention mask (1 = cannot attend, 0 = can attend)
+        # Shape: [total_len, total_len]
+        attn_mask = torch.ones(total_len, total_len, device=x.device)
+        
+        # Allow queries to attend to all tokens
+        attn_mask[:query_len, :] = 0
+        
+        # Allow input features to attend only to themselves
+        for i in range(query_len, total_len):
+            attn_mask[i, i] = 0
+            
+        # Convert to proper format for transformer
+        attn_mask = attn_mask.bool()
+        
+        # Get the data type of transformer parameters
+        param_dtype = self.transformer.layers[0].norm1.weight.dtype
+        
+        # Ensure input is in the same data type as transformer parameters
+        x_with_query = x_with_query.to(param_dtype)
+        
         # Process through transformer
-        output = self.transformer(x_with_query)
+        output = self.transformer(x_with_query, mask=attn_mask)
         
         # Extract query outputs
         query_output = output[:, :query_len]
@@ -306,7 +341,7 @@ class PerceiverBlock(nn.Module):
 class AdaptiveQueryProjector(BaseProjector):
     """
     Adaptive Query Transformer Projector
-    Uses learnable query tokens with self-attention to visual features
+    Uses learnable query tokens to attend to visual features
     """
     def __init__(
         self, 
@@ -319,58 +354,72 @@ class AdaptiveQueryProjector(BaseProjector):
         num_queries: int = 32
     ):
         super().__init__(input_dim, output_dim)
+        self.num_queries = num_queries
+        self.hidden_dim = hidden_dim
         
-        # Input projection
+        # Input projection with proper initialization
         self.input_proj = nn.Linear(input_dim, hidden_dim)
+        nn.init.normal_(self.input_proj.weight, std=0.02)
+        nn.init.zeros_(self.input_proj.bias)
         
-        # Query tokens (learnable)
+        # Add normalization for stability
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        
+        # Learnable query tokens with improved initialization
         self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, hidden_dim))
-        nn.init.normal_(self.query_tokens, std=0.02)  # Initialize with normal distribution
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         
-        # Transformer encoder for self-attention
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=num_heads,
-                dim_feedforward=4*hidden_dim,
-                dropout=dropout,
-                batch_first=True
-            ),
-            num_layers=num_layers
+        # Transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True  # Pre-norm for better stability
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         
-        # Final projection to output dimension
+        # Final projection to output dimension with proper initialization
         self.output_proj = nn.Linear(hidden_dim, output_dim)
-    
+        nn.init.normal_(self.output_proj.weight, std=0.02)
+        nn.init.zeros_(self.output_proj.bias)
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, input_dim]
         B = x.size(0)
         
-        # Project input features to hidden dimension
-        x = self.input_proj(x)
+        # Store original dtype for consistent return
+        input_dtype = x.dtype
+        
+        # Project input to hidden dimension and normalize
+        x = self.input_proj(x)  # [B, T, hidden_dim]
+        x = self.input_norm(x)
         
         # Expand query tokens to batch size
-        queries = self.query_tokens.expand(B, -1, -1)
+        query_tokens = self.query_tokens.expand(B, -1, -1)  # [B, num_queries, hidden_dim]
         
-        # Concatenate queries and input features
-        x_with_queries = torch.cat([queries, x], dim=1)
+        # Concatenate query tokens with input features
+        x_with_queries = torch.cat([query_tokens, x], dim=1)  # [B, num_queries + T, hidden_dim]
         
-        # Create attention mask to allow queries to attend to all tokens
-        # but input features can only attend to themselves
-        device = x.device
-        seq_len = x_with_queries.size(1)
-        query_len = queries.size(1)
+        # Create attention mask for transformer
+        # Shape: [seq_len, seq_len]
+        query_len, feat_len = self.num_queries, x.size(1)
+        total_len = query_len + feat_len
         
-        # Create attention mask (1 = don't mask, 0 = mask)
-        # Note: This is the opposite of the mask used in PyTorch's TransformerEncoder
-        mask = torch.zeros(seq_len, seq_len, device=device)
-        # Queries can attend to all tokens
-        mask[:query_len, :] = 1
-        # Input features can only attend to themselves
-        for i in range(query_len, seq_len):
-            mask[i, i] = 1
-        # Convert to boolean mask for PyTorch's attention (True = mask, False = don't mask)
-        attn_mask = (mask == 0)
+        # Create mask where True (1) means tokens cannot attend to each other
+        attn_mask = torch.ones(total_len, total_len, device=x.device)
+        
+        # Allow queries to attend to all tokens (both queries and inputs)
+        attn_mask[:query_len, :] = 0
+        
+        # Allow input features to attend only to themselves (diagonal)
+        for i in range(query_len, total_len):
+            attn_mask[i, i] = 0
+            
+        # Convert to boolean mask for transformer
+        attn_mask = attn_mask.bool()
         
         # Get the data type of transformer parameters
         param_dtype = self.transformer.layers[0].norm1.weight.dtype
@@ -378,16 +427,32 @@ class AdaptiveQueryProjector(BaseProjector):
         # Ensure input is in the same data type as transformer parameters
         x_with_queries = x_with_queries.to(param_dtype)
         
-        # Apply transformer layers
-        out = self.transformer(x_with_queries, mask=attn_mask)
-        
-        # Extract only the query token outputs
-        query_outputs = out[:, :query_len, :]
-        
-        # Project to output dimension
-        output = self.output_proj(query_outputs)
-        
-        return output
+        try:
+            # Process through transformer
+            output = self.transformer(x_with_queries, mask=attn_mask)
+            
+            # Extract only the query token outputs
+            query_output = output[:, :query_len]  # [B, num_queries, hidden_dim]
+            
+            # Project to output dimension
+            result = self.output_proj(query_output)  # [B, num_queries, output_dim]
+            
+            # Return with original dtype for consistency
+            return result.to(input_dtype)
+            
+        except RuntimeError as e:
+            if "expected scalar type" in str(e):
+                # Handle mixed precision error explicitly
+                logger.warning(f"Mixed precision error in AdaptiveQueryProjector: {e}")
+                # Fall back to float32 for the entire computation
+                x_with_queries = x_with_queries.to(torch.float32)
+                output = self.transformer(x_with_queries, mask=attn_mask)
+                query_output = output[:, :query_len]
+                result = self.output_proj(query_output)
+                return result.to(input_dtype)
+            else:
+                # Re-raise if it's not a dtype issue
+                raise
 
 
 class FusionRefinementProjector(BaseProjector):
@@ -738,11 +803,11 @@ class SparseRoutingBlock(nn.Module):
         
         # Get top-k experts
         routing_weights = F.softmax(router_logits, dim=-1)
-        top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)  # [B, T, k], [B, T, k]
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)  # [B, T, k]
         
         # Initialize output tensor
-        expert_outputs = torch.zeros_like(x)
+        expert_outputs = torch.zeros_like(x)  # [B, T, D]
         
         # Process each expert
         for i, expert in enumerate(self.experts):
@@ -1190,19 +1255,20 @@ class BLIP2QFormer(BaseProjector):
         from transformers import BertConfig, BertLMHeadModel, BertModel
         from transformers.models.bert.modeling_bert import BertEncoder, BertPooler, BertAttention
         
-        # Learnable query tokens
+        # Learnable query tokens with better initialization strategy
         self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, input_dim))
-        nn.init.normal_(self.query_tokens, std=0.02)
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         
-        # Visual/audio input projection to match QFormer hidden size
+        # Input normalization for stability
+        self.input_norm = nn.LayerNorm(input_dim)
+        
+        # Visual/audio input projection with explicit initialization
         self.input_proj = nn.Linear(input_dim, input_dim)
+        nn.init.normal_(self.input_proj.weight, std=0.02)
+        nn.init.zeros_(self.input_proj.bias)
         
         # Create BERT-based QFormer
         if use_bert_config:
-            # Instead of using BertLMHeadModel directly with cross-attention,
-            # we'll implement our own architecture using BertModel components
-            # This avoids the decoder model requirement for cross-attention
-            
             # Load default BERT configuration 
             qformer_config = BertConfig.from_pretrained("bert-base-uncased")
             qformer_config.encoder_width = input_dim
@@ -1221,7 +1287,7 @@ class BLIP2QFormer(BaseProjector):
             # Initialize the BERT model for self-attention
             self.bert_model = BertModel(qformer_config, add_pooling_layer=False)
             
-            # Create separate cross-attention layers
+            # Create separate cross-attention layers with proper initialization
             self.cross_attention_layers = nn.ModuleList([
                 nn.MultiheadAttention(
                     embed_dim=input_dim,
@@ -1252,8 +1318,10 @@ class BLIP2QFormer(BaseProjector):
                 for i in range(num_layers)
             ])
         
-        # Final projection to match LLM dimensions
+        # Final projection to match LLM dimensions with proper initialization
         self.output_proj = nn.Linear(input_dim, output_dim)
+        nn.init.normal_(self.output_proj.weight, std=0.02)
+        nn.init.zeros_(self.output_proj.bias)
         
         # Flag to track if we're using BERT or custom implementation
         self.use_bert_config = use_bert_config
@@ -1278,18 +1346,26 @@ class BLIP2QFormer(BaseProjector):
         
         # Create mask if needed and text tokens are provided
         if text_tokens is not None and text_mask is None:
-            text_mask = torch.ones_like(text_tokens)
+            text_mask = (text_tokens != 0).float()  # Convert to float for attention mask
+        
+        # Get the dtype of the input for consistent handling
+        input_dtype = x.dtype
         
         if self.use_bert_config:
-            return self.forward_bert(x, text_tokens, text_mask)
+            # Run forward pass with consistent dtype handling
+            output = self.forward_bert(x, text_tokens, text_mask)
+            # Return with original input dtype for consistency
+            return output.to(input_dtype)
         else:
-            return self.forward_custom(x, text_tokens, text_mask)
+            output = self.forward_custom(x, text_tokens, text_mask)
+            return output.to(input_dtype)
     
     def forward_bert(self, visual_features, text_input_ids=None, text_attention_mask=None):
         """BERT-based implementation forward pass"""
         B = visual_features.size(0)
         
-        # Project visual features
+        # Apply input normalization and projection
+        visual_features = self.input_norm(visual_features)
         visual_features = self.input_proj(visual_features)
         
         # Expand query tokens to batch size
@@ -1302,7 +1378,17 @@ class BLIP2QFormer(BaseProjector):
         if has_text_input:
             # Use BERT embeddings for text
             with torch.no_grad():  # We don't need to update the embedding layer
+                # Handle potential dtype mismatch
+                text_input_ids = text_input_ids.to(dtype=torch.long)
+                # Get embeddings
                 text_embeds = self.bert_model.embeddings.word_embeddings(text_input_ids)
+                # Match dtype with query tokens
+                text_embeds = text_embeds.to(query_tokens.dtype)
+        
+        # Ensure consistent dtype throughout the forward pass
+        # Get BERT's parameter dtype
+        bert_dtype = next(self.bert_model.parameters()).dtype
+        query_tokens = query_tokens.to(bert_dtype)
         
         # Process query tokens through BERT layers with custom cross-attention
         hidden_states = query_tokens
@@ -1317,10 +1403,14 @@ class BLIP2QFormer(BaseProjector):
             if i % 2 == 1 and cross_attn_idx < len(self.cross_attention_layers):
                 # Cross-attention to visual features
                 norm_hidden = self.cross_layer_norms[cross_attn_idx](hidden_states)
+                
+                # Ensure visual features match dtype
+                visual_features_matched = visual_features.to(norm_hidden.dtype)
+                
                 visual_attn_output = self.cross_attention_layers[cross_attn_idx](
                     query=norm_hidden,
-                    key=visual_features,
-                    value=visual_features,
+                    key=visual_features_matched,
+                    value=visual_features_matched,
                     need_weights=False
                 )[0]
                 hidden_states = hidden_states + visual_attn_output
@@ -1328,11 +1418,19 @@ class BLIP2QFormer(BaseProjector):
                 # Cross-attention to text if available
                 if has_text_input:
                     norm_hidden = self.cross_layer_norms[cross_attn_idx](hidden_states)
+                    
+                    # Ensure text embeddings match dtype 
+                    text_embeds_matched = text_embeds.to(norm_hidden.dtype)
+                    text_mask_expanded = None
+                    
+                    if text_attention_mask is not None:
+                        text_mask_expanded = ~text_attention_mask.bool()
+                    
                     text_attn_output = self.cross_attention_layers[cross_attn_idx](
                         query=norm_hidden,
-                        key=text_embeds,
-                        value=text_embeds,
-                        key_padding_mask=None if text_attention_mask is None else ~text_attention_mask.bool(),
+                        key=text_embeds_matched,
+                        value=text_embeds_matched,
+                        key_padding_mask=text_mask_expanded,
                         need_weights=False
                     )[0]
                     hidden_states = hidden_states + text_attn_output
@@ -1351,7 +1449,8 @@ class BLIP2QFormer(BaseProjector):
         """Custom implementation forward pass if not using BERT-based QFormer"""
         B = visual_features.size(0)
         
-        # Project visual features
+        # Apply input normalization and projection
+        visual_features = self.input_norm(visual_features)
         visual_features = self.input_proj(visual_features)
         
         # Expand query tokens to batch size
@@ -1361,21 +1460,16 @@ class BLIP2QFormer(BaseProjector):
         for layer in self.qformer_layers:
             # Only pass text if available
             if text_embeds is not None:
+                # Ensure dtype consistency
+                text_embeds_matched = text_embeds.to(query_tokens.dtype)
                 query_tokens = layer(
                     query_tokens, 
-                    visual_features, 
-                    text_embeds, 
-                    visual_attention_mask=None,
+                    visual_features,
+                    text_embeds_matched,
                     text_attention_mask=attention_mask
                 )
             else:
-                query_tokens = layer(
-                    query_tokens, 
-                    visual_features, 
-                    None,
-                    visual_attention_mask=None,
-                    text_attention_mask=None
-                )
+                query_tokens = layer(query_tokens, visual_features)
         
         # Project to output dimension
         output = self.output_proj(query_tokens)
@@ -1779,8 +1873,7 @@ class TextAwarePerceiverLayer(nn.Module):
 
 class TextAwareAdaptiveQueryProjector(BaseProjector):
     """
-    Text-Aware Adaptive Query Transformer Projector
-    Uses text to condition query tokens with cross-attention to visual features
+    Text-aware version of the AdaptiveQueryProjector that conditions queries based on text
     """
     def __init__(
         self, 
@@ -1793,21 +1886,28 @@ class TextAwareAdaptiveQueryProjector(BaseProjector):
         num_queries: int = 32
     ):
         super().__init__(input_dim, output_dim)
+        self.num_queries = num_queries
+        self.hidden_dim = hidden_dim
         
-        # Input projection
+        # Input projection with proper initialization
         self.input_proj = nn.Linear(input_dim, hidden_dim)
+        nn.init.normal_(self.input_proj.weight, std=0.02)
+        nn.init.zeros_(self.input_proj.bias)
         
-        # Query tokens (learnable)
+        # Input normalization for stability
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        
+        # Learnable query tokens with better initialization
         self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, hidden_dim))
-        nn.init.normal_(self.query_tokens, std=0.02)  # Initialize with normal distribution
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         
-        # Text encoder components - BERT embedding layer for text tokens
-        from transformers import BertConfig, BertModel
-        bert_config = BertConfig.from_pretrained('bert-base-uncased')
-        self.text_embeddings = BertModel.from_pretrained('bert-base-uncased', config=bert_config).embeddings.word_embeddings
+        # Text encoder - project text tokens to hidden_dim with proper initialization
+        self.text_proj = nn.Linear(input_dim, hidden_dim)
+        nn.init.normal_(self.text_proj.weight, std=0.02)
+        nn.init.zeros_(self.text_proj.bias)
         
-        # Project text features to match hidden dimension
-        self.text_proj = nn.Linear(768, hidden_dim)  # BERT hidden size is 768
+        # Text normalization
+        self.text_norm = nn.LayerNorm(hidden_dim)
         
         # Cross-attention for text conditioning
         self.text_cross_attn = nn.MultiheadAttention(
@@ -1816,70 +1916,69 @@ class TextAwareAdaptiveQueryProjector(BaseProjector):
             dropout=dropout,
             batch_first=True
         )
-        self.text_norm = nn.LayerNorm(hidden_dim)
+        self.text_cross_norm = nn.LayerNorm(hidden_dim)
         
-        # Transformer encoder for self-attention
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=num_heads,
-                dim_feedforward=4*hidden_dim,
-                dropout=dropout,
-                batch_first=True
-            ),
-            num_layers=num_layers
+        # Transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True  # Pre-norm for better training stability
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         
-        # Final projection to output dimension
+        # Final projection with proper initialization
         self.output_proj = nn.Linear(hidden_dim, output_dim)
-    
+        nn.init.normal_(self.output_proj.weight, std=0.02)
+        nn.init.zeros_(self.output_proj.bias)
+        
     def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
         # x: [B, T, input_dim]
         B = x.size(0)
         
-        # Project input features to hidden dimension
-        x = self.input_proj(x)
+        # Store input dtype for consistent return
+        input_dtype = x.dtype
+        
+        # Project input features to hidden_dim and normalize
+        x = self.input_proj(x)  # [B, T, hidden_dim]
+        x = self.input_norm(x)
         
         # Expand query tokens to batch size
-        queries = self.query_tokens.expand(B, -1, -1)
+        queries = self.query_tokens.expand(B, -1, -1)  # [B, num_queries, hidden_dim]
         
-        # Process text if available to condition the queries
+        # Process text if available
         if text_tokens is not None:
-            # Get text embeddings using BERT
-            with torch.no_grad():
-                text_embeds = self.text_embeddings(text_tokens)
+            # Project text to hidden dimension and normalize
+            text_features = self.text_proj(text_tokens)  # [B, L, hidden_dim]
+            text_features = self.text_norm(text_features)
             
-            # Project text to hidden dimension
-            text_features = self.text_proj(text_embeds)
+            # Ensure text features have the same dtype as queries
+            text_features = text_features.to(queries.dtype)
             
-            # Apply cross-attention from queries to text
-            queries_norm = self.text_norm(queries)
+            # Condition queries based on text using cross-attention
+            queries_norm = self.text_cross_norm(queries)
+            
+            # Create text attention mask if provided
+            text_attn_mask = None
+            if text_mask is not None:
+                # Convert mask to appropriate format for PyTorch attention
+                # (True where tokens should be ignored)
+                text_attn_mask = ~text_mask.bool()
+                
+            # Apply cross-attention between queries and text
             queries = queries + self.text_cross_attn(
                 query=queries_norm,
                 key=text_features,
                 value=text_features,
-                key_padding_mask=None if text_mask is None else ~text_mask.bool(),
+                key_padding_mask=text_attn_mask,
                 need_weights=False
             )[0]
         
-        # Concatenate conditioned queries and input features
-        x_with_queries = torch.cat([queries, x], dim=1)
-        
-        # Create attention mask to allow queries to attend to all tokens
-        # but input features can only attend to themselves
-        device = x.device
-        seq_len = x_with_queries.size(1)
-        query_len = queries.size(1)
-        
-        # Create attention mask (1 = don't mask, 0 = mask)
-        mask = torch.zeros(seq_len, seq_len, device=device)
-        # Queries can attend to all tokens
-        mask[:query_len, :] = 1
-        # Input features can only attend to themselves
-        for i in range(query_len, seq_len):
-            mask[i, i] = 1
-        # Convert to boolean mask for PyTorch's attention (True = mask, False = don't mask)
-        attn_mask = (mask == 0)
+        # Concatenate query tokens with input features
+        x_with_queries = torch.cat([queries, x], dim=1)  # [B, num_queries + T, hidden_dim]
         
         # Get the data type of transformer parameters
         param_dtype = self.transformer.layers[0].norm1.weight.dtype
@@ -1887,16 +1986,36 @@ class TextAwareAdaptiveQueryProjector(BaseProjector):
         # Ensure input is in the same data type as transformer parameters
         x_with_queries = x_with_queries.to(param_dtype)
         
-        # Apply transformer layers
-        out = self.transformer(x_with_queries, mask=attn_mask)
+        # Create attention mask for the transformer
+        # Shape: [seq_len, seq_len] where seq_len = num_queries + input_length
+        query_len, feat_len = self.num_queries, x.size(1)
+        total_len = query_len + feat_len
         
-        # Extract only the query token outputs
-        query_outputs = out[:, :query_len, :]
+        # Create attention mask where 1 = cannot attend, 0 = can attend
+        # We create a causal mask for the fixed size attention
+        attn_mask = torch.ones(total_len, total_len, device=x.device)
+        
+        # Allow queries to attend to all tokens (both queries and inputs)
+        attn_mask[:query_len, :] = 0
+        
+        # Allow input features to attend only to themselves
+        for i in range(query_len, total_len):
+            attn_mask[i, i] = 0
+            
+        # Convert to proper format for transformer
+        attn_mask = attn_mask.bool()
+        
+        # Process through transformer with proper mask
+        output = self.transformer(x_with_queries, mask=attn_mask)
+        
+        # Extract query outputs only
+        query_output = output[:, :query_len]  # [B, num_queries, hidden_dim]
         
         # Project to output dimension
-        output = self.output_proj(query_outputs)
+        output = self.output_proj(query_output)  # [B, num_queries, output_dim]
         
-        return output
+        # Return with consistent dtype
+        return output.to(input_dtype)
 
 
 class TextAwareHierarchicalMoEProjector(BaseProjector):
@@ -2831,53 +2950,257 @@ class TextConditionedAdapter(nn.Module):
 
 def get_projector(projector_name, input_dim, output_dim, **kwargs):
     """
-    Get a projector instance based on the name and parameters.
+    Factory function to create a projector by name
     
     Args:
-        projector_name: Name of the projector to create
-        input_dim: Input dimension for the projector
-        output_dim: Output dimension for the projector
-        **kwargs: Additional arguments for the projector constructor
-    
+        projector_name: String identifier for projector type
+        input_dim: Input dimension
+        output_dim: Output dimension 
+        **kwargs: Additional arguments to pass to projector constructor
+        
     Returns:
-        An instance of the requested projector
+        Initialized projector
     """
-    import inspect
+    projector_name = projector_name.lower()
     
-    # Dictionary of available projectors
-    projectors = {
-        "linear": LinearProjector,
-        "mlp": MLPProjector,
-        "enhanced_qformer": EnhancedQFormerProjector,
-        "blip2_qformer": BLIP2QFormer,
-        "cross_attention": CrossAttentionProjector,
-        "perceiver": PerceiverProjector,
-        "adaptive_query": AdaptiveQueryProjector,
-        "gated_cross_attention": GatedCrossAttentionProjector,
-        "hierarchical_moe": HierarchicalMoEProjector,
-        "fusion_refinement": FusionRefinementProjector,
-        "multi_scale_contrastive": MultiScaleContrastiveProjector,
-        "pevl_adapter": PEVLAdapter,
-        # Text-aware projectors
-        "text_aware_cross_attention": TextAwareCrossAttentionProjector,
-        "text_aware_perceiver": TextAwarePerceiverProjector,
-        "text_aware_adaptive_query": TextAwareAdaptiveQueryProjector,
-        "text_aware_hierarchical_moe": TextAwareHierarchicalMoEProjector,
-        "text_aware_fusion_refinement": TextAwareFusionRefinementProjector,
-        "text_aware_gated_cross_attention": TextAwareGatedCrossAttentionProjector,
-        "text_aware_multi_scale_contrastive": TextAwareMultiScaleContrastiveProjector,
-        "text_aware_pevl_adapter": TextAwarePEVLAdapter,
-    }
+    # Log the projector creation with its parameters
+    logger.info(f"Creating projector: {projector_name} with input_dim={input_dim}, output_dim={output_dim}")
+    logger.info(f"Additional kwargs: {kwargs}")
     
-    # Check if the requested projector exists
-    if projector_name not in projectors:
-        raise ValueError(f"Unknown projector: {projector_name}. Available projectors: {list(projectors.keys())}")
+    # Basic projectors
+    if projector_name == "linear":
+        return LinearProjector(input_dim, output_dim)
+        
+    elif projector_name == "mlp":
+        return MLPProjector(
+            input_dim, 
+            output_dim, 
+            hidden_dim=kwargs.get("hidden_dim", input_dim * 2),
+            num_layers=kwargs.get("num_layers", 2),
+            activation=kwargs.get("activation", "gelu"),
+            dropout=kwargs.get("dropout", 0.1)
+        )
+        
+    elif projector_name == "qformer":
+        return QFormerProjector(
+            input_dim, 
+            output_dim, 
+            num_queries=kwargs.get("num_queries", 32),
+            num_layers=kwargs.get("num_layers", 6),  # Use more layers by default for QFormer
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1)
+        )
     
-    projector_class = projectors[projector_name]
+    elif projector_name == "blip2_qformer":
+        return BLIP2QFormer(
+            input_dim,
+            output_dim,
+            num_queries=kwargs.get("num_queries", 32),
+            num_layers=kwargs.get("num_layers", 6),
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1),
+            intermediate_size=kwargs.get("intermediate_size", 3072),
+            use_bert_config=kwargs.get("use_bert_config", True)
+        )
     
-    # Filter kwargs to only include parameters that the projector's constructor accepts
-    constructor_params = inspect.signature(projector_class.__init__).parameters
-    filtered_kwargs = {k: v for k, v in kwargs.items() if k in constructor_params}
+    elif projector_name == "cross_attention":
+        return CrossAttentionProjector(
+            input_dim, 
+            output_dim, 
+            num_heads=kwargs.get("num_heads", 8),
+            num_layers=kwargs.get("num_layers", 2),
+            dropout=kwargs.get("dropout", 0.1)
+        )
+        
+    elif projector_name == "perceiver":
+        return PerceiverProjector(
+            input_dim, 
+            output_dim, 
+            num_latents=kwargs.get("num_latents", 32),
+            num_layers=kwargs.get("num_layers", 3),
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1)
+        )
+        
+    elif projector_name == "adaptive_query":
+        return AdaptiveQueryProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 1024),
+            num_heads=kwargs.get("num_heads", 8),
+            num_layers=kwargs.get("num_layers", 3),
+            dropout=kwargs.get("dropout", 0.1),
+            num_queries=kwargs.get("num_queries", 32)
+        )
     
-    # Return the instantiated projector
-    return projector_class(input_dim, output_dim, **filtered_kwargs)
+    elif projector_name == "fusion_refinement":
+        return FusionRefinementProjector(
+            input_dim,
+            output_dim,
+            num_stages=kwargs.get("num_stages", 3),
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1)
+        )
+        
+    elif projector_name == "gated_cross_attention":
+        return GatedCrossAttentionProjector(
+            input_dim,
+            output_dim,
+            num_heads=kwargs.get("num_heads", 8),
+            num_layers=kwargs.get("num_layers", 2),
+            dropout=kwargs.get("dropout", 0.1),
+            use_gate_mlp=kwargs.get("use_gate_mlp", True)
+        )
+        
+    elif projector_name == "hierarchical_moe":
+        return HierarchicalMoEProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 2048),
+            num_experts=kwargs.get("num_experts", 8),
+            k=kwargs.get("k", 2),
+            num_layers=kwargs.get("num_layers", 2)
+        )
+        
+    elif projector_name == "enhanced_qformer":
+        return EnhancedQFormerProjector(
+            input_dim,
+            output_dim,
+            num_queries=kwargs.get("num_queries", 32),
+            num_layers=kwargs.get("num_layers", 6),
+            num_heads=kwargs.get("num_heads", 8),
+            intermediate_dim=kwargs.get("intermediate_dim", 3072),
+            dropout=kwargs.get("dropout", 0.1)
+        )
+        
+    elif projector_name == "multiscale_contrastive":
+        return MultiScaleContrastiveProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 2048),
+            num_scales=kwargs.get("num_scales", 3),
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1),
+            contrastive_temp=kwargs.get("contrastive_temp", 0.07)
+        )
+        
+    elif projector_name == "pevl_adapter":
+        return PEVLAdapter(
+            input_dim,
+            output_dim,
+            bottleneck_dim=kwargs.get("bottleneck_dim", 256),
+            num_layers=kwargs.get("num_layers", 2),
+            num_tasks=kwargs.get("num_tasks", 1)
+        )
+        
+    elif projector_name == "self_aggregating_linear":
+        return SelfAggregatingLinearProjector(
+            input_dim,
+            output_dim,
+            num_output_tokens=kwargs.get("num_output_tokens", 32)
+        )
+        
+    elif projector_name == "self_aggregating_mlp":
+        return SelfAggregatingMLPProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", input_dim * 2),
+            num_layers=kwargs.get("num_layers", 2),
+            activation=kwargs.get("activation", "gelu"),
+            dropout=kwargs.get("dropout", 0.1),
+            num_output_tokens=kwargs.get("num_output_tokens", 32)
+        )
+    
+    # Text-Aware projectors
+    elif projector_name == "text_aware_cross_attention":
+        return TextAwareCrossAttentionProjector(
+            input_dim,
+            output_dim,
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1),
+            num_layers=kwargs.get("num_layers", 2),
+            num_output_tokens=kwargs.get("num_output_tokens", 32)
+        )
+        
+    elif projector_name == "text_aware_perceiver":
+        return TextAwarePerceiverProjector(
+            input_dim,
+            output_dim,
+            num_latents=kwargs.get("num_latents", 32),
+            num_latent_dim=kwargs.get("num_latent_dim", 512),
+            num_layers=kwargs.get("num_layers", 4),
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1)
+        )
+        
+    elif projector_name == "text_aware_adaptive_query":
+        return TextAwareAdaptiveQueryProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 1024),
+            num_heads=kwargs.get("num_heads", 8),
+            num_layers=kwargs.get("num_layers", 3),
+            dropout=kwargs.get("dropout", 0.1),
+            num_queries=kwargs.get("num_queries", 32)
+        )
+        
+    elif projector_name == "text_aware_hierarchical_moe":
+        return TextAwareHierarchicalMoEProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 2048),
+            num_experts=kwargs.get("num_experts", 8),
+            k=kwargs.get("k", 2),
+            num_layers=kwargs.get("num_layers", 2),
+            num_output_tokens=kwargs.get("num_output_tokens", 32),
+            dropout=kwargs.get("dropout", 0.1),
+            num_heads=kwargs.get("num_heads", 8)
+        )
+        
+    elif projector_name == "text_aware_fusion_refinement":
+        return TextAwareFusionRefinementProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 1024),
+            num_heads=kwargs.get("num_heads", 8),
+            num_refinement_steps=kwargs.get("num_refinement_steps", 3),
+            dropout=kwargs.get("dropout", 0.1),
+            num_output_tokens=kwargs.get("num_output_tokens", 32)
+        )
+        
+    elif projector_name == "text_aware_gated_cross_attention":
+        return TextAwareGatedCrossAttentionProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 1024),
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1),
+            num_layers=kwargs.get("num_layers", 3),
+            num_output_tokens=kwargs.get("num_output_tokens", 32)
+        )
+        
+    elif projector_name == "text_aware_multiscale_contrastive":
+        return TextAwareMultiScaleContrastiveProjector(
+            input_dim,
+            output_dim,
+            hidden_dim=kwargs.get("hidden_dim", 2048),
+            num_scales=kwargs.get("num_scales", 3),
+            num_heads=kwargs.get("num_heads", 8),
+            dropout=kwargs.get("dropout", 0.1),
+            contrastive_temp=kwargs.get("contrastive_temp", 0.07),
+            num_output_tokens=kwargs.get("num_output_tokens", 32)
+        )
+        
+    elif projector_name == "text_aware_pevl_adapter":
+        return TextAwarePEVLAdapter(
+            input_dim,
+            output_dim,
+            bottleneck_dim=kwargs.get("bottleneck_dim", 256),
+            num_adapter_layers=kwargs.get("num_adapter_layers", 3),
+            dropout=kwargs.get("dropout", 0.1),
+            num_heads=kwargs.get("num_heads", 8),
+            num_output_tokens=kwargs.get("num_output_tokens", 32)
+        )
+        
+    else:
+        raise ValueError(f"Unknown projector type: {projector_name}")
