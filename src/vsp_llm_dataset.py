@@ -36,7 +36,7 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def load_audio_visual(manifest_path, max_keep, min_keep, frame_rate, label_paths, label_rates, tol=0.1):
+def load_audio_visual(manifest_path, max_keep, min_keep, frame_rate, label_paths, label_rates, tol=0.1, is_query_based=False):
     def is_audio_label_aligned(audio_dur, label_durs):
         return all([abs(audio_dur - label_dur)<tol for label_dur in label_durs])
 
@@ -50,9 +50,24 @@ def load_audio_visual(manifest_path, max_keep, min_keep, frame_rate, label_paths
     dur_from_label_list = list(zip(*dur_from_label_list))
     
     manifest = manifest_path.split('/')[-1].split('.')[0]
-    cluster_counts_fn = manifest_path.replace('.tsv','.cluster_counts')
-    cluster_counts_list = open(cluster_counts_fn).readlines()
+    cluster_counts_list = []
     
+    # Only load cluster_counts for non-query-based projectors (linear, MLP)
+    if not is_query_based:
+        cluster_counts_fn = manifest_path.replace('.tsv','.cluster_counts')
+        if os.path.exists(cluster_counts_fn):
+            cluster_counts_list = open(cluster_counts_fn).readlines()
+            logger.info(f"Loaded cluster counts from {cluster_counts_fn}")
+        else:
+            logger.warning(f"Cluster counts file {cluster_counts_fn} not found, but required for non-query projectors!")
+            logger.warning(f"Creating dummy cluster counts for compatibility")
+            # Create dummy cluster counts for compatibility
+            with open(manifest_path) as f:
+                f.readline()  # Skip root
+                dummy_counts = []
+                for _ in f:
+                    dummy_counts.append("1")  # Default 1 cluster per frame
+                cluster_counts_list = dummy_counts
     
     cluster_counts = []
     with open(manifest_path) as f:
@@ -73,7 +88,12 @@ def load_audio_visual(manifest_path, max_keep, min_keep, frame_rate, label_paths
                 names.append((video_path, audio_path+':'+audio_id))
                 inds.append(ind)
                 sizes.append(sz)
-                cluster_counts.append(cluster_counts_list[ind].strip())
+                if not is_query_based and cluster_counts_list:
+                    # Only add cluster counts for non-query projectors
+                    cluster_counts.append(cluster_counts_list[ind].strip())
+                elif not is_query_based:
+                    # If we don't have cluster counts but need them, use default of 1
+                    cluster_counts.append("1")
     tot = ind + 1
     logger.info(
         (
@@ -172,7 +192,8 @@ class VSP_LLM_dataset(FairseqDataset):
             noise_fn=None,
             noise_prob=0,
             noise_snr=0,
-            noise_num=1
+            noise_num=1,
+            projector_type: str = "linear"
     ):
         # Load tokenizer with explicit type checking
         logger.info(f"Loading tokenizer from {llm_ckpt_path}")
@@ -202,14 +223,33 @@ class VSP_LLM_dataset(FairseqDataset):
         
         # Get the appropriate prompt template for this model
         self.model_name = model_name
-
+        
+        # Check if we're using a query-based projector
+        query_based_projectors = [
+            "qformer", "enhanced_qformer", "visual_speech_qformer", 
+            "perceiver", "cross_attention", "adaptive_query",
+            "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
+            "text_aware_comprehensive_qformer", "visual_text_alignment", "visual_speech_text_qformer",
+            "ebranchformer_visual_speech"
+        ]
+        is_query_based = any(qp in projector_type.lower() for qp in query_based_projectors)
+        logger.info(f"Using projector type: {projector_type} (query-based: {is_query_based})")
+        
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
             if isinstance(label_rates, int)
             else label_rates
         )
         self.modalities = set(modalities)
-        self.audio_root, self.names, inds, tot, self.sizes, self.cluster_counts, = load_audio_visual(manifest_path, max_keep_sample_size, min_keep_sample_size, frame_rate=sample_rate, label_paths=label_paths, label_rates=self.label_rates)
+        self.audio_root, self.names, inds, tot, self.sizes, self.cluster_counts, = load_audio_visual(
+            manifest_path, 
+            max_keep_sample_size, 
+            min_keep_sample_size, 
+            frame_rate=sample_rate, 
+            label_paths=label_paths, 
+            label_rates=self.label_rates,
+            is_query_based=is_query_based  # Pass the is_query_based flag
+        )
         self.sample_rate = sample_rate
         self.stack_order_audio = stack_order_audio
         self.shuffle = shuffle

@@ -7,29 +7,14 @@
 
 
 # set variables
-DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
+DATA_PATH=/data/ssd3/data_rishabh/lrs3/433h_data   # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_proj_test_vision   # output path to save
+OUT_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_mlp    # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
 
-# Set the path to your LLM model here
-# You can use any HuggingFace compatible model like:
-# - Llama models: Meta-Llama-3-8B, Llama-2-7b-hf, etc.
-# - Mistral models: mistralai/Mistral-7B-v0.1
-# - Other models: EleutherAI/gpt-j-6b, facebook/opt-6.7b, etc.
-
-# IMPORTANT: For gated models like Llama-2 and Llama-3, you need to:
-#  1. Create a Hugging Face account: https://huggingface.co/join
-#  2. Request access to the model: https://huggingface.co/meta-llama/Llama-2-13b-hf
-#  3. Log in with: huggingface-cli login
-#
-# If you don't have access, use an open model like:
-# - "mistralai/Mistral-7B-v0.1"
-# - "stabilityai/stablelm-3b-4e1t"
-# - "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-HF_MODEL_ID="Llama-2-7b-hf"  # HuggingFace model ID
+HF_MODEL_ID="meta-llama/Llama-2-7b-hf"  # HuggingFace model ID
 CHECKPOINT_DIR="${ROOT}/checkpoints"
 
 # Check if the model exists locally, if not download it
@@ -83,23 +68,16 @@ fi
 
 PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert large_lrs3_iter5
 
-# Note: The code has been updated to automatically:
-#  - Detect model architecture and adapt LoRA parameters accordingly
-#  - Handle different model hidden sizes (encoder dimensions)
-#  - Configure tokenizers appropriately for different models
-#  - Apply model-specific prompt templates for optimal performance
-# You should not need to manually modify the code for different model architectures
-
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 
 # Default to linear projector if not specified
-PROJECTOR_TYPE=${PROJECTOR_TYPE:-ebranchformer_visual_speech}
+PROJECTOR_TYPE=${PROJECTOR_TYPE:-mlp}
 
 fairseq-hydra-train \
     --config-dir ${SRC}/conf \
-    --config-name vsp-llm-433h-freeze \
+    --config-name vsp-llm-dodder \
         common.user_dir=${SRC} \
         task.data=${DATA_PATH} \
         task.label_dir=${DATA_PATH} \

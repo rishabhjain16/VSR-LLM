@@ -183,7 +183,7 @@ class VSPLLMConfig(FairseqDataclass):
         metadata={"help": "Dropout rate in projector (if applicable)"}
     )
     projector_num_queries: int = field(
-        default=32, 
+        default=256, 
         metadata={"help": "Number of queries in query-based projectors (if applicable)"}
     )
 
@@ -283,6 +283,15 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             
         # Create the projector
         self.avfeat_to_llm = get_projector(cfg.projector_type, **projector_kwargs)
+        
+        # Add attention-based cluster aggregation components
+        hidden_size = projector_kwargs['output_dim']
+        self.cluster_attention = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.GELU(),
+            nn.Linear(128, 1)
+        )
+        
         # Log the projector type being used
         logger.info(f"==========================================================")
         logger.info(f"INITIALIZING MODEL WITH PROJECTOR TYPE: {cfg.projector_type}")
@@ -445,8 +454,16 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             for clutser_num in cluster_counts:
                 end_idx = start_idx + clutser_num
                 slice = output['encoder_out'][:,start_idx:end_idx,:]
-                mean_tensor = torch.mean(slice, dim=1, keepdim=True)
-                results_tensor.append(mean_tensor)            
+                
+                # Enhanced cluster aggregation with attention weighting
+                # Calculate attention weights across frames in the cluster
+                attn_scores = self.cluster_attention(slice)  # [B, T, 1]
+                attn_weights = torch.nn.functional.softmax(attn_scores, dim=1)
+                
+                # Apply weighted aggregation instead of simple mean
+                weighted_avg = (slice * attn_weights).sum(dim=1, keepdim=True)
+                results_tensor.append(weighted_avg)
+                
                 start_idx = end_idx
     
             # Verify we processed the entire sequence for non-query projectors
@@ -455,7 +472,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             reduced_enc_out = torch.cat(results_tensor, dim=1)
             # Only log the shape once
             if not self.logged_projector_shape:
-                logger.info(f"Using cluster-based aggregation with output shape: {reduced_enc_out.size()}")
+                logger.info(f"Using attention-weighted cluster aggregation with output shape: {reduced_enc_out.size()}")
                 self.logged_projector_shape = True
         
         B, T, D = reduced_enc_out.size()
@@ -556,8 +573,16 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             for clutser_num in cluster_counts:
                 end_idx = start_idx + clutser_num
                 slice = output['encoder_out'][:,start_idx:end_idx,:]
-                mean_tensor = torch.mean(slice, dim=1, keepdim=True)
-                results_tensor.append(mean_tensor)            
+                
+                # Enhanced cluster aggregation with attention weighting
+                # Calculate attention weights across frames in the cluster
+                attn_scores = self.cluster_attention(slice)  # [B, T, 1]
+                attn_weights = torch.nn.functional.softmax(attn_scores, dim=1)
+                
+                # Apply weighted aggregation instead of simple mean
+                weighted_avg = (slice * attn_weights).sum(dim=1, keepdim=True)
+                results_tensor.append(weighted_avg)
+                
                 start_idx = end_idx
     
             # Verify we processed the entire sequence
@@ -588,7 +613,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             inputs_embeds=llm_input,
             top_p=top_p,
             num_beams=num_beams,
-            max_new_tokens=max_length,
+            max_new_tokens=128,
             min_length=min_length,
             repetition_penalty=repetition_penalty,
             do_sample=True,

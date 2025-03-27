@@ -176,7 +176,6 @@ class VSP_LLM_TrainingTask(FairseqTask):
         return self.cfg.label_dir
 
     def load_dataset(self, split: str, **kwargs) -> None:
-
         manifest = f"{self.cfg.data}/{split}.tsv"
         logger.info(f"Using tokenizer")
         paths = [
@@ -185,6 +184,19 @@ class VSP_LLM_TrainingTask(FairseqTask):
         image_aug = self.cfg.image_aug if split == 'train' else False
         noise_fn, noise_snr = f"{self.cfg.noise_wav}/{split}.tsv" if self.cfg.noise_wav is not None else None, eval(self.cfg.noise_snr)
         noise_num = self.cfg.noise_num # 
+        
+        # Get projector_type from task_cfg if available, otherwise from self.cfg
+        task_cfg = kwargs.get('task_cfg', None)
+        if task_cfg and hasattr(task_cfg, 'model') and hasattr(task_cfg.model, 'projector_type'):
+            projector_type = task_cfg.model.projector_type
+            logger.info(f"Using projector_type from task_cfg: {projector_type}")
+        elif hasattr(self.cfg, 'model') and hasattr(self.cfg.model, 'projector_type'):
+            projector_type = self.cfg.model.projector_type
+            logger.info(f"Using projector_type from self.cfg.model: {projector_type}")
+        else:
+            projector_type = "linear"  # Default
+            logger.info(f"No projector_type specified, using default: {projector_type}")
+            
         self.datasets[split] = VSP_LLM_dataset(
             manifest,
             sample_rate=self.cfg.sample_rate,
@@ -210,7 +222,8 @@ class VSP_LLM_TrainingTask(FairseqTask):
             noise_fn=noise_fn,
             noise_prob=self.cfg.noise_prob,
             noise_snr=noise_snr,
-            noise_num=noise_num
+            noise_num=noise_num,
+            projector_type=projector_type  # Pass the projector_type
         )
 
     def max_positions(self) -> Tuple[int, int]:

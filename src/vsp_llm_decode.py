@@ -193,7 +193,7 @@ def _main(cfg, output_file):
             model.half()
 
     # Load dataset (possibly sharded)
-    cfg.dataset.batch_size = 1
+    cfg.dataset.batch_size = 4
     cfg.dataset.max_tokens = 2000
     itr = task.get_batch_iterator(
         dataset=task.dataset(cfg.dataset.gen_subset),
