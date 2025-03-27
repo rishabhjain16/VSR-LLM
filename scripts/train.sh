@@ -14,21 +14,6 @@ OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_pr
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
 
-# Set the path to your LLM model here
-# You can use any HuggingFace compatible model like:
-# - Llama models: Meta-Llama-3-8B, Llama-2-7b-hf, etc.
-# - Mistral models: mistralai/Mistral-7B-v0.1
-# - Other models: EleutherAI/gpt-j-6b, facebook/opt-6.7b, etc.
-
-# IMPORTANT: For gated models like Llama-2 and Llama-3, you need to:
-#  1. Create a Hugging Face account: https://huggingface.co/join
-#  2. Request access to the model: https://huggingface.co/meta-llama/Llama-2-13b-hf
-#  3. Log in with: huggingface-cli login
-#
-# If you don't have access, use an open model like:
-# - "mistralai/Mistral-7B-v0.1"
-# - "stabilityai/stablelm-3b-4e1t"
-# - "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 HF_MODEL_ID="Llama-2-7b-hf"  # HuggingFace model ID
 CHECKPOINT_DIR="${ROOT}/checkpoints"
 
@@ -100,7 +85,7 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # -------------------------------------------------------------
 
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
-PROJECTOR_TYPE="linear"
+PROJECTOR_TYPE="visual_speech_qformer"
 
 # Whether to use attention-weighted cluster aggregation (true) or simple mean (false)
 # Only applies to non-query-based projectors like linear, mlp, ebranchformer_cluster

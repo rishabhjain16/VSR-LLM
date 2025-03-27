@@ -73,8 +73,11 @@ export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 
 # Default to linear projector if not specified
-PROJECTOR_TYPE=${PROJECTOR_TYPE:-mlp}
+# Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
+PROJECTOR_TYPE="visual_speech_qformer"
 
+# Whether to use attention-weighted cluster aggregation (true) or simple mean (false)
+# Only applies to non-query-based projectors like linear, mlp, ebranchformer_cluster
 USE_ATTENTION_CLUSTER=true
 
 # -------------------------------------------------------------
@@ -103,3 +106,4 @@ fairseq-hydra-train \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
         distributed_training.nprocs_per_node=1 
+
