@@ -77,12 +77,6 @@ PROJECTOR_TYPE=${PROJECTOR_TYPE:-mlp}
 
 USE_ATTENTION_CLUSTER=true
 
-
-asd
-asda
-dataad
-
-
 # -------------------------------------------------------------
 # End of configuration section
 # -------------------------------------------------------------
