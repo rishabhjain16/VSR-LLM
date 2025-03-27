@@ -303,12 +303,16 @@ class VSP_LLM_dataset(FairseqDataset):
 
 
     def load_units(self, index):
-        #assert('video' in self.modalities and 'audio' in self.modalities)
-        av_units = self.cluster_counts[index].strip().split(' ')
-        int_av_units = [int(x) for x in av_units]
-        av_units = torch.tensor(int_av_units, dtype=int)
-
-        return av_units
+        # For projectors that need cluster_counts (non-query-based)
+        if hasattr(self, 'cluster_counts') and len(self.cluster_counts) > 0:
+            av_units = self.cluster_counts[index].strip().split(' ')
+            int_av_units = [int(x) for x in av_units]
+            av_units = torch.tensor(int_av_units, dtype=int)
+            return av_units
+        else:
+            # For query-based projectors, just return an empty tensor
+            # The actual value doesn't matter as it won't be used
+            return torch.tensor([], dtype=int)
         
     def load_feature(self, mix_name):
         """

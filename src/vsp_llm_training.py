@@ -132,6 +132,10 @@ class VSP_LLM_TrainingConfig(FairseqDataclass):
     noise_snr: Optional[str] = field(default='0', metadata={'help': 'noise SNR in audio'})
     noise_num: int = field(default=1, metadata={'help': 'number of noise wav files to mix'})
     fine_tuning: bool = field(default=False, metadata={"help": "set to true if fine-tuning AV-Hubert"})
+    projector_type: Optional[str] = field(
+        default="linear", 
+        metadata={"help": "Type of projector to use (linear, mlp, qformer, etc.)"}
+    )
 
 @register_task("vsp_llm_training", dataclass=VSP_LLM_TrainingConfig)
 class VSP_LLM_TrainingTask(FairseqTask):
@@ -175,28 +179,39 @@ class VSP_LLM_TrainingTask(FairseqTask):
             return self.cfg.data
         return self.cfg.label_dir
 
-    def load_dataset(self, split: str, **kwargs) -> None:
-        manifest = f"{self.cfg.data}/{split}.tsv"
+    def load_dataset(self, split, task_cfg=None, **kwargs):
+        manifest = f"{self.get_label_dir()}/{split}.tsv"
+        if not os.path.isfile(manifest):
+            manifest = f"{self.cfg.data}/{split}.tsv"
+        logger.info(f"manifests: {manifest}")
+        
         logger.info(f"Using tokenizer")
         paths = [
             f"{self.get_label_dir()}/{split}.{l}" for l in self.cfg.labels
         ]
         image_aug = self.cfg.image_aug if split == 'train' else False
         noise_fn, noise_snr = f"{self.cfg.noise_wav}/{split}.tsv" if self.cfg.noise_wav is not None else None, eval(self.cfg.noise_snr)
-        noise_num = self.cfg.noise_num # 
+        noise_num = self.cfg.noise_num
         
-        # Get projector_type from task_cfg if available, otherwise from self.cfg
-        task_cfg = kwargs.get('task_cfg', None)
-        if task_cfg and hasattr(task_cfg, 'model') and hasattr(task_cfg.model, 'projector_type'):
-            projector_type = task_cfg.model.projector_type
-            logger.info(f"Using projector_type from task_cfg: {projector_type}")
-        elif hasattr(self.cfg, 'model') and hasattr(self.cfg.model, 'projector_type'):
+        # Find the projector_type from different potential sources
+        projector_type = None
+        
+        # Try to get from task_cfg first, highest priority
+        if task_cfg and hasattr(task_cfg, 'projector_type') and task_cfg.projector_type is not None:
+            projector_type = task_cfg.projector_type
+        # Then try to get from self.cfg
+        elif hasattr(self.cfg, 'projector_type') and self.cfg.projector_type is not None:
+            projector_type = self.cfg.projector_type
+        # Then try to get from self.cfg.model
+        elif hasattr(self.cfg, 'model') and hasattr(self.cfg.model, 'projector_type') and self.cfg.model.projector_type is not None:
             projector_type = self.cfg.model.projector_type
-            logger.info(f"Using projector_type from self.cfg.model: {projector_type}")
+        # Default fallback
         else:
-            projector_type = "linear"  # Default
-            logger.info(f"No projector_type specified, using default: {projector_type}")
+            projector_type = "linear"  # Default fallback
             
+        # Check if we're using a query-based projector
+        is_query_based = "qformer" in projector_type.lower()
+        
         self.datasets[split] = VSP_LLM_dataset(
             manifest,
             sample_rate=self.cfg.sample_rate,
@@ -223,7 +238,7 @@ class VSP_LLM_TrainingTask(FairseqTask):
             noise_prob=self.cfg.noise_prob,
             noise_snr=noise_snr,
             noise_num=noise_num,
-            projector_type=projector_type  # Pass the projector_type
+            projector_type=projector_type
         )
 
     def max_positions(self) -> Tuple[int, int]:
