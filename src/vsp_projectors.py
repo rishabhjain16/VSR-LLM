@@ -3308,6 +3308,19 @@ def get_projector(projector_name, input_dim, output_dim, **kwargs):
             **kwargs
         )
     
+    # E-Branchformer for Cluster-based approach
+    elif projector_name == "ebranchformer_cluster":
+        # Remove args that are not used by EBranchformerClusterProjector
+        for k in list(kwargs.keys()):
+            if k not in inspect.signature(EBranchformerClusterProjector.__init__).parameters:
+                kwargs.pop(k)
+                
+        return EBranchformerClusterProjector(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            **kwargs
+        )
+    
     else:
         raise ValueError(f"Unknown projector type: {projector_name}")
 
@@ -4393,3 +4406,94 @@ class CGMixerFeedForward(nn.Module):
         output = channel_gate * channel_out + spatial_gate * spatial_out
         
         return output
+
+
+class EBranchformerClusterProjector(BaseProjector):
+    """E-Branchformer projector that maintains sequence length for cluster-based aggregation
+    
+    Unlike the query-based version, this projector processes the input features without
+    reducing the sequence length, allowing the model to use cluster-based aggregation.
+    It enhances features while preserving the temporal structure for downstream aggregation.
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        output_dim: int, 
+        hidden_dim: int = 512,
+        num_layers: int = 4, 
+        num_heads: int = 8, 
+        dropout: float = 0.1,
+        conv_kernel_size: int = 31,  # Larger kernel for lip movement context
+        ffn_expansion_factor: int = 4,
+    ):
+        super().__init__(input_dim, output_dim)
+        
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # Input projection
+        self.input_projection = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.Dropout(dropout)
+        )
+        
+        # E-Branchformer blocks
+        self.blocks = nn.ModuleList([
+            EBranchformerBlock(
+                dim=hidden_dim,
+                num_heads=num_heads,
+                conv_kernel_size=conv_kernel_size,
+                ffn_expansion_factor=ffn_expansion_factor,
+                dropout=dropout,
+                use_cgmlp=(i % 2 == 0),  # Alternate between CGMixer and standard MLPs
+                layer_idx=i
+            ) for i in range(num_layers)
+        ])
+        
+        # Final projection
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.output_projection = nn.Linear(hidden_dim, output_dim)
+        
+        # For numerical stability and debugging
+        self.logger = logging.getLogger(__name__)
+    
+    def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
+        """Forward pass with improved numerical stability
+        
+        Args:
+            x: Visual features [B, T, D]
+            text_tokens: Optional text tokens (for compatibility with text-aware projectors)
+            text_mask: Optional text attention mask
+            
+        Returns:
+            Projected features [B, T, output_dim] - maintains original sequence length
+        """
+        try:
+            # Store original precision
+            orig_dtype = x.dtype
+            
+            # Project input to hidden dimension
+            x = self.input_projection(x)
+            
+            # Process through E-Branchformer blocks
+            for block in self.blocks:
+                x = block(x)
+            
+            # Final norm and projection
+            x = self.norm(x)
+            output = self.output_projection(x)
+            
+            return output
+            
+        except RuntimeError as e:
+            # Handle mixed precision error explicitly
+            if "cuda runtime error" in str(e).lower() or "nan" in str(e).lower() or "inf" in str(e).lower():
+                self.logger.warning(f"Mixed precision error in EBranchformerClusterProjector: {e}")
+                # Fall back to float32 computation
+                with torch.cuda.amp.autocast(enabled=False):
+                    return self.forward(x.float(), 
+                                       None if text_tokens is None else text_tokens.float(), 
+                                       text_mask)
+            else:
+                raise e

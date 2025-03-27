@@ -186,6 +186,14 @@ class VSPLLMConfig(FairseqDataclass):
         default=256, 
         metadata={"help": "Number of queries in query-based projectors (if applicable)"}
     )
+    use_attention_cluster: bool = field(
+        default=True,
+        metadata={"help": "Use attention-weighted cluster aggregation instead of simple mean"}
+    )
+    data_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "path to data directory. DEPRECATED!"},
+    )
 
 
 
@@ -292,9 +300,13 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             nn.Linear(128, 1)
         )
         
+        # Store the cluster aggregation method setting
+        self.use_attention_cluster = cfg.use_attention_cluster
+        
         # Log the projector type being used
         logger.info(f"==========================================================")
         logger.info(f"INITIALIZING MODEL WITH PROJECTOR TYPE: {cfg.projector_type}")
+        logger.info(f"USING ATTENTION CLUSTER: {cfg.use_attention_cluster}")
         logger.info(f"==========================================================")
         self.freeze_finetune_updates = cfg.freeze_finetune_updates
         
@@ -455,14 +467,19 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 end_idx = start_idx + clutser_num
                 slice = output['encoder_out'][:,start_idx:end_idx,:]
                 
-                # Enhanced cluster aggregation with attention weighting
-                # Calculate attention weights across frames in the cluster
-                attn_scores = self.cluster_attention(slice)  # [B, T, 1]
-                attn_weights = torch.nn.functional.softmax(attn_scores, dim=1)
-                
-                # Apply weighted aggregation instead of simple mean
-                weighted_avg = (slice * attn_weights).sum(dim=1, keepdim=True)
-                results_tensor.append(weighted_avg)
+                if self.use_attention_cluster:
+                    # Enhanced cluster aggregation with attention weighting
+                    # Calculate attention weights across frames in the cluster
+                    attn_scores = self.cluster_attention(slice)  # [B, T, 1]
+                    attn_weights = torch.nn.functional.softmax(attn_scores, dim=1)
+                    
+                    # Apply weighted aggregation instead of simple mean
+                    weighted_avg = (slice * attn_weights).sum(dim=1, keepdim=True)
+                    results_tensor.append(weighted_avg)
+                else:
+                    # Original method: simple mean aggregation
+                    mean_avg = slice.mean(dim=1, keepdim=True)
+                    results_tensor.append(mean_avg)
                 
                 start_idx = end_idx
     
@@ -472,7 +489,10 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             reduced_enc_out = torch.cat(results_tensor, dim=1)
             # Only log the shape once
             if not self.logged_projector_shape:
-                logger.info(f"Using attention-weighted cluster aggregation with output shape: {reduced_enc_out.size()}")
+                if self.use_attention_cluster:
+                    logger.info(f"Using attention-weighted cluster aggregation with output shape: {reduced_enc_out.size()}")
+                else:
+                    logger.info(f"Using mean cluster aggregation with output shape: {reduced_enc_out.size()}")
                 self.logged_projector_shape = True
         
         B, T, D = reduced_enc_out.size()
@@ -574,14 +594,19 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 end_idx = start_idx + clutser_num
                 slice = output['encoder_out'][:,start_idx:end_idx,:]
                 
-                # Enhanced cluster aggregation with attention weighting
-                # Calculate attention weights across frames in the cluster
-                attn_scores = self.cluster_attention(slice)  # [B, T, 1]
-                attn_weights = torch.nn.functional.softmax(attn_scores, dim=1)
-                
-                # Apply weighted aggregation instead of simple mean
-                weighted_avg = (slice * attn_weights).sum(dim=1, keepdim=True)
-                results_tensor.append(weighted_avg)
+                if self.use_attention_cluster:
+                    # Enhanced cluster aggregation with attention weighting
+                    # Calculate attention weights across frames in the cluster
+                    attn_scores = self.cluster_attention(slice)  # [B, T, 1]
+                    attn_weights = torch.nn.functional.softmax(attn_scores, dim=1)
+                    
+                    # Apply weighted aggregation instead of simple mean
+                    weighted_avg = (slice * attn_weights).sum(dim=1, keepdim=True)
+                    results_tensor.append(weighted_avg)
+                else:
+                    # Original method: simple mean aggregation
+                    mean_avg = slice.mean(dim=1, keepdim=True)
+                    results_tensor.append(mean_avg)
                 
                 start_idx = end_idx
     

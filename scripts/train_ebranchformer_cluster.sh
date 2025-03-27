@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_proj_test_vision   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_ebranchformer_cluster   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -19,16 +19,6 @@ SRC=${ROOT}/src
 # - Llama models: Meta-Llama-3-8B, Llama-2-7b-hf, etc.
 # - Mistral models: mistralai/Mistral-7B-v0.1
 # - Other models: EleutherAI/gpt-j-6b, facebook/opt-6.7b, etc.
-
-# IMPORTANT: For gated models like Llama-2 and Llama-3, you need to:
-#  1. Create a Hugging Face account: https://huggingface.co/join
-#  2. Request access to the model: https://huggingface.co/meta-llama/Llama-2-13b-hf
-#  3. Log in with: huggingface-cli login
-#
-# If you don't have access, use an open model like:
-# - "mistralai/Mistral-7B-v0.1"
-# - "stabilityai/stablelm-3b-4e1t"
-# - "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 HF_MODEL_ID="Llama-2-7b-hf"  # HuggingFace model ID
 CHECKPOINT_DIR="${ROOT}/checkpoints"
 
@@ -63,11 +53,6 @@ if [ ! -d "${LLM_PATH}" ] || [ -z "$(ls -A ${LLM_PATH} 2>/dev/null)" ]; then
         echo "1. You need to authenticate with Hugging Face (run 'huggingface-cli login')"
         echo "2. You don't have access to this gated model"
         echo "3. There's a network or permission issue"
-        echo ""
-        echo "Try using an open model instead by changing HF_MODEL_ID to:"
-        echo "- 'mistralai/Mistral-7B-v0.1'"
-        echo "- 'stabilityai/stablelm-3b-4e1t'"
-        echo "- 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'"
         exit 1
     fi
     
@@ -83,19 +68,36 @@ fi
 
 PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert large_lrs3_iter5
 
-# Note: The code has been updated to automatically:
-#  - Detect model architecture and adapt LoRA parameters accordingly
-#  - Handle different model hidden sizes (encoder dimensions)
-#  - Configure tokenizers appropriately for different models
-#  - Apply model-specific prompt templates for optimal performance
-# You should not need to manually modify the code for different model architectures
-
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 
-# Default to linear projector if not specified
-PROJECTOR_TYPE=${PROJECTOR_TYPE:-linear}
+# Use the E-Branchformer Cluster Projector
+PROJECTOR_TYPE="ebranchformer_cluster"
+
+# Determine which cluster aggregation method to use
+# Set to "true" for attention-weighted or "false" for simple mean
+USE_ATTENTION_CLUSTER=${1:-"true"}
+
+# E-Branchformer specific hyperparameters
+HIDDEN_DIM=512
+NUM_LAYERS=4
+NUM_HEADS=8
+DROPOUT=0.1
+KERNEL_SIZE=31
+FFN_EXPANSION=4
+
+# Define output path based on aggregation method
+if [ "$USE_ATTENTION_CLUSTER" = "true" ]; then
+    OUT_PATH="${OUT_PATH}_attn"
+else
+    OUT_PATH="${OUT_PATH}_mean"
+fi
+
+echo "Training E-Branchformer Cluster model with:"
+echo "- Projector type: $PROJECTOR_TYPE"
+echo "- Using attention-weighted cluster: $USE_ATTENTION_CLUSTER"
+echo "- Output path: $OUT_PATH"
 
 fairseq-hydra-train \
     --config-dir ${SRC}/conf \
@@ -107,6 +109,12 @@ fairseq-hydra-train \
         model.w2v_path=${PRETRAINED_MODEL_PATH} \
         model.llm_ckpt_path=${LLM_PATH} \
         +model.projector_type=${PROJECTOR_TYPE} \
+        +model.use_attention_cluster=${USE_ATTENTION_CLUSTER} \
+        +model.projector_hidden_dim=${HIDDEN_DIM} \
+        +model.projector_num_layers=${NUM_LAYERS} \
+        +model.projector_num_heads=${NUM_HEADS} \
+        +model.projector_dropout=${DROPOUT} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
-        distributed_training.nprocs_per_node=1 
+        distributed_training.nprocs_per_node=1 \
+        optimization.update_freq=[1] 
