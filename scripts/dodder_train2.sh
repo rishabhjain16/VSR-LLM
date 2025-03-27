@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/data/ssd3/data_rishabh/lrs3/433h_data   # path to train dataset dir
 
-OUT_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_mlp    # output path to save
+OUT_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_linear_wc    # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -69,7 +69,7 @@ fi
 PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert large_lrs3_iter5
 
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 
 # Default to linear projector if not specified
@@ -90,7 +90,7 @@ fi
 
 fairseq-hydra-train \
     --config-dir ${SRC}/conf \
-    --config-name vsp-llm-433h-freeze \
+    --config-name vsp-llm-dodder \
         common.user_dir=${SRC} \
         task.data=${DATA_PATH} \
         task.label_dir=${DATA_PATH} \

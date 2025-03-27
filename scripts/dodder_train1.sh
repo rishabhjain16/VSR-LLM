@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/data/ssd3/data_rishabh/lrs3/433h_data   # path to train dataset dir
 
-OUT_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_mlp    # output path to save
+OUT_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_linear_sc    # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -78,7 +78,7 @@ PROJECTOR_TYPE="linear"
 
 # Whether to use attention-weighted cluster aggregation (true) or simple mean (false)
 # Only applies to non-query-based projectors like linear, mlp, ebranchformer_cluster
-USE_ATTENTION_CLUSTER=true
+USE_ATTENTION_CLUSTER=false
 
 echo "Training with:"
 echo "- Projector type: $PROJECTOR_TYPE"
@@ -90,7 +90,7 @@ fi
 
 fairseq-hydra-train \
     --config-dir ${SRC}/conf \
-    --config-name vsp-llm-433h-freeze \
+    --config-name vsp-llm-dodder \
         common.user_dir=${SRC} \
         task.data=${DATA_PATH} \
         task.label_dir=${DATA_PATH} \
