@@ -69,13 +69,6 @@ fi
 
 PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert large_lrs3_iter5
 
-# Note: The code has been updated to automatically:
-#  - Detect model architecture and adapt LoRA parameters accordingly
-#  - Handle different model hidden sizes (encoder dimensions)
-#  - Configure tokenizers appropriately for different models
-#  - Apply model-specific prompt templates for optimal performance
-# You should not need to manually modify the code for different model architectures
-
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=1
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
