@@ -75,9 +75,23 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # Default to linear projector if not specified
 PROJECTOR_TYPE=${PROJECTOR_TYPE:-linear}
 
+USE_ATTENTION_CLUSTER=true
+
+# -------------------------------------------------------------
+# End of configuration section
+# -------------------------------------------------------------
+
+echo "Training with:"
+echo "- Projector type: $PROJECTOR_TYPE"
+if [[ "$PROJECTOR_TYPE" != *"qformer"* ]] && [[ "$PROJECTOR_TYPE" != *"perceiver"* ]] && [[ "$PROJECTOR_TYPE" != *"fusion"* ]]; then
+    echo "- Using attention-weighted clustering: $USE_ATTENTION_CLUSTER"
+else
+    echo "- Query-based projector (clustering method doesn't apply)"
+fi
+
 fairseq-hydra-train \
     --config-dir ${SRC}/conf \
-    --config-name vsp-llm-morell \
+    --config-name vsp-llm-433h-freeze \
         common.user_dir=${SRC} \
         task.data=${DATA_PATH} \
         task.label_dir=${DATA_PATH} \
@@ -85,6 +99,7 @@ fairseq-hydra-train \
         model.w2v_path=${PRETRAINED_MODEL_PATH} \
         model.llm_ckpt_path=${LLM_PATH} \
         +model.projector_type=${PROJECTOR_TYPE} \
+        +model.use_attention_cluster=${USE_ATTENTION_CLUSTER} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
         distributed_training.nprocs_per_node=1 
