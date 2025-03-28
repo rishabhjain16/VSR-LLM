@@ -13,8 +13,8 @@ MODEL_SRC=${ROOT}/src
 
 # Set the path to your Llama 3 model here
 #LLM_PATH=${ROOT}/checkpoints/vicuna-7b-v1.5    # path to vicuna checkpoint
-#LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf
-LLM_PATH=${ROOT}/checkpoints/Meta-Llama-3-8B    # path to Llama 3 model
+LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf
+#LLM_PATH=${ROOT}/checkpoints/Meta-Llama-3-8B    # path to Llama 3 model
 
 DATA_ROOT=/data/ssd3/data_rishabh/lrs3/433h_data     # path to test dataset dir
 #DATA_ROOT=/home/rishabh/Desktop/Dataset/lrs2likelrs3/lrs2_video_seg16s/data_lrs2
@@ -34,7 +34,7 @@ MODEL_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_mlp/checkpoints/checkpoi
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_UnordodoxPromptNew_bs4/checkpoints/checkpoint_best.pt
 
 
-OUT_PATH=${ROOT}/checkpoints/decode/decode_llama3_test    # output path to save results
+OUT_PATH=${ROOT}/checkpoints/decode/llama2_lrs3_mlp    # output path to save results
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test_mytrained_lora_32
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test
 

@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/data/ssd2/data_rishabh/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/proj/VSR-LLM/checkpoints/projector_test/llama3_lrs3_linear    # output path to save
+OUT_PATH=/data/ssd2/data_rishabh/VSR_ckps/projector_test/llama2_7b_lrs3_blip2_qformer    # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
