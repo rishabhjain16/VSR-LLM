@@ -446,8 +446,20 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         
         # Check if we're using a query-based projector that changes sequence length
         proj_seq_len = output['encoder_out'].size(1)
-        is_query_based = proj_seq_len != orig_seq_len
         
+        # First check projector type name (more reliable)
+        is_query_based = any(qp in self.cfg.projector_type.lower() for qp in [
+            "qformer", "enhanced_qformer", "visual_speech_qformer", 
+            "perceiver", "cross_attention", "adaptive_query",
+            "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
+            "text_aware_comprehensive_qformer", "visual_text_alignment", 
+            "visual_speech_text_qformer", "ebranchformer_visual_speech"
+        ])
+        
+        # Fallback to sequence length check if needed
+        if not is_query_based:
+            is_query_based = proj_seq_len != orig_seq_len
+            
         # Handle different projector types
         if is_query_based:
             # For query-based projectors (QFormer, EnhancedQFormer, etc.) that return fixed number of tokens
@@ -458,7 +470,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 logger.info(f"Using query-based projector output with shape: {reduced_enc_out.size()}")
                 self.logged_projector_shape = True
         else:
-            # For projectors that maintain sequence length (Linear, MLP), use cluster-based aggregation
+            # For projectors that maintain sequence length, use cluster-based aggregation
             cluster_counts = kwargs['source']['cluster_counts'][0]  # tensor list
             
             results_tensor = []
@@ -483,9 +495,8 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 
                 start_idx = end_idx
     
-            # Verify we processed the entire sequence for non-query projectors
+            # Verify we processed the entire sequence
             assert(cluster_counts.sum().item() == proj_seq_len)
-    
             reduced_enc_out = torch.cat(results_tensor, dim=1)
             # Only log the shape once
             if not self.logged_projector_shape:
@@ -579,7 +590,19 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Handle different projector types
         proj_seq_len = output['encoder_out'].size(1)
         orig_seq_len = kwargs['source']['video'].size(1)  # Original sequence length
-        is_query_based = proj_seq_len != orig_seq_len
+        
+        # First check projector type name (more reliable)
+        is_query_based = any(qp in self.cfg.projector_type.lower() for qp in [
+            "qformer", "enhanced_qformer", "visual_speech_qformer", 
+            "perceiver", "cross_attention", "adaptive_query",
+            "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
+            "text_aware_comprehensive_qformer", "visual_text_alignment", 
+            "visual_speech_text_qformer", "ebranchformer_visual_speech"
+        ])
+        
+        # Fallback to sequence length check if needed
+        if not is_query_based:
+            is_query_based = proj_seq_len != orig_seq_len
         
         if is_query_based:
             # For query-based projectors, use the output directly
@@ -613,6 +636,13 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             # Verify we processed the entire sequence
             assert(cluster_counts.sum().item() == proj_seq_len)
             reduced_enc_out = torch.cat(results_tensor, dim=1)
+            # Only log the shape once
+            if not self.logged_projector_shape:
+                if self.use_attention_cluster:
+                    logger.info(f"Using attention-weighted cluster aggregation with output shape: {reduced_enc_out.size()}")
+                else:
+                    logger.info(f"Using mean cluster aggregation with output shape: {reduced_enc_out.size()}")
+                self.logged_projector_shape = True
         
         B, T, D = reduced_enc_out.size()
         instruction = kwargs['source']['text']
