@@ -59,15 +59,7 @@ def load_audio_visual(manifest_path, max_keep, min_keep, frame_rate, label_paths
             cluster_counts_list = open(cluster_counts_fn).readlines()
             logger.info(f"Loaded cluster counts from {cluster_counts_fn}")
         else:
-            logger.warning(f"Cluster counts file {cluster_counts_fn} not found, but required for non-query projectors!")
-            logger.warning(f"Creating dummy cluster counts for compatibility")
-            # Create dummy cluster counts for compatibility
-            with open(manifest_path) as f:
-                f.readline()  # Skip root
-                dummy_counts = []
-                for _ in f:
-                    dummy_counts.append("1")  # Default 1 cluster per frame
-                cluster_counts_list = dummy_counts
+            raise FileNotFoundError(f"Cluster counts file {cluster_counts_fn} not found, but required for non-query projectors!")
     
     cluster_counts = []
     with open(manifest_path) as f:
@@ -310,9 +302,21 @@ class VSP_LLM_dataset(FairseqDataset):
             av_units = torch.tensor(int_av_units, dtype=int)
             return av_units
         else:
-            # For query-based projectors, just return an empty tensor
-            # The actual value doesn't matter as it won't be used
-            return torch.tensor([], dtype=int)
+            # Check if we're using a query-based projector
+            query_based_projectors = [
+                "qformer", "enhanced_qformer", "visual_speech_qformer", 
+                "perceiver", "cross_attention", "adaptive_query",
+                "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
+                "text_aware_comprehensive_qformer", "visual_text_alignment", "visual_speech_text_qformer",
+                "ebranchformer_visual_speech"
+            ]
+            if hasattr(self, 'projector_type') and any(qp in self.projector_type.lower() for qp in query_based_projectors):
+                # For query-based projectors, just return an empty tensor
+                # The actual value doesn't matter as it won't be used
+                return torch.tensor([], dtype=int)
+            else:
+                # For non-query projectors, raise an error
+                raise ValueError(f"Cluster counts are required for non-query projector {getattr(self, 'projector_type', 'unknown')}")
         
     def load_feature(self, mix_name):
         """

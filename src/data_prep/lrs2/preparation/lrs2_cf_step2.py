@@ -35,7 +35,7 @@ def check(fids, base_dir):
 
 def main():
     # Set the root directory for LRS2 dataset
-    lrs2_root = '/data/ssd2/data_rishabh/lrs2/segmented/lrs2/lrs2_video_seg24s'
+    lrs2_root = '/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s'
     
     # Read the file list
     file_list = os.path.join(lrs2_root, 'file.list')

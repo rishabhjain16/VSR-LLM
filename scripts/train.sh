@@ -87,14 +87,11 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
 PROJECTOR_TYPE="linear"
 
-# Whether to use attention-weighted cluster aggregation (true) or simple mean (false)
-# Only applies to non-query-based projectors like linear, mlp, ebranchformer_cluster
-USE_ATTENTION_CLUSTER=true
 
-echo "Training with:"
-echo "- Projector type: $PROJECTOR_TYPE"
+
+# Check if this is a query-based projector
 if [[ "$PROJECTOR_TYPE" != *"qformer"* ]] && [[ "$PROJECTOR_TYPE" != *"perceiver"* ]] && [[ "$PROJECTOR_TYPE" != *"fusion"* ]]; then
-    echo "- Using attention-weighted clustering: $USE_ATTENTION_CLUSTER"
+    echo "- Using clustering Approach"
 else
     echo "- Query-based projector (clustering method doesn't apply)"
 fi
@@ -110,7 +107,6 @@ fairseq-hydra-train \
         model.w2v_path=${PRETRAINED_MODEL_PATH} \
         model.llm_ckpt_path=${LLM_PATH} \
         +model.projector_type=${PROJECTOR_TYPE} \
-        +model.use_attention_cluster=${USE_ATTENTION_CLUSTER} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
         distributed_training.nprocs_per_node=1 

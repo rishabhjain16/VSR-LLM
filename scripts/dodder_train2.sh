@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/data/ssd3/data_rishabh/lrs3/433h_data   # path to train dataset dir
 
-OUT_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_linear_wc    # output path to save
+OUT_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_mlp    # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -69,28 +69,24 @@ fi
 PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert large_lrs3_iter5
 
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 
 # Default to linear projector if not specified
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
 PROJECTOR_TYPE="linear"
 
-# Whether to use attention-weighted cluster aggregation (true) or simple mean (false)
-# Only applies to non-query-based projectors like linear, mlp, ebranchformer_cluster
-USE_ATTENTION_CLUSTER=true
-
 echo "Training with:"
 echo "- Projector type: $PROJECTOR_TYPE"
 if [[ "$PROJECTOR_TYPE" != *"qformer"* ]] && [[ "$PROJECTOR_TYPE" != *"perceiver"* ]] && [[ "$PROJECTOR_TYPE" != *"fusion"* ]]; then
-    echo "- Using attention-weighted clustering: $USE_ATTENTION_CLUSTER"
+    echo "- Using mean clustering (default)"
 else
     echo "- Query-based projector (clustering method doesn't apply)"
 fi
 
 fairseq-hydra-train \
     --config-dir ${SRC}/conf \
-    --config-name vsp-llm-dodder \
+    --config-name vsp-llm-433h-freeze \
         common.user_dir=${SRC} \
         task.data=${DATA_PATH} \
         task.label_dir=${DATA_PATH} \
@@ -99,7 +95,6 @@ fairseq-hydra-train \
         model.w2v_path=${PRETRAINED_MODEL_PATH} \
         model.llm_ckpt_path=${LLM_PATH} \
         +model.projector_type=${PROJECTOR_TYPE} \
-        +model.use_attention_cluster=${USE_ATTENTION_CLUSTER} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
         distributed_training.nprocs_per_node=1 
