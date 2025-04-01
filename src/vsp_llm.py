@@ -426,6 +426,11 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Increment batch counter for logging
         self.batch_counter += 1
         
+        # Always update CTC status at the start of forward to ensure it's correct
+        # This prevents issues when transitioning between train and validation
+        if hasattr(self, 'cfg') and hasattr(self.cfg, 'use_ctc'):
+            self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
+        
         # First get encoder output
         ft = self.freeze_finetune_updates <= self.num_updates
         with torch.no_grad() if not ft else contextlib.ExitStack():
@@ -1035,6 +1040,11 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
     def forward(self, **kwargs):
         # Increment batch counter for logging
         self.batch_counter += 1
+        
+        # Always update CTC status at the start of forward to ensure it's correct
+        # This prevents issues when transitioning between train and validation
+        if hasattr(self, 'cfg') and hasattr(self.cfg, 'use_ctc'):
+            self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
         
         # First get encoder output
         ft = self.freeze_finetune_updates <= self.num_updates
