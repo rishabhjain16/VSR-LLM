@@ -878,10 +878,26 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         return state_dict
 
     def set_num_updates(self, num_updates):
-        """Track the number of updates for logging purposes"""
+        """
+        Standard Fairseq hook called by the trainer to update model state.
+        This is the idiomatic place to ensure training state consistency.
+        """
+        # Call parent method
         super().set_num_updates(num_updates) 
+        
+        # Store updates counter for use in model logic
         self.num_updates = num_updates
-        self.batch_counter += 1
+        
+        # Ensure CTC loss is used if gradients are enabled
+        # Use a custom attribute to track our intent rather than relying on self.training
+        self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
+        
+        # Log when set_num_updates is called (helps debugging frequency)
+        logger.info(f"set_num_updates called with update {num_updates}, grad_enabled={torch.is_grad_enabled()}")
+        
+        # Log CTC status (not tied to batch counter to ensure visibility)
+        logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
+        
         return self.num_updates
 
     def state_dict(self):
@@ -1351,8 +1367,10 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Use a custom attribute to track our intent rather than relying on self.training
         self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
         
-        # Log when this flag changes status
-        if self.batch_counter % 20 == 0:
-            logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
+        # Log when set_num_updates is called (helps debugging frequency)
+        logger.info(f"set_num_updates called with update {num_updates}, grad_enabled={torch.is_grad_enabled()}")
+        
+        # Log CTC status (not tied to batch counter to ensure visibility)
+        logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
         
         return self.num_updates
