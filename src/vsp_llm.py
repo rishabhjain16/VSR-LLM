@@ -1015,12 +1015,18 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         nn.init.xavier_normal_(self.ctc_head_projector.weight)
         nn.init.zeros_(self.ctc_head_projector.bias)
         
+        # Auto-set blank index to avoid conflict with padding token
+        if not hasattr(cfg, 'ctc_blank_idx') or cfg.ctc_blank_idx == 0:
+            # Use last token in vocabulary as blank
+            self.cfg.ctc_blank_idx = vocab_size - 1
+            logger.info(f"Auto-setting CTC blank_idx to {self.cfg.ctc_blank_idx} (last token in vocabulary)")
+        
         # Log CTC configuration
         logger.info(f"==========================================================")
         logger.info(f"INITIALIZING MODEL WITH CTC: weight={cfg.ctc_weight}, blank={cfg.ctc_blank_idx}")
         logger.info(f"CTC feature source: {cfg.ctc_feature_source}")
         logger.info(f"==========================================================")
-        
+    
     @classmethod
     def build_model(cls, cfg, task):
         """Build a new model instance."""
