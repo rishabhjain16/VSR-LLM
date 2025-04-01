@@ -202,9 +202,9 @@ class VSPLLMConfig(FairseqDataclass):
         default=0.3,
         metadata={"help": "Weight for CTC loss (0.3 means 30% CTC, 70% LM)"}
     )
-    ctc_blank_idx: int = field(
+    ctc_blank_idx: Optional[int] = field(
         default=0, 
-        metadata={"help": "Index to use for blank token in CTC"}
+        metadata={"help": "Index to use for blank token in CTC (if 0 or empty, will use last token in vocabulary)"}
     )
     ctc_feature_source: str = field(
         default="projector",
@@ -648,7 +648,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                     logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
                 
                 # Verify our blank index isn't causing issues with padding
-                if self.cfg.ctc_blank_idx == 0:
+                if self.cfg.ctc_blank_idx == 0 or self.cfg.ctc_blank_idx is None or (isinstance(self.cfg.ctc_blank_idx, str) and not self.cfg.ctc_blank_idx.strip()):
                     logger.warning("CTC blank_idx is set to 0, which is also the padding token - this may cause issues")
             
             # Calculate CTC loss
@@ -1016,10 +1016,16 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         nn.init.zeros_(self.ctc_head_projector.bias)
         
         # Auto-set blank index to avoid conflict with padding token
-        if not hasattr(cfg, 'ctc_blank_idx') or cfg.ctc_blank_idx == 0:
+        if not hasattr(cfg, 'ctc_blank_idx') or cfg.ctc_blank_idx == 0 or cfg.ctc_blank_idx is None or (isinstance(cfg.ctc_blank_idx, str) and not cfg.ctc_blank_idx.strip()):
             # Use last token in vocabulary as blank
             self.cfg.ctc_blank_idx = vocab_size - 1
             logger.info(f"Auto-setting CTC blank_idx to {self.cfg.ctc_blank_idx} (last token in vocabulary)")
+            
+            # Try to print the actual token if tokenizer is available
+            if hasattr(decoder, 'tokenizer'):
+                tokenizer = decoder.tokenizer
+                if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
+                    logger.info(f"CTC blank_token: {tokenizer.pad_token}")
         
         # Log CTC configuration
         logger.info(f"==========================================================")
@@ -1268,7 +1274,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                     logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
                 
                 # Verify our blank index isn't causing issues with padding
-                if self.cfg.ctc_blank_idx == 0:
+                if self.cfg.ctc_blank_idx == 0 or self.cfg.ctc_blank_idx is None or (isinstance(self.cfg.ctc_blank_idx, str) and not self.cfg.ctc_blank_idx.strip()):
                     logger.warning("CTC blank_idx is set to 0, which is also the padding token - this may cause issues")
             
             # Calculate CTC loss
