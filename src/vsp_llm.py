@@ -431,11 +431,51 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Get the original size before applying projector
         orig_seq_len = output['encoder_out'].size(1)
         
-        # Check if we're using a text-aware projector
-        is_text_aware = 'text_aware' in self.cfg.projector_type
+        # Get transcript information for cross-modal alignment
+        labels = kwargs['target_list'].clone()
         
-        # For text-aware projectors, always use text tokens
-        if is_text_aware:
+        # Get labels embedding with model structure awareness
+        try:
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                labels_embedding = self.decoder.model.model.embed_tokens(labels)
+            elif hasattr(self.decoder, 'model'):
+                labels_embedding = self.decoder.model.embed_tokens(labels)
+            else:
+                labels_embedding = self.decoder.embed_tokens(labels)
+        except AttributeError:
+            # Fallback to get_input_embeddings method
+            embedding_layer = self.decoder.get_input_embeddings()
+            labels_embedding = embedding_layer(labels)
+        
+        # Variable to store alignment loss
+        alignment_loss = torch.tensor(0.0, device=output['encoder_out'].device)
+        
+        # Check if we're using a text-aware projector
+        is_text_aware = 'text_aware' in self.cfg.projector_type or 'qformer' in self.cfg.projector_type.lower()
+        
+        # For all projectors, try to use text information if available
+        has_text_support = hasattr(self.avfeat_to_llm, 'forward') and 'text_embeddings' in inspect.signature(self.avfeat_to_llm.forward).parameters
+        
+        if has_text_support:
+            # Also pass transcript information for cross-modal alignment
+            projector_output = self.avfeat_to_llm(
+                output['encoder_out'], 
+                text_tokens=labels,  # Pass transcript tokens for alignment
+                text_embeddings=labels_embedding,  # Pass transcript embeddings for alignment
+                return_alignment_loss=True
+            )
+            
+            # Unpack if alignment loss was returned
+            if isinstance(projector_output, tuple):
+                output['encoder_out'], alignment_loss = projector_output
+            else:
+                output['encoder_out'] = projector_output
+            
+            # Log the use of transcript information
+            if not self.logged_projector_shape:
+                logger.info(f"Using transcript information for cross-modal alignment in {self.cfg.projector_type}")
+        elif is_text_aware:
+            # For text-aware projectors without text_embeddings support
             # Get text tokens from kwargs - these should always be present
             text_tokens = kwargs['source']['text']
             
@@ -448,9 +488,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             
             # Only log this once per run
             if not self.logged_projector_shape:
-                logger.info(f"Using text tokens with shape {text_tokens.shape} for text-aware projector")
+                logger.info(f"Using instruction tokens with shape {text_tokens.shape} for text-aware projector (consider upgrading to a projector that supports transcript alignment)")
             
-            # Pass both video features and text to the projector - never fall back to vision-only
+            # Pass both video features and text to the projector
             output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
         else:
             # For non-text-aware projectors, just pass the video features
@@ -521,21 +561,6 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             embedding_layer = self.decoder.get_input_embeddings()
             instruction_embedding = embedding_layer(instruction)
 
-        labels = kwargs['target_list'].clone()
-        
-        # Get labels embedding with model structure awareness
-        try:
-            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
-                labels_embedding = self.decoder.model.model.embed_tokens(labels)
-            elif hasattr(self.decoder, 'model'):
-                labels_embedding = self.decoder.model.embed_tokens(labels)
-            else:
-                labels_embedding = self.decoder.embed_tokens(labels)
-        except AttributeError:
-            # Fallback to get_input_embeddings method
-            embedding_layer = self.decoder.get_input_embeddings()
-            labels_embedding = embedding_layer(labels)
-
         llm_input = torch.cat((instruction_embedding, reduced_enc_out, labels_embedding), dim=1)
         
         # Prepare labels for loss calculation (used by all model types)
@@ -549,8 +574,24 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Use a single code path for all models instead of model-specific branches
         llm_out = self.decoder(inputs_embeds=llm_input, labels=llm_labels, return_dict=True)
         
+        # Include alignment loss if it's available (for text-aware projectors)
+        loss = llm_out.loss
+        if has_text_support and alignment_loss.item() > 0:
+            # Add alignment loss with a weight (e.g., 0.1)
+            alignment_weight = 0.1
+            total_loss = (1 - alignment_weight) * loss + alignment_weight * alignment_loss.to(loss.dtype)
+            
+            # Log losses occasionally
+            if self.batch_counter % 20 == 0:
+                loss_val = float(loss.detach().cpu().item())
+                align_loss_val = float(alignment_loss.detach().cpu().item())
+                logger.info(f"Batch {self.batch_counter}: LM loss: {loss_val:.4f}, "
+                           f"Alignment loss: {align_loss_val:.4f}")
+        else:
+            total_loss = loss
+        
         # Return loss, logits, and labels for all model types
-        return llm_out.loss, llm_out.logits, llm_labels
+        return total_loss, llm_out.logits, llm_labels
 
 
     @torch.no_grad()
@@ -566,11 +607,15 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         output = self.encoder(**kwargs)
         
         # Check if we're using a text-aware projector
-        is_text_aware = 'text_aware' in self.cfg.projector_type
+        is_text_aware = 'text_aware' in self.cfg.projector_type or 'qformer' in self.cfg.projector_type.lower()
         
-        # For text-aware projectors, always use text tokens
-        if is_text_aware:
-            # Get text tokens from kwargs - these should always be present
+        # For all projectors, try to use text information if available
+        has_text_support = hasattr(self.avfeat_to_llm, 'forward') and 'text_embeddings' in inspect.signature(self.avfeat_to_llm.forward).parameters
+        
+        # In generate mode, we only have instruction tokens available
+        # For projectors that support text embeddings or text-aware projectors
+        if has_text_support or is_text_aware:
+            # Get text tokens from kwargs (only instruction tokens are available during inference)
             text_tokens = kwargs['source']['text']
             
             # Add debug info about text tokens
@@ -578,10 +623,31 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             
             # Create attention mask (1 for real tokens, 0 for padding)
             text_mask = (text_tokens != 0)
-            logger.info(f"Using text tokens in generate() for text-aware projector")
+            logger.info(f"Using instruction tokens in generate() mode (transcript tokens not available during inference)")
             
-            # Pass both video features and text to the projector - never fall back to vision-only
-            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
+            # Pass both video features and text to the projector
+            if has_text_support:
+                # Try to pass the instruction tokens as both tokens and embeddings
+                try:
+                    if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                        text_embeddings = self.decoder.model.model.embed_tokens(text_tokens)
+                    elif hasattr(self.decoder, 'model'):
+                        text_embeddings = self.decoder.model.embed_tokens(text_tokens)
+                    else:
+                        text_embeddings = self.decoder.embed_tokens(text_tokens)
+                except AttributeError:
+                    # Fallback to get_input_embeddings method
+                    embedding_layer = self.decoder.get_input_embeddings()
+                    text_embeddings = embedding_layer(text_tokens)
+                
+                output['encoder_out'] = self.avfeat_to_llm(
+                    output['encoder_out'], 
+                    text_tokens=text_tokens,
+                    text_embeddings=text_embeddings
+                )
+            else:
+                # Basic text-aware projector
+                output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
         else:
             # For non-text-aware projectors, just pass the video features
             output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
@@ -866,13 +932,9 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         is_text_aware = 'text_aware' in self.cfg.projector_type or 'qformer' in self.cfg.projector_type.lower()
         
         # For all projectors, try to use text information if available
-        # This is a key change - all projectors that support it will now use transcript information
         has_text_support = hasattr(self.avfeat_to_llm, 'forward') and 'text_embeddings' in inspect.signature(self.avfeat_to_llm.forward).parameters
         
         if has_text_support:
-            # Get text tokens from kwargs
-            text_tokens = kwargs['source']['text']  # Instruction tokens
-            
             # Also pass transcript information for cross-modal alignment
             projector_output = self.avfeat_to_llm(
                 output['encoder_out'], 
@@ -890,11 +952,28 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             # Log the use of transcript information
             if not self.logged_projector_shape:
                 logger.info(f"Using transcript information for cross-modal alignment in {self.cfg.projector_type}")
+        elif is_text_aware:
+            # For text-aware projectors without text_embeddings support
+            # Get text tokens from kwargs - these should always be present
+            text_tokens = kwargs['source']['text']
+            
+            # Add debug info about text tokens
+            if not self.logged_projector_shape:
+                logger.info(f"Text tokens shape: {text_tokens.shape}, non-zero tokens: {(text_tokens != 0).sum().item()}")
+            
+            # Create attention mask (1 for real tokens, 0 for padding)
+            text_mask = (text_tokens != 0)
+            
+            # Only log this once per run
+            if not self.logged_projector_shape:
+                logger.info(f"Using instruction tokens with shape {text_tokens.shape} for text-aware projector (consider upgrading to a projector that supports transcript alignment)")
+            
+            # Pass both video features and text to the projector
+            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
         else:
-            # For non-text-aware projectors, just pass the visual features
+            # For non-text-aware projectors, just pass the video features
             output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
         
-        # Process rest of the forward pass as in parent class
         # Check if we're using a query-based projector that changes sequence length
         proj_seq_len = output['encoder_out'].size(1)
         
