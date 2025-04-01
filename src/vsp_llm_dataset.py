@@ -216,15 +216,10 @@ class VSP_LLM_dataset(FairseqDataset):
         # Get the appropriate prompt template for this model
         self.model_name = model_name
         
-        # Check if we're using a query-based projector
-        query_based_projectors = [
-            "qformer", "enhanced_qformer", "visual_speech_qformer", 
-            "perceiver", "cross_attention", "adaptive_query",
-            "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
-            "text_aware_comprehensive_qformer", "visual_text_alignment", "visual_speech_text_qformer",
-            "ebranchformer_visual_speech"
-        ]
-        is_query_based = any(qp in projector_type.lower() for qp in query_based_projectors)
+        # Simplified approach: Only linear and mlp are non-query-based projectors
+        # All others are query-based (and text-based)
+        is_query_based = projector_type.lower() not in ['linear', 'mlp']
+        
         logger.info(f"Using projector type: {projector_type} (query-based: {is_query_based})")
         
         self.label_rates = (
@@ -303,15 +298,9 @@ class VSP_LLM_dataset(FairseqDataset):
             av_units = torch.tensor(int_av_units, dtype=int)
             return av_units
         else:
-            # Check if we're using a query-based projector
-            query_based_projectors = [
-                "qformer", "enhanced_qformer", "visual_speech_qformer", 
-                "perceiver", "cross_attention", "adaptive_query",
-                "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
-                "text_aware_comprehensive_qformer", "visual_text_alignment", "visual_speech_text_qformer",
-                "ebranchformer_visual_speech"
-            ]
-            if hasattr(self, 'projector_type') and any(qp in self.projector_type.lower() for qp in query_based_projectors):
+            # Simplified approach: Only linear and mlp are non-query-based projectors
+            # All others are query-based (and text-based)
+            if hasattr(self, 'projector_type') and self.projector_type.lower() not in ['linear', 'mlp']:
                 # For query-based projectors, just return an empty tensor
                 # The actual value doesn't matter as it won't be used
                 return torch.tensor([], dtype=int)

@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_proj_test_vision   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/test_vsp_llm   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -24,47 +24,6 @@ LLM_PATH="${CHECKPOINT_DIR}/${MODEL_BASENAME}"
 # Create checkpoints directory if it doesn't exist
 mkdir -p "${CHECKPOINT_DIR}"
 
-# If LLM_PATH doesn't exist, download the model
-if [ ! -d "${LLM_PATH}" ] || [ -z "$(ls -A ${LLM_PATH} 2>/dev/null)" ]; then
-    echo "Model not found at ${LLM_PATH}, downloading from HuggingFace..."
-    
-    # Make download_model.py executable if it's not already
-    chmod +x ${SRC}/download_model.py
-    
-    # Run the Python script to download the model and capture its output
-    downloaded_path=$(python3 ${SRC}/download_model.py "$HF_MODEL_ID" --output-dir "${LLM_PATH}" 2>&1)
-    
-    # Check if the download was successful by looking for specific success message
-    if echo "$downloaded_path" | grep -q "Successfully downloaded model"; then
-        # Extract just the path from the output (last line)
-        model_path=$(echo "$downloaded_path" | tail -n 1)
-        LLM_PATH="${model_path}"
-        echo "Model successfully downloaded to: ${LLM_PATH}"
-    else
-        echo "ERROR: Failed to download model. Output was:"
-        echo "$downloaded_path"
-        echo ""
-        echo "This might be because:"
-        echo "1. You need to authenticate with Hugging Face (run 'huggingface-cli login')"
-        echo "2. You don't have access to this gated model"
-        echo "3. There's a network or permission issue"
-        echo ""
-        echo "Try using an open model instead by changing HF_MODEL_ID to:"
-        echo "- 'mistralai/Mistral-7B-v0.1'"
-        echo "- 'stabilityai/stablelm-3b-4e1t'"
-        echo "- 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'"
-        exit 1
-    fi
-    
-    # Verify the model files exist
-    if [ ! -d "${LLM_PATH}" ] || [ ! -f "${LLM_PATH}/config.json" ]; then
-        echo "ERROR: Model download seemed successful but files are missing."
-        echo "Expected to find model files in: ${LLM_PATH}"
-        exit 1
-    fi
-else
-    echo "Using existing model at: ${LLM_PATH}"
-fi
 
 PRETRAINED_MODEL_PATH=${ROOT}/checkpoints/large_vox_iter5.pt   # path to pretrained avhubert large_lrs3_iter5
 
@@ -85,13 +44,13 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # -------------------------------------------------------------
 
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
-PROJECTOR_TYPE="linear"
+PROJECTOR_TYPE="visual_speech_qformer"
 
 # CTC configuration
-USE_CTC="false"  # Set to "true" to enable CTC loss
+USE_CTC="true"  # Set to "true" to enable CTC loss
 CTC_WEIGHT="0.3"  # Weight for CTC loss (0.3 means 30% CTC, 70% LM)
 CTC_FEATURE_SOURCE="projector"  # Source of features for CTC: "encoder" or "projector"
-MODEL_TYPE="vsp_llm"  # Use "vsp_llm_ctc" when USE_CTC is true
+MODEL_TYPE="vsp_llm_ctc"  # Use "vsp_llm_ctc" when USE_CTC is true
 
 
 # Check if CTC should be enabled
@@ -105,7 +64,7 @@ else
 fi
 
 # Check if this is a query-based projector
-if [[ "$PROJECTOR_TYPE" != *"qformer"* ]] && [[ "$PROJECTOR_TYPE" != *"perceiver"* ]] && [[ "$PROJECTOR_TYPE" != *"fusion"* ]]; then
+if [[ "$PROJECTOR_TYPE" != *"qformer"* ]] && [[ "$PROJECTOR_TYPE" != *"cross_attention"* ]]; then
     echo "- Using clustering Approach"
 else
     echo "- Query-based projector (clustering method doesn't apply)"
@@ -125,7 +84,7 @@ fairseq-hydra-train \
         +model.use_ctc=${USE_CTC} \
         +model.ctc_weight=${CTC_WEIGHT} \
         +model.ctc_feature_source=${CTC_FEATURE_SOURCE} \
-        model=\\${MODEL_TYPE} \
+        model._name=${MODEL_TYPE} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
         distributed_training.nprocs_per_node=1 

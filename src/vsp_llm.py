@@ -15,6 +15,11 @@ from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 from einops import repeat
 import datetime
+import math
+import random
+import time
+import contextlib
+import inspect
 
 from dataclasses import dataclass, field
 from fairseq import checkpoint_utils, tasks, utils
@@ -23,8 +28,6 @@ from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.models import BaseFairseqModel, FairseqEncoder, register_model
 from fairseq.models.hubert.hubert import MASKING_DISTRIBUTION_CHOICES
 from omegaconf import II, MISSING
-import contextlib
-import inspect
 
 # Import our new module for LoRA target module selection
 from .vsp_lora import get_target_modules, LORA_CONFIG
@@ -165,8 +168,8 @@ class VSPLLMConfig(FairseqDataclass):
 
     # Add new fields for projector configuration
     projector_type: str = field(
-        default="linear", 
-        metadata={"help": "Type of projector to use (linear, mlp, qformer, cross_attention, perceiver, adaptive_query, fusion_refinement)"}
+        default="visual_speech_qformer",
+        metadata={"help": "Type of projector to use (linear, mlp, qformer, cross_attention, blip2_qformer, comprehensive_qformer, visual_speech_qformer, visual_speech_text_qformer, multiscale_contrastive)"}
     )
     projector_hidden_dim: Optional[int] = field(
         default=None, 
@@ -434,87 +437,68 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Get transcript information for cross-modal alignment
         labels = kwargs['target_list'].clone()
         
-        # Get labels embedding with model structure awareness
-        try:
-            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
-                labels_embedding = self.decoder.model.model.embed_tokens(labels)
-            elif hasattr(self.decoder, 'model'):
-                labels_embedding = self.decoder.model.embed_tokens(labels)
-            else:
-                labels_embedding = self.decoder.embed_tokens(labels)
-        except AttributeError:
-            # Fallback to get_input_embeddings method
-            embedding_layer = self.decoder.get_input_embeddings()
-            labels_embedding = embedding_layer(labels)
+        # Get labels embedding directly from the model
+        if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+            labels_embedding = self.decoder.model.model.embed_tokens(labels)
+        elif hasattr(self.decoder, 'model'):
+            labels_embedding = self.decoder.model.embed_tokens(labels)
+        else:
+            labels_embedding = self.decoder.embed_tokens(labels)
         
-        # Variable to store alignment loss
+        # Simplified rule for text-based projectors:
+        # Linear and MLP are cluster-based, everything else is text-based
+        is_text_based = self.cfg.projector_type.lower() not in ['linear', 'mlp']
+        
+        # Apply projector based on type
         alignment_loss = torch.tensor(0.0, device=output['encoder_out'].device)
         
-        # Check if we're using a text-aware projector
-        is_text_aware = 'text_aware' in self.cfg.projector_type or 'qformer' in self.cfg.projector_type.lower()
-        
-        # For all projectors, try to use text information if available
-        has_text_support = hasattr(self.avfeat_to_llm, 'forward') and 'text_embeddings' in inspect.signature(self.avfeat_to_llm.forward).parameters
-        
-        if has_text_support:
-            # Also pass transcript information for cross-modal alignment
-            projector_output = self.avfeat_to_llm(
-                output['encoder_out'], 
-                text_tokens=labels,  # Pass transcript tokens for alignment
-                text_embeddings=labels_embedding,  # Pass transcript embeddings for alignment
-                return_alignment_loss=True
-            )
-            
-            # Unpack if alignment loss was returned
-            if isinstance(projector_output, tuple):
-                output['encoder_out'], alignment_loss = projector_output
-            else:
-                output['encoder_out'] = projector_output
-            
-            # Log the use of transcript information
+        if is_text_based:
+            # For all text-based projectors, always pass transcript tokens embeddings
             if not self.logged_projector_shape:
-                logger.info(f"Using transcript information for cross-modal alignment in {self.cfg.projector_type}")
-        elif is_text_aware:
-            # For text-aware projectors without text_embeddings support
-            # Get text tokens from kwargs - these should always be present
-            text_tokens = kwargs['source']['text']
-            
-            # Add debug info about text tokens
-            if not self.logged_projector_shape:
-                logger.info(f"Text tokens shape: {text_tokens.shape}, non-zero tokens: {(text_tokens != 0).sum().item()}")
+                logger.info(f"Using transcript tokens for vision-text mapping in {self.cfg.projector_type}")
             
             # Create attention mask (1 for real tokens, 0 for padding)
-            text_mask = (text_tokens != 0)
+            text_mask = (labels != 0)
             
-            # Only log this once per run
-            if not self.logged_projector_shape:
-                logger.info(f"Using instruction tokens with shape {text_tokens.shape} for text-aware projector (consider upgrading to a projector that supports transcript alignment)")
+            # Convert embeddings to match encoder output dtype
+            labels_embedding_matched = labels_embedding.to(dtype=output['encoder_out'].dtype)
             
-            # Pass both video features and text to the projector
-            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
+            # Check projector's forward method signature to determine which parameters to pass
+            forward_params = inspect.signature(self.avfeat_to_llm.forward).parameters
+            
+            # Base parameters that all projectors accept
+            projector_args = {
+                "x": output['encoder_out']
+            }
+            
+            # Add text_tokens parameter if it exists in the signature
+            if "text_tokens" in forward_params:
+                projector_args["text_tokens"] = labels_embedding_matched
+                
+            # Add text_mask parameter if it exists in the signature
+            if "text_mask" in forward_params:
+                projector_args["text_mask"] = text_mask
+                
+            # For QFormer-specific implementations that use text_embeddings instead of text_tokens
+            if "text_embeddings" in forward_params and "text_tokens" not in forward_params:
+                projector_args["text_embeddings"] = labels_embedding_matched
+                
+            # Pass the appropriate parameters to the projector
+            output['encoder_out'] = self.avfeat_to_llm(**projector_args)
         else:
-            # For non-text-aware projectors, just pass the video features
+            # For non-text-based projectors (linear, mlp), just pass the video features
             output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
         
         # Check if we're using a query-based projector that changes sequence length
         proj_seq_len = output['encoder_out'].size(1)
         
-        # First check projector type name (more reliable)
-        is_query_based = any(qp in self.cfg.projector_type.lower() for qp in [
-            "qformer", "enhanced_qformer", "visual_speech_qformer", 
-            "perceiver", "cross_attention", "adaptive_query",
-            "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
-            "text_aware_comprehensive_qformer", "visual_text_alignment", 
-            "visual_speech_text_qformer", "ebranchformer_visual_speech"
-        ])
-        
-        # Fallback to sequence length check if needed
-        if not is_query_based:
-            is_query_based = proj_seq_len != orig_seq_len
+        # Query-based projectors are the same as text-based in our case, 
+        # since only linear and mlp are not query-based
+        is_query_based = is_text_based
             
         # Handle different projector types
         if is_query_based:
-            # For query-based projectors (QFormer, EnhancedQFormer, etc.) that return fixed number of tokens
+            # For query-based projectors that return fixed number of tokens
             # We skip the cluster-based aggregation as these projectors already aggregate
             reduced_enc_out = output['encoder_out']
             # Only log the shape once
@@ -690,7 +674,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 # Combine losses with weighting
                 # Convert to same dtype for combination
                 # Add alignment loss if available (for cross-modal learning)
-                if has_text_support and alignment_loss.item() > 0:
+                if is_text_based and alignment_loss.item() > 0:
                     # Add alignment loss with a weight (e.g., 0.1)
                     alignment_weight = 0.1
                     total_loss = (1 - self.cfg.ctc_weight - alignment_weight) * lm_loss + \
@@ -741,15 +725,14 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 ):
         output = self.encoder(**kwargs)
         
-        # Check if we're using a text-aware projector
-        is_text_aware = 'text_aware' in self.cfg.projector_type or 'qformer' in self.cfg.projector_type.lower()
+        # Check if the projector supports text conditioning for alignment loss
+        is_text_aware = any(qp in self.cfg.projector_type.lower() for qp in [
+            "qformer", "blip2_qformer", "comprehensive_qformer", 
+            "visual_speech_qformer", "visual_speech_text_qformer"
+        ])
         
         # For all projectors, try to use text information if available
-        has_text_support = hasattr(self.avfeat_to_llm, 'forward') and 'text_embeddings' in inspect.signature(self.avfeat_to_llm.forward).parameters
-        
-        # In generate mode, we only have instruction tokens available
-        # For projectors that support text embeddings or text-aware projectors
-        if has_text_support or is_text_aware:
+        if is_text_aware:
             # Get text tokens from kwargs (only instruction tokens are available during inference)
             text_tokens = kwargs['source']['text']
             
@@ -760,29 +743,39 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             text_mask = (text_tokens != 0)
             logger.info(f"Using instruction tokens in generate() mode (transcript tokens not available during inference)")
             
-            # Pass both video features and text to the projector
-            if has_text_support:
-                # Try to pass the instruction tokens as both tokens and embeddings
-                try:
-                    if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
-                        text_embeddings = self.decoder.model.model.embed_tokens(text_tokens)
-                    elif hasattr(self.decoder, 'model'):
-                        text_embeddings = self.decoder.model.embed_tokens(text_tokens)
-                    else:
-                        text_embeddings = self.decoder.embed_tokens(text_tokens)
-                except AttributeError:
-                    # Fallback to get_input_embeddings method
-                    embedding_layer = self.decoder.get_input_embeddings()
-                    text_embeddings = embedding_layer(text_tokens)
-                
-                output['encoder_out'] = self.avfeat_to_llm(
-                    output['encoder_out'], 
-                    text_tokens=text_tokens,
-                    text_embeddings=text_embeddings
-                )
+            # Get embeddings for the tokens
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                text_embeddings = self.decoder.model.model.embed_tokens(text_tokens)
+            elif hasattr(self.decoder, 'model'):
+                text_embeddings = self.decoder.model.embed_tokens(text_tokens)
             else:
-                # Basic text-aware projector
-                output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
+                text_embeddings = self.decoder.embed_tokens(text_tokens)
+            
+            # Match dtype with encoder output for compatibility
+            text_embeddings_matched = text_embeddings.to(dtype=output['encoder_out'].dtype)
+            
+            # Check projector's forward method signature to determine which parameters to pass
+            forward_params = inspect.signature(self.avfeat_to_llm.forward).parameters
+            
+            # Base parameters that all projectors accept
+            projector_args = {
+                "x": output['encoder_out']
+            }
+            
+            # Add text_tokens parameter if it exists in the signature
+            if "text_tokens" in forward_params:
+                projector_args["text_tokens"] = text_embeddings_matched
+                
+            # Add text_mask parameter if it exists in the signature
+            if "text_mask" in forward_params:
+                projector_args["text_mask"] = text_mask
+                
+            # For QFormer-specific implementations that use text_embeddings instead of text_tokens
+            if "text_embeddings" in forward_params and "text_tokens" not in forward_params:
+                projector_args["text_embeddings"] = text_embeddings_matched
+                
+            # Pass the appropriate parameters to the projector
+            output['encoder_out'] = self.avfeat_to_llm(**projector_args)
         else:
             # For non-text-aware projectors, just pass the video features
             output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
@@ -793,11 +786,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         
         # First check projector type name (more reliable)
         is_query_based = any(qp in self.cfg.projector_type.lower() for qp in [
-            "qformer", "enhanced_qformer", "visual_speech_qformer", 
-            "perceiver", "cross_attention", "adaptive_query",
-            "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
-            "text_aware_comprehensive_qformer", "visual_text_alignment", 
-            "visual_speech_text_qformer", "ebranchformer_visual_speech"
+            "qformer", "visual_speech_qformer", "cross_attention",
+            "blip2_qformer", "comprehensive_qformer",
+            "visual_speech_text_qformer", "multiscale_contrastive"
         ])
         
         # Fallback to sequence length check if needed
@@ -1060,87 +1051,68 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Get transcript information for cross-modal alignment
         labels = kwargs['target_list'].clone()
         
-        # Get labels embedding with model structure awareness
-        try:
-            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
-                labels_embedding = self.decoder.model.model.embed_tokens(labels)
-            elif hasattr(self.decoder, 'model'):
-                labels_embedding = self.decoder.model.embed_tokens(labels)
-            else:
-                labels_embedding = self.decoder.embed_tokens(labels)
-        except AttributeError:
-            # Fallback to get_input_embeddings method
-            embedding_layer = self.decoder.get_input_embeddings()
-            labels_embedding = embedding_layer(labels)
+        # Get labels embedding directly from the model
+        if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+            labels_embedding = self.decoder.model.model.embed_tokens(labels)
+        elif hasattr(self.decoder, 'model'):
+            labels_embedding = self.decoder.model.embed_tokens(labels)
+        else:
+            labels_embedding = self.decoder.embed_tokens(labels)
         
-        # Variable to store alignment loss
+        # Simplified rule for text-based projectors:
+        # Linear and MLP are cluster-based, everything else is text-based
+        is_text_based = self.cfg.projector_type.lower() not in ['linear', 'mlp']
+        
+        # Apply projector based on type
         alignment_loss = torch.tensor(0.0, device=output['encoder_out'].device)
         
-        # Check if we're using a text-aware projector
-        is_text_aware = 'text_aware' in self.cfg.projector_type or 'qformer' in self.cfg.projector_type.lower()
-        
-        # For all projectors, try to use text information if available
-        has_text_support = hasattr(self.avfeat_to_llm, 'forward') and 'text_embeddings' in inspect.signature(self.avfeat_to_llm.forward).parameters
-        
-        if has_text_support:
-            # Also pass transcript information for cross-modal alignment
-            projector_output = self.avfeat_to_llm(
-                output['encoder_out'], 
-                text_tokens=labels,  # Pass transcript tokens for alignment
-                text_embeddings=labels_embedding,  # Pass transcript embeddings for alignment
-                return_alignment_loss=True
-            )
-            
-            # Unpack if alignment loss was returned
-            if isinstance(projector_output, tuple):
-                output['encoder_out'], alignment_loss = projector_output
-            else:
-                output['encoder_out'] = projector_output
-            
-            # Log the use of transcript information
+        if is_text_based:
+            # For all text-based projectors, always pass transcript tokens embeddings
             if not self.logged_projector_shape:
-                logger.info(f"Using transcript information for cross-modal alignment in {self.cfg.projector_type}")
-        elif is_text_aware:
-            # For text-aware projectors without text_embeddings support
-            # Get text tokens from kwargs - these should always be present
-            text_tokens = kwargs['source']['text']
-            
-            # Add debug info about text tokens
-            if not self.logged_projector_shape:
-                logger.info(f"Text tokens shape: {text_tokens.shape}, non-zero tokens: {(text_tokens != 0).sum().item()}")
+                logger.info(f"Using transcript tokens for vision-text mapping in {self.cfg.projector_type}")
             
             # Create attention mask (1 for real tokens, 0 for padding)
-            text_mask = (text_tokens != 0)
+            text_mask = (labels != 0)
             
-            # Only log this once per run
-            if not self.logged_projector_shape:
-                logger.info(f"Using instruction tokens with shape {text_tokens.shape} for text-aware projector (consider upgrading to a projector that supports transcript alignment)")
+            # Convert embeddings to match encoder output dtype
+            labels_embedding_matched = labels_embedding.to(dtype=output['encoder_out'].dtype)
             
-            # Pass both video features and text to the projector
-            output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'], text_tokens=text_tokens, text_mask=text_mask)
+            # Check projector's forward method signature to determine which parameters to pass
+            forward_params = inspect.signature(self.avfeat_to_llm.forward).parameters
+            
+            # Base parameters that all projectors accept
+            projector_args = {
+                "x": output['encoder_out']
+            }
+            
+            # Add text_tokens parameter if it exists in the signature
+            if "text_tokens" in forward_params:
+                projector_args["text_tokens"] = labels_embedding_matched
+                
+            # Add text_mask parameter if it exists in the signature
+            if "text_mask" in forward_params:
+                projector_args["text_mask"] = text_mask
+                
+            # For QFormer-specific implementations that use text_embeddings instead of text_tokens
+            if "text_embeddings" in forward_params and "text_tokens" not in forward_params:
+                projector_args["text_embeddings"] = labels_embedding_matched
+                
+            # Pass the appropriate parameters to the projector
+            output['encoder_out'] = self.avfeat_to_llm(**projector_args)
         else:
-            # For non-text-aware projectors, just pass the video features
+            # For non-text-based projectors (linear, mlp), just pass the video features
             output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
         
         # Check if we're using a query-based projector that changes sequence length
         proj_seq_len = output['encoder_out'].size(1)
         
-        # First check projector type name (more reliable)
-        is_query_based = any(qp in self.cfg.projector_type.lower() for qp in [
-            "qformer", "enhanced_qformer", "visual_speech_qformer", 
-            "perceiver", "cross_attention", "adaptive_query",
-            "blip2_qformer", "text_aware_qformer", "comprehensive_qformer",
-            "text_aware_comprehensive_qformer", "visual_text_alignment", 
-            "visual_speech_text_qformer", "ebranchformer_visual_speech"
-        ])
-        
-        # Fallback to sequence length check if needed
-        if not is_query_based:
-            is_query_based = proj_seq_len != orig_seq_len
+        # Query-based projectors are the same as text-based in our case, 
+        # since only linear and mlp are not query-based
+        is_query_based = is_text_based
             
         # Handle different projector types
         if is_query_based:
-            # For query-based projectors (QFormer, EnhancedQFormer, etc.) that return fixed number of tokens
+            # For query-based projectors that return fixed number of tokens
             # We skip the cluster-based aggregation as these projectors already aggregate
             reduced_enc_out = output['encoder_out']
             # Only log the shape once
@@ -1316,7 +1288,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                 # Combine losses with weighting
                 # Convert to same dtype for combination
                 # Add alignment loss if available (for cross-modal learning)
-                if has_text_support and alignment_loss.item() > 0:
+                if is_text_based and alignment_loss.item() > 0:
                     # Add alignment loss with a weight (e.g., 0.1)
                     alignment_weight = 0.1
                     total_loss = (1 - self.cfg.ctc_weight - alignment_weight) * lm_loss + \
