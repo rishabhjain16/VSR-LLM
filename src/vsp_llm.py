@@ -783,6 +783,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Initialize num_updates for logging
         self.num_updates = 0
         self.batch_counter = 0  # Add batch counter for more frequent logging
+        self._use_ctc_in_forward = cfg.use_ctc  # Add tracking attribute for CTC usage
         
         # Get hidden size dynamically from the decoder's configuration
         # This will be the output dimension of our projector
@@ -1055,7 +1056,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         
         # Calculate CTC loss if enabled and in training mode
         total_loss = lm_loss
-        if self.training and self.cfg.use_ctc:
+        if self._use_ctc_in_forward:
             # Choose the CTC feature source based on configuration
             if self.cfg.ctc_feature_source == "encoder":
                 # Use raw encoder output for CTC
@@ -1205,3 +1206,24 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         
         # Return combined loss, logits, and labels
         return total_loss, llm_out.logits, llm_labels
+
+    def set_num_updates(self, num_updates):
+        """
+        Standard Fairseq hook called by the trainer to update model state.
+        This is the idiomatic place to ensure training state consistency.
+        """
+        # Call parent method
+        super().set_num_updates(num_updates) 
+        
+        # Store updates counter for use in model logic
+        self.num_updates = num_updates
+        
+        # Ensure CTC loss is used if gradients are enabled
+        # Use a custom attribute to track our intent rather than relying on self.training
+        self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
+        
+        # Log when this flag changes status
+        if self.batch_counter % 20 == 0:
+            logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
+        
+        return self.num_updates
