@@ -45,7 +45,7 @@ dataset:
   validate_interval: 1
   train_subset: train
   valid_subset: test
-  batch_size: 4
+  batch_size: 1
 
 criterion:
   _name: decoder_only_language_modeling_loss
@@ -56,7 +56,7 @@ optimization:
   max_update: 30000
   lr: [0.0005]
   sentence_avg: true
-  update_freq: [8]
+  update_freq: [1]
 
 optimizer:
   _name: adam

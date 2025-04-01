@@ -109,6 +109,22 @@ class QFormerProjector(BaseProjector):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         
+        # Add cross-modal components for transcript alignment
+        self.text_projection = nn.Linear(input_dim, input_dim)
+        self.text_norm = nn.LayerNorm(input_dim)
+        
+        # Cross-attention for aligning visual queries with text
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=input_dim,
+            nhead=num_heads,
+            dim_feedforward=input_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.cross_modal_transformer = nn.TransformerDecoder(decoder_layer, 1)
+        
         # Final projection to match LLM dimensions
         self.proj = nn.Linear(input_dim, output_dim)
         
@@ -116,7 +132,7 @@ class QFormerProjector(BaseProjector):
         nn.init.normal_(self.proj.weight, std=0.02)
         nn.init.zeros_(self.proj.bias)
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, text_tokens=None, text_embeddings=None, return_alignment_loss=False) -> torch.Tensor:
         # x: [B, T, input_dim]
         B = x.size(0)
         
@@ -161,8 +177,64 @@ class QFormerProjector(BaseProjector):
         # Extract query outputs
         query_output = output[:, :query_len]
         
+        alignment_loss = torch.tensor(0.0, device=x.device)
+        
+        # Process text information if available (for cross-modal alignment)
+        if text_embeddings is not None:
+            # Process text embeddings
+            text_features = self.text_projection(text_embeddings)
+            text_features = self.text_norm(text_features)
+            
+            # Create padding mask for text (1 = padding, 0 = real token)
+            if text_tokens is not None:
+                text_padding_mask = (text_tokens == 0)
+            else:
+                text_padding_mask = None
+            
+            # Use cross-modal attention to refine queries with text information
+            refined_queries = self.cross_modal_transformer(
+                query_output,           # Target (queries)
+                text_features,          # Memory (text)
+                memory_key_padding_mask=text_padding_mask
+            )
+            
+            # Calculate alignment loss (simple contrastive loss)
+            if return_alignment_loss:
+                # Mean pooling for both modalities
+                query_pooled = refined_queries.mean(dim=1)  # [B, D]
+                text_pooled = text_features.mean(dim=1)     # [B, D]
+                
+                # Normalize embeddings
+                query_pooled = F.normalize(query_pooled, dim=-1)
+                text_pooled = F.normalize(text_pooled, dim=-1)
+                
+                # Compute similarity matrix
+                similarity = torch.matmul(query_pooled, text_pooled.transpose(0, 1))  # [B, B]
+                
+                # Scale by temperature
+                temperature = 0.07
+                similarity = similarity / temperature
+                
+                # Labels are the diagonal (matching pairs)
+                labels = torch.arange(similarity.size(0), device=similarity.device)
+                
+                # Symmetric loss
+                loss_i2t = F.cross_entropy(similarity, labels)
+                loss_t2i = F.cross_entropy(similarity.transpose(0, 1), labels)
+                
+                alignment_loss = (loss_i2t + loss_t2i) / 2.0
+            
+            # Use refined queries for final projection
+            final_queries = refined_queries
+        else:
+            # Without text information, use original query output
+            final_queries = query_output
+            
         # Project to target dimension
-        projected = self.proj(query_output)
+        projected = self.proj(final_queries)
+        
+        if return_alignment_loss:
+            return projected, alignment_loss
         
         return projected
 

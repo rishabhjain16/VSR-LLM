@@ -79,8 +79,20 @@ USE_FP16=true
 # Projector type
 PROJECTOR_TYPE="visual_speech_qformer"
 
+# CTC configuration
+USE_CTC="false"  # Set to "true" to enable CTC loss
+CTC_WEIGHT="0.3"  # Weight for CTC loss (0.3 means 30% CTC, 70% LM)
+CTC_FEATURE_SOURCE="projector"  # Source of features for CTC: "encoder" or "projector"
+
 echo "Training with:"
 echo "- Projector type: $PROJECTOR_TYPE"
+# Check if CTC should be enabled
+if [ "$USE_CTC" = "true" ]; then
+    echo "- Using CTC loss with weight: $CTC_WEIGHT"
+    echo "- CTC feature source: $CTC_FEATURE_SOURCE"
+else
+    echo "- Not using CTC loss"
+fi
 if [[ "$PROJECTOR_TYPE" != *"qformer"* ]] && [[ "$PROJECTOR_TYPE" != *"perceiver"* ]] && [[ "$PROJECTOR_TYPE" != *"fusion"* ]]; then
     echo "- Using mean clustering (default)"
 else
@@ -98,6 +110,9 @@ fairseq-hydra-train \
         model.w2v_path=${PRETRAINED_MODEL_PATH} \
         model.llm_ckpt_path=${LLM_PATH} \
         +model.projector_type=${PROJECTOR_TYPE} \
+        +model.use_ctc=${USE_CTC} \
+        +model.ctc_weight=${CTC_WEIGHT} \
+        +model.ctc_feature_source=${CTC_FEATURE_SOURCE} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
         distributed_training.nprocs_per_node=1 

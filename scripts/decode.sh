@@ -16,7 +16,7 @@ MODEL_SRC=${ROOT}/src
 LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf
 #LLM_PATH=${ROOT}/checkpoints/Meta-Llama-3-8B    # path to Llama 3 model
 
-#DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data     # path to test dataset dir
+DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data     # path to test dataset dir
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_clean/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/test_lrs2/lrs2/lrs2_video_seg16s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/WildVSR/test_data
@@ -27,9 +27,9 @@ LLM_PATH=${ROOT}/checkpoints/Llama-2-7b-hf
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_clean/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/test_lrs2/lrs2/lrs2_video_seg16s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2/auto/lrs2/lrs2_video_seg24s/data_lrs2
-DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2/retina/lrs2/lrs2_video_seg16s/data_lrs2
+#DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
 
-MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_proj_test_enhancedqformer/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
+MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_proj_linear_with_ctc/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
 #MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt
 #MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
 #MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
@@ -39,7 +39,7 @@ MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_UnordodoxPromptNew_bs4/checkpoints/checkpoint_best.pt
 
 
-OUT_PATH=${ROOT}/checkpoints/decode/decode_llama2_lrs2_mp    # output path to save results
+OUT_PATH=${ROOT}/checkpoints/decode/decode_llama2_ctc   # output path to save results
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test_mytrained_lora_32
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test
 

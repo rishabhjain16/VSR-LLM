@@ -76,8 +76,22 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
 PROJECTOR_TYPE="linear"
 
+# CTC configuration
+USE_CTC="false"  # Set to "true" to enable CTC loss
+CTC_WEIGHT="0.3"  # Weight for CTC loss (0.3 means 30% CTC, 70% LM)
+CTC_FEATURE_SOURCE="projector"  # Source of features for CTC: "encoder" or "projector"
+MODEL_TYPE="vsp_llm"  # Use "vsp_llm_ctc" when USE_CTC is true
+
 echo "Training with:"
 echo "- Projector type: $PROJECTOR_TYPE"
+# Check if CTC should be enabled
+if [ "$USE_CTC" = "true" ]; then
+    MODEL_TYPE="vsp_llm_ctc"
+    echo "- Using CTC loss with weight: $CTC_WEIGHT"
+    echo "- CTC feature source: $CTC_FEATURE_SOURCE"
+else
+    echo "- Not using CTC loss"
+fi
 if [[ "$PROJECTOR_TYPE" != *"qformer"* ]] && [[ "$PROJECTOR_TYPE" != *"perceiver"* ]] && [[ "$PROJECTOR_TYPE" != *"fusion"* ]]; then
     echo "- Using mean clustering (default)"
 else
@@ -95,6 +109,10 @@ fairseq-hydra-train \
         model.w2v_path=${PRETRAINED_MODEL_PATH} \
         model.llm_ckpt_path=${LLM_PATH} \
         +model.projector_type=${PROJECTOR_TYPE} \
+        +model.use_ctc=${USE_CTC} \
+        +model.ctc_weight=${CTC_WEIGHT} \
+        +model.ctc_feature_source=${CTC_FEATURE_SOURCE} \
+        model=\\${MODEL_TYPE} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \
         distributed_training.nprocs_per_node=1 

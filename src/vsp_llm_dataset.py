@@ -233,6 +233,7 @@ class VSP_LLM_dataset(FairseqDataset):
             else label_rates
         )
         self.modalities = set(modalities)
+        self.projector_type = projector_type
         self.audio_root, self.names, inds, tot, self.sizes, self.cluster_counts, = load_audio_visual(
             manifest_path, 
             max_keep_sample_size, 
