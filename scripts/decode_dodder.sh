@@ -24,7 +24,7 @@ DATA_ROOT=/data/ssd3/data_rishabh/lrs3/433h_data     # path to test dataset dir
 # - src/vsp_llm.py: target_modules, lora_r, lora_alpha for the specific model architecture
 # - Default values are set for Llama models and should work with Llama 3
 
-MODEL_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_mlp/checkpoints/checkpoint_best.pt    # path to trained model with Llama 3
+MODEL_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_linear_ctc_projector/checkpoints/checkpoint_best.pt    # path to trained model with Llama 3
 #MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt
 #MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
 #MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
@@ -34,7 +34,7 @@ MODEL_PATH=/data/ssd3/data_rishabh/VSR_ckps/llama2_lrs3_mlp/checkpoints/checkpoi
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_UnordodoxPromptNew_bs4/checkpoints/checkpoint_best.pt
 
 
-OUT_PATH=${ROOT}/checkpoints/decode/llama2_lrs3_mlp    # output path to save results
+OUT_PATH=${ROOT}/checkpoints/decode/llama2_lrs3_t1    # output path to save results
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test_mytrained_lora_32
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test
 
