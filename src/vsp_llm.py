@@ -212,11 +212,16 @@ class VSPLLMConfig(FairseqDataclass):
     )
     ctc_blank_idx: Optional[int] = field(
         default=0, 
-        metadata={"help": "Index to use for blank token in CTC (if 0 or empty, will use last token in vocabulary)"}
+        metadata={"help": "Index to use for blank token in CTC (defaults to 0)"}
     )
     ctc_feature_source: str = field(
         default="projector",
         metadata={"help": "Source of features for CTC loss: 'encoder' (raw AV-HuBERT) or 'projector' (after projection)"}
+    )
+    # Add a field for CTC vocabulary size (always using phonetic vocabulary)
+    ctc_vocab_size: int = field(
+        default=50,
+        metadata={"help": "Size of the phonetic vocabulary for CTC"}
     )
 
 
@@ -587,27 +592,27 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         target_ids = torch.full((B, T + instruction_embedding_t),-100).long().to(labels.device)
         llm_labels = torch.cat((target_ids, llm_labels), dim=1)
         
-        # Use a single code path for all models instead of model-specific branches
-        llm_out = self.decoder(inputs_embeds=llm_input, labels=llm_labels, return_dict=True)
-        lm_loss = llm_out.loss
-        
-        # Calculate CTC loss if enabled and in training mode
-        total_loss = lm_loss
-        if hasattr(self, '_use_ctc_in_forward') and self._use_ctc_in_forward:
-            # Choose the CTC feature source based on configuration
+        # If CTC is enabled and we're in training mode
+        if self._use_ctc_in_forward:
+            # Get CTC features based on the configured source
             if self.cfg.ctc_feature_source == "encoder":
                 # Use raw encoder output for CTC
-                ctc_features = output['encoder_out'].clone()
-                ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
+                ctc_features = reduced_enc_out.clone()
+                
+                # Only calculate logits if using encoder features
+                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
                 ctc_logits = self.ctc_head_encoder(ctc_features_matched)
                 
-                # Get input lengths from encoder output
-                if 'padding_mask' in output and output['padding_mask'] is not None:
-                    input_lengths = (~output['padding_mask']).long().sum(-1)
-                else:
-                    input_lengths = torch.full((output['encoder_out'].size(0),), 
-                                            output['encoder_out'].size(1),
-                                            device=output['encoder_out'].device,
+                # For encoder output, be careful with input lengths
+                if hasattr(self, 'encoder_outputs_per_layer'):
+                    # Use encoder-specific information if available
+                    input_lengths = self.encoder_outputs_per_layer.get('lengths', None)
+                
+                if input_lengths is None:
+                    # Fallback to assuming all time steps are valid
+                    input_lengths = torch.full((reduced_enc_out.size(0),), 
+                                            reduced_enc_out.size(1),
+                                            device=reduced_enc_out.device,
                                             dtype=torch.long)
                 
                 # Log which feature source is being used
@@ -616,7 +621,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             else:
                 # Use projector output for CTC (default)
                 ctc_features = reduced_enc_out.clone()
-                ctc_features_matched = ctc_features.to(dtype=self.ctc_head_projector.weight.dtype)
+                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
                 ctc_logits = self.ctc_head_projector(ctc_features_matched)
                 
                 # For projector output, be more careful with input lengths
@@ -643,8 +648,24 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             # Apply log softmax to CTC logits
             log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # [T, B, V]
             
-            # Get target sequence (same text used for LLM loss)
-            target = labels
+            # Map target to phonetic indices
+            # Create mapping tensor for LLM token IDs to phonetic IDs (map everything to <unk>)
+            # In a real implementation, you would have a more sophisticated mapping
+            # For now, we'll just use a simple strategy for testing
+            unk_idx = self.phonetic_vocab.get('<unk>', 1)  # Default to 1 if not found
+            
+            # Clone target to avoid modifying the original
+            phonetic_target = torch.full_like(labels, unk_idx)
+            
+            # Get non-padding tokens
+            non_pad_mask = (labels != 0)
+            
+            # Set non-pad tokens to unk_idx (this is a simplified approach)
+            # In a real implementation, you would map each token to an appropriate phonetic sequence
+            phonetic_target = phonetic_target * non_pad_mask
+            
+            # Use phonetic_target for CTC loss calculation
+            target = phonetic_target
             
             # Remove padding tokens for CTC loss
             pad_mask = (target != 0)  # 0 is padding token
@@ -663,9 +684,8 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 if invalid_lens > 0:
                     logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
                 
-                # Verify our blank index isn't causing issues with padding
-                if self.cfg.ctc_blank_idx == 0 or self.cfg.ctc_blank_idx is None or (isinstance(self.cfg.ctc_blank_idx, str) and not self.cfg.ctc_blank_idx.strip()):
-                    logger.warning("CTC blank_idx is set to 0, which is also the padding token - this may cause issues")
+                # Log vocabulary information
+                logger.info(f"Using phonetic vocabulary for CTC targets, size: {self.ctc_vocab_size}")
             
             # Calculate CTC loss
             try:
@@ -695,13 +715,6 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                         min_logit = ctc_logits.min().item()
                         mean_logit = ctc_logits.mean().item()
                         logger.warning(f"CTC logits stats: min={min_logit:.4f}, max={max_logit:.4f}, mean={mean_logit:.4f}")
-                        
-                        # Try with a fixed minimum loss to prevent zero gradient
-                        if self.cfg.ctc_feature_source == "projector" and ctc_loss.item() < 1e-6:
-                            # If using projector and getting zero loss, fall back to a nominal minimum loss
-                            # to ensure some gradient signal reaches the CTC head
-                            logger.warning("Applying minimum loss floor for numerical stability")
-                            ctc_loss = torch.max(ctc_loss, torch.tensor(0.1, device=ctc_loss.device, dtype=ctc_loss.dtype))
                 
                 # Combine losses with weighting
                 # Convert to same dtype for combination
@@ -753,6 +766,10 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 top_p=0.9,
                 repetition_penalty=1.0,
                 length_penalty=0.0,
+                use_ctc_decoding=True,  # Changed default to True
+                ctc_beam_size=10,
+                ctc_weight_decode=0.3,  # Set default weight for hybrid decoding
+                return_ctc_outputs=True,  # Added to return CTC outputs
                 **kwargs,
                 ):
         output = self.encoder(**kwargs)
@@ -854,6 +871,59 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 logger.info(f"Using mean cluster aggregation with output shape: {reduced_enc_out.size()}")
                 self.logged_projector_shape = True
         
+        # Option to use CTC decoding
+        if use_ctc_decoding and hasattr(self, 'ctc_vocab_size'):
+            # Get CTC logits based on configured CTC head
+            if self.cfg.ctc_feature_source == "encoder" and self.ctc_head_encoder is not None:
+                ctc_features = output['encoder_out'].clone()
+                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
+                ctc_logits = self.ctc_head_encoder(ctc_features_matched)
+            elif self.ctc_head_projector is not None:
+                ctc_features = reduced_enc_out.clone()
+                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
+                ctc_logits = self.ctc_head_projector(ctc_features_matched)
+            else:
+                # Fall back to normal generation if CTC head is not available
+                logger.warning("CTC decoding requested but appropriate CTC head is not available")
+                use_ctc_decoding = False
+            
+            if use_ctc_decoding:
+                # Apply log softmax to CTC logits
+                log_probs = F.log_softmax(ctc_logits, dim=-1)  # [B, T, V]
+                
+                # Simplified greedy decoding (we could implement beam search in a more sophisticated system)
+                # This just demonstrates the basic approach
+                best_paths = torch.argmax(log_probs, dim=-1)  # [B, T]
+                
+                # Remove repeated tokens and blanks (basic CTC decoding)
+                decoded_seqs = []
+                for seq in best_paths:
+                    decoded = []
+                    prev = -1  # Different from all valid indices
+                    for token_idx in seq:
+                        token = token_idx.item()
+                        if token != prev and token != self.cfg.ctc_blank_idx:
+                            decoded.append(token)
+                        prev = token
+                    
+                    # Convert to tensor
+                    decoded_tensor = torch.tensor(decoded, device=best_paths.device)
+                    decoded_seqs.append(decoded_tensor)
+                
+                # If we're using a phonetic vocabulary, convert to a readable format
+                if hasattr(self, 'idx_to_phonetic'):
+                    readable_seqs = []
+                    for seq in decoded_seqs:
+                        readable = ''.join([self.idx_to_phonetic.get(idx.item(), '?') for idx in seq])
+                        readable_seqs.append(readable)
+                    
+                    # Store for return
+                    self._ctc_decoded_outputs = readable_seqs
+                    logger.info(f"CTC decoded sequences: {readable_seqs}")
+                
+                # Store CTC feature for later use in reranking
+                self._ctc_features_for_reranking = reduced_enc_out if self.cfg.ctc_feature_source == "projector" else output['encoder_out']
+        
         B, T, D = reduced_enc_out.size()
         instruction = kwargs['source']['text']
         
@@ -874,6 +944,8 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
         # Use a consistent approach for all models
         self.decoder.config.use_cache = True
+        
+        # Get LLM outputs
         outputs = self.decoder.generate(
             inputs_embeds=llm_input,
             top_p=top_p,
@@ -883,9 +955,77 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             repetition_penalty=repetition_penalty,
             do_sample=True,
             length_penalty=length_penalty,
+            output_scores=True,
+            return_dict_in_generate=True,
         )
+        
+        # Store the original sequences for returning with CTC output
+        original_sequences = outputs.sequences
+        
+        # Check if reranking with CTC is needed
+        if use_ctc_decoding and hasattr(self, '_ctc_features_for_reranking') and ctc_weight_decode is not None and ctc_weight_decode > 0:
+            # Get sequences from outputs
+            sequences = outputs.sequences
+            
+            # Convert sequences to list of token lists for each batch item
+            batch_size = sequences.size(0)
+            sequence_lists = [[] for _ in range(batch_size)]
+            
+            # Group by batch
+            for i in range(sequences.size(0)):
+                # Skip instruction token IDs which are the same for all beams
+                seq = sequences[i, instruction.size(1):]
+                sequence_lists[i % batch_size].append(seq)
+            
+            # Calculate LLM scores
+            llm_scores = []
+            for i in range(batch_size):
+                # Use sequence_scores from beam search
+                if hasattr(outputs, 'sequences_scores'):
+                    beam_scores = outputs.sequences_scores.reshape(batch_size, -1)[i].tolist()
+                    llm_scores.append(beam_scores)
+                else:
+                    # Fallback - equal weights if scores not available
+                    llm_scores.append([1.0] * len(sequence_lists[i]))
+            
+            # Perform hybrid reranking
+            reranked_indices = self.hybrid_reranking(
+                self._ctc_features_for_reranking,
+                llm_scores,
+                sequence_lists,
+                ctc_weight=ctc_weight_decode,
+                feature_source=self.cfg.ctc_feature_source
+            )
+            
+            # Reorder sequences based on reranking
+            reranked_sequences = []
+            for b in range(batch_size):
+                # Get the top reranked sequence
+                top_idx = reranked_indices[b][0]
+                reranked_sequences.append(sequences[b * len(sequence_lists[b]) + top_idx])
+            
+            # Return reranked sequences
+            if len(reranked_sequences) == 1:
+                return reranked_sequences[0]
+            else:
+                return torch.stack(reranked_sequences)
+            
+        # Clear temporary storage
+        if hasattr(self, '_ctc_features_for_reranking'):
+            delattr(self, '_ctc_features_for_reranking')
 
-        return outputs
+        # Return both LLM and CTC outputs if requested
+        if return_ctc_outputs and hasattr(self, '_ctc_decoded_outputs'):
+            # Create a structure to return both
+            result = {
+                'llm_output': outputs.sequences,
+                'ctc_output': self._ctc_decoded_outputs
+            }
+            # Clean up temporary storage
+            delattr(self, '_ctc_decoded_outputs')
+            return result
+        
+        return outputs.sequences
 
     def get_ctc_target(self, sample):
         return sample["target"], sample["target_lengths"]
@@ -929,8 +1069,135 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
     def state_dict(self):
         old_state = super().state_dict()
-        state = {k:v for k,v in old_state.items() if 'lora' in k or 'avfeat_to_llm' in k or 'encoder' in k}
+        state = {k:v for k,v in old_state.items() if 'lora' in k or 'avfeat_to_llm' in k or 'encoder' in k or 'ctc_head' in k}
         return state
+
+    def calculate_ctc_scores(self, encoder_features, sequences, feature_source="projector"):
+        """
+        Calculate CTC scores for a set of sequences for use in reranking.
+        
+        Args:
+            encoder_features: tensor of shape [B, T, D] (based on feature_source)
+            sequences: list of token sequences to score
+            feature_source: whether to use "encoder" or "projector" features
+            
+        Returns:
+            scores: tensor of CTC scores for each sequence
+        """
+        # Skip if CTC not available
+        if feature_source == "encoder" and self.ctc_head_encoder is None:
+            logger.warning("Requested encoder CTC scoring but encoder CTC head is not available")
+            return None
+        elif feature_source == "projector" and self.ctc_head_projector is None:
+            logger.warning("Requested projector CTC scoring but projector CTC head is not available")
+            return None
+        
+        # Get logits from appropriate CTC head
+        with torch.no_grad():
+            if feature_source == "encoder":
+                ctc_features_matched = encoder_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
+                ctc_logits = self.ctc_head_encoder(ctc_features_matched)
+            else:
+                ctc_features_matched = encoder_features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
+                ctc_logits = self.ctc_head_projector(ctc_features_matched)
+            
+            # Apply log softmax to CTC logits
+            log_probs = F.log_softmax(ctc_logits, dim=-1)  # [B, T, V]
+        
+        # Calculate scores for each sequence
+        batch_size = log_probs.size(0)
+        input_lengths = torch.full((batch_size,), log_probs.size(1), device=log_probs.device, dtype=torch.long)
+        scores = []
+        
+        for b in range(batch_size):
+            batch_scores = []
+            batch_log_probs = log_probs[b].unsqueeze(0)  # [1, T, V]
+            
+            # Process each sequence
+            for sequence in sequences[b]:
+                # Skip empty sequences
+                if len(sequence) == 0:
+                    batch_scores.append(float('-inf'))
+                    continue
+                
+                # Convert to tensor if needed
+                if not isinstance(sequence, torch.Tensor):
+                    sequence = torch.tensor(sequence, device=log_probs.device, dtype=torch.long)
+                
+                # Reshape for CTC loss
+                sequence = sequence.unsqueeze(0)  # [1, S]
+                target_length = torch.tensor([sequence.size(1)], device=log_probs.device, dtype=torch.long)
+                
+                # If using phonetic vocabulary, map sequence to phonetic indices
+                if not hasattr(sequence, 'already_mapped'):
+                    # Here we need a mapping from LLM tokens to phonetic tokens
+                    # Implement a more sophisticated mapping for real systems
+                    unk_idx = self.phonetic_vocab.get('<unk>', 1)
+                    phonetic_sequence = torch.full_like(sequence, unk_idx)
+                    phonetic_sequence.already_mapped = True
+                    sequence = phonetic_sequence
+                
+                try:
+                    # CTC loss (negative = score)
+                    batch_log_probs_float = batch_log_probs.float().transpose(0, 1)  # [T, 1, V]
+                    loss = F.ctc_loss(
+                        batch_log_probs_float,
+                        sequence,
+                        input_lengths[b].unsqueeze(0),
+                        target_length,
+                        blank=self.cfg.ctc_blank_idx,
+                        reduction="sum",
+                        zero_infinity=True,
+                    )
+                    # Convert loss to score (negative) and normalize by length
+                    batch_scores.append(-loss.item() / target_length.item())
+                except Exception as e:
+                    logger.warning(f"Error calculating CTC score: {e}")
+                    batch_scores.append(float('-inf'))
+            
+            scores.append(batch_scores)
+        
+        return scores
+        
+    def hybrid_reranking(self, encoder_features, llm_scores, sequences, ctc_weight=0.3, feature_source="projector"):
+        """
+        Rerank sequences using a combination of LLM and CTC scores
+        
+        Args:
+            encoder_features: tensor of encoder features
+            llm_scores: list of LLM scores for sequences
+            sequences: list of sequences to rerank
+            ctc_weight: weight for CTC scores (1-ctc_weight for LLM scores)
+            feature_source: whether to use "encoder" or "projector" features
+            
+        Returns:
+            reranked_indices: list of reranked indices for each batch item
+        """
+        # Calculate CTC scores
+        ctc_scores = self.calculate_ctc_scores(encoder_features, sequences, feature_source)
+        
+        if ctc_scores is None:
+            # Fallback to original rankings if CTC scoring failed
+            return list(range(len(llm_scores[0])))
+        
+        # Combine scores
+        reranked_indices = []
+        for b in range(len(llm_scores)):
+            # Normalize scores
+            llm_scores_norm = torch.tensor(llm_scores[b])
+            llm_scores_norm = (llm_scores_norm - llm_scores_norm.mean()) / (llm_scores_norm.std() + 1e-9)
+            
+            ctc_scores_norm = torch.tensor(ctc_scores[b])
+            ctc_scores_norm = (ctc_scores_norm - ctc_scores_norm.mean()) / (ctc_scores_norm.std() + 1e-9)
+            
+            # Combine scores
+            combined_scores = (1 - ctc_weight) * llm_scores_norm + ctc_weight * ctc_scores_norm
+            
+            # Get indices of sorted combined scores
+            _, indices = torch.sort(combined_scores, descending=True)
+            reranked_indices.append(indices.tolist())
+        
+        return reranked_indices
 
 
 def Embedding(num_embeddings, embedding_dim, padding_idx):
@@ -1030,35 +1297,86 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             encoder_dim = 1024  # Common AV-HuBERT dimension
             logger.warning(f"Could not determine encoder dimension, using default: {encoder_dim}")
         
-        # Get vocabulary size for CTC output dimension
-        vocab_size = None
-        if hasattr(decoder, 'config') and hasattr(decoder.config, 'vocab_size'):
-            vocab_size = decoder.config.vocab_size
-        elif hasattr(decoder, 'vocab_size'):
-            vocab_size = decoder.vocab_size
+        # Define a phonetic vocabulary for CTC
+        # Create a phonetic vocabulary of the specified size
+        self.ctc_vocab_size = getattr(cfg, 'ctc_vocab_size', 50)
         
-        if vocab_size is None:
-            raise ValueError("Could not determine vocabulary size for CTC head output dimension.")
+        # Create a dict mapping characters to indices
+        # Start with a blank token at index 0
+        self.phonetic_vocab = {'<blank>': 0}
         
-        # Log the determined dimensions
-        logger.info(f"Encoder CTC head will use dimensions: {encoder_dim} → {vocab_size}")
-        logger.info(f"Projector CTC head will use dimensions: {projector_out_dim} → {vocab_size}")
+        # Add basic phonetic symbols (vowels, consonants, etc.)
+        vowels = ['a', 'e', 'i', 'o', 'u']
+        consonants = ['b', 'c', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 'q', 'r', 's', 't', 'v', 'w', 'x', 'y', 'z']
+        special = ['<unk>', '<pad>', '<s>', ' ', ' ']
         
-        # Add CTC heads for both feature sources
-        self.ctc_head_encoder = nn.Linear(encoder_dim, vocab_size)
-        self.ctc_head_projector = nn.Linear(projector_out_dim, vocab_size)
+        # Add these symbols to our vocabulary
+        all_symbols = vowels + consonants + special
         
-        # Initialize the projection layers
-        nn.init.xavier_normal_(self.ctc_head_encoder.weight)
-        nn.init.zeros_(self.ctc_head_encoder.bias)
-        nn.init.xavier_normal_(self.ctc_head_projector.weight)
-        nn.init.zeros_(self.ctc_head_projector.bias)
+        # Ensure we don't exceed the vocabulary size
+        available_symbols = all_symbols[:self.ctc_vocab_size - 1]  # -1 for blank token
+        
+        # Add symbols to the vocabulary
+        for i, symbol in enumerate(available_symbols):
+            self.phonetic_vocab[symbol] = i + 1  # +1 because blank is 0
+        
+        # Create reverse mapping
+        self.idx_to_phonetic = {idx: char for char, idx in self.phonetic_vocab.items()}
+        
+        # Set actual vocab size based on created vocabulary
+        self.ctc_vocab_size = len(self.phonetic_vocab)
+        
+        # Use this vocab size for the CTC head
+        vocab_size = self.ctc_vocab_size
+        
+        # Sanity check: ensure vocab size is reasonable for phonetic vocabulary
+        if vocab_size > 100:
+            logger.warning(f"Phonetic vocabulary size {vocab_size} is unusually large. Check configuration.")
+            # Force reasonable size for phonetic vocabulary
+            logger.warning(f"Forcing phonetic vocabulary size to 50 (was {vocab_size})")
+            vocab_size = 50
+            self.ctc_vocab_size = vocab_size
+        
+        logger.info(f"Using phonetic vocabulary for CTC with {vocab_size} tokens")
+        
+        # Log the determined dimensions with clearer information
+        logger.info(f"Encoder CTC head will use dimensions: {encoder_dim} → {vocab_size} (phonetic vocab)")
+        logger.info(f"Projector CTC head will use dimensions: {projector_out_dim} → {vocab_size} (phonetic vocab)")
+        
+        # Add structured CTC heads for both feature sources
+        # Use a more sophisticated architecture with multiple layers for better mapping
+        if cfg.ctc_feature_source == "encoder":
+            # Initialize the encoder-based CTC head (only if we're using it)
+            hidden_dim = min(encoder_dim, 512)  # Use smaller hidden dimension for efficiency
+            self.ctc_head_encoder = nn.Sequential(
+                nn.Linear(encoder_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, vocab_size)
+            )
+            # Initialize only the projector if we're using it
+            self.ctc_head_projector = None
+        else:
+            # Initialize the projector-based CTC head (only if we're using it)
+            hidden_dim = min(projector_out_dim, 512)  # Use smaller hidden dimension for efficiency
+            self.ctc_head_projector = nn.Sequential(
+                nn.Linear(projector_out_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, vocab_size)
+            )
+            # Initialize only the encoder if we're using it
+            self.ctc_head_encoder = None
+        
+        logger.info(f"Using structured CTC head with hidden dimension: {hidden_dim}")
         
         # Auto-set blank index to avoid conflict with padding token
         if not hasattr(cfg, 'ctc_blank_idx') or cfg.ctc_blank_idx == 0 or cfg.ctc_blank_idx is None or (isinstance(cfg.ctc_blank_idx, str) and not cfg.ctc_blank_idx.strip()):
-            # Use last token in vocabulary as blank
-            self.cfg.ctc_blank_idx = vocab_size - 1
-            logger.info(f"Auto-setting CTC blank_idx to {self.cfg.ctc_blank_idx} (last token in vocabulary)")
+            # For phonetic vocab, blank is already at index 0
+            self.cfg.ctc_blank_idx = 0
+            logger.info(f"Using phonetic vocabulary with blank_idx=0")
             
             # Try to print the actual token if tokenizer is available
             if hasattr(decoder, 'tokenizer'):
@@ -1071,7 +1389,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         logger.info(f"INITIALIZING MODEL WITH CTC: weight={cfg.ctc_weight}, blank={cfg.ctc_blank_idx}")
         logger.info(f"CTC feature source: {cfg.ctc_feature_source}")
         logger.info(f"==========================================================")
-    
+
     @classmethod
     def build_model(cls, cfg, task):
         """Build a new model instance."""
@@ -1233,18 +1551,23 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         
         # Calculate CTC loss if enabled and in training mode
         total_loss = lm_loss
-        if hasattr(self, '_use_ctc_in_forward') and self._use_ctc_in_forward:
-            # Choose the CTC feature source based on configuration
+        if self._use_ctc_in_forward:
+            # Get CTC features based on the configured source
             if self.cfg.ctc_feature_source == "encoder":
                 # Use raw encoder output for CTC
-                ctc_features = raw_encoder_out
-                ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
+                ctc_features = raw_encoder_out.clone()
+                
+                # Only calculate logits if using encoder features
+                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
                 ctc_logits = self.ctc_head_encoder(ctc_features_matched)
                 
-                # Get input lengths from encoder output
-                if 'padding_mask' in output and output['padding_mask'] is not None:
-                    input_lengths = (~output['padding_mask']).long().sum(-1)
-                else:
+                # For encoder output, be careful with input lengths
+                if hasattr(self, 'encoder_outputs_per_layer'):
+                    # Use encoder-specific information if available
+                    input_lengths = self.encoder_outputs_per_layer.get('lengths', None)
+                
+                if input_lengths is None:
+                    # Fallback to assuming all time steps are valid
                     input_lengths = torch.full((raw_encoder_out.size(0),), 
                                             raw_encoder_out.size(1),
                                             device=raw_encoder_out.device,
@@ -1256,7 +1579,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             else:
                 # Use projector output for CTC (default)
                 ctc_features = reduced_enc_out.clone()
-                ctc_features_matched = ctc_features.to(dtype=self.ctc_head_projector.weight.dtype)
+                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
                 ctc_logits = self.ctc_head_projector(ctc_features_matched)
                 
                 # For projector output, be more careful with input lengths
@@ -1283,8 +1606,24 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             # Apply log softmax to CTC logits
             log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # [T, B, V]
             
-            # Get target sequence (same text used for LLM loss)
-            target = labels
+            # Map target to phonetic indices
+            # Create mapping tensor for LLM token IDs to phonetic IDs (map everything to <unk>)
+            # In a real implementation, you would have a more sophisticated mapping
+            # For now, we'll just use a simple strategy for testing
+            unk_idx = self.phonetic_vocab.get('<unk>', 1)  # Default to 1 if not found
+            
+            # Clone target to avoid modifying the original
+            phonetic_target = torch.full_like(labels, unk_idx)
+            
+            # Get non-padding tokens
+            non_pad_mask = (labels != 0)
+            
+            # Set non-pad tokens to unk_idx (this is a simplified approach)
+            # In a real implementation, you would map each token to an appropriate phonetic sequence
+            phonetic_target = phonetic_target * non_pad_mask
+            
+            # Use phonetic_target for CTC loss calculation
+            target = phonetic_target
             
             # Remove padding tokens for CTC loss
             pad_mask = (target != 0)  # 0 is padding token
@@ -1303,9 +1642,8 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                 if invalid_lens > 0:
                     logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
                 
-                # Verify our blank index isn't causing issues with padding
-                if self.cfg.ctc_blank_idx == 0 or self.cfg.ctc_blank_idx is None or (isinstance(self.cfg.ctc_blank_idx, str) and not self.cfg.ctc_blank_idx.strip()):
-                    logger.warning("CTC blank_idx is set to 0, which is also the padding token - this may cause issues")
+                # Log vocabulary information
+                logger.info(f"Using phonetic vocabulary for CTC targets, size: {self.ctc_vocab_size}")
             
             # Calculate CTC loss
             try:
@@ -1335,13 +1673,6 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                         min_logit = ctc_logits.min().item()
                         mean_logit = ctc_logits.mean().item()
                         logger.warning(f"CTC logits stats: min={min_logit:.4f}, max={max_logit:.4f}, mean={mean_logit:.4f}")
-                        
-                        # Try with a fixed minimum loss to prevent zero gradient
-                        if self.cfg.ctc_feature_source == "projector" and ctc_loss.item() < 1e-6:
-                            # If using projector and getting zero loss, fall back to a nominal minimum loss
-                            # to ensure some gradient signal reaches the CTC head
-                            logger.warning("Applying minimum loss floor for numerical stability")
-                            ctc_loss = torch.max(ctc_loss, torch.tensor(0.1, device=ctc_loss.device, dtype=ctc_loss.dtype))
                 
                 # Combine losses with weighting
                 # Convert to same dtype for combination
@@ -1406,3 +1737,178 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
         
         return self.num_updates
+
+    def ctc_greedy_decode(self, features, feature_source="projector"):
+        """
+        Performs greedy CTC decoding on the given features.
+        
+        Args:
+            features: Tensor of shape [B, T, D] from encoder or projector
+            feature_source: Whether to use "encoder" or "projector" CTC head
+            
+        Returns:
+            List of decoded sequences as strings (if phonetic vocab) or token indices
+        """
+        # Skip if CTC not available
+        if feature_source == "encoder" and self.ctc_head_encoder is None:
+            logger.warning("Requested encoder CTC decoding but encoder CTC head is not available")
+            return None
+        elif feature_source == "projector" and self.ctc_head_projector is None:
+            logger.warning("Requested projector CTC decoding but projector CTC head is not available")
+            return None
+            
+        # Get logits from appropriate CTC head
+        with torch.no_grad():
+            if feature_source == "encoder":
+                features_matched = features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
+                logits = self.ctc_head_encoder(features_matched)
+            else:
+                features_matched = features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
+                logits = self.ctc_head_projector(features_matched)
+            
+            # Get most likely tokens at each position
+            best_paths = torch.argmax(logits, dim=-1)  # [B, T]
+        
+        # Apply CTC decoding rules (merge repeated tokens, remove blanks)
+        batch_size = best_paths.size(0)
+        decoded_seqs = []
+        
+        for b in range(batch_size):
+            path = best_paths[b]
+            decoded = []
+            prev = -1  # Different from all valid indices
+            
+            for token_idx in path:
+                token = token_idx.item()
+                if token != prev and token != self.cfg.ctc_blank_idx:
+                    decoded.append(token)
+                prev = token
+            
+            # Convert to string if using phonetic vocabulary
+            if hasattr(self, 'idx_to_phonetic'):
+                decoded_str = ''.join([self.idx_to_phonetic.get(idx, '?') for idx in decoded])
+                decoded_seqs.append(decoded_str)
+            else:
+                # Return indices
+                decoded_seqs.append(decoded)
+        
+        return decoded_seqs
+    
+    def ctc_beam_decode(self, features, beam_size=10, feature_source="projector"):
+        """
+        Performs beam search CTC decoding on the given features.
+        
+        Args:
+            features: Tensor of shape [B, T, D] from encoder or projector
+            beam_size: Beam size for the search
+            feature_source: Whether to use "encoder" or "projector" CTC head
+            
+        Returns:
+            List of decoded sequences as strings (if phonetic vocab) or token indices
+        """
+        # Skip if CTC not available
+        if feature_source == "encoder" and self.ctc_head_encoder is None:
+            logger.warning("Requested encoder CTC beam decoding but encoder CTC head is not available")
+            return None
+        elif feature_source == "projector" and self.ctc_head_projector is None:
+            logger.warning("Requested projector CTC beam decoding but projector CTC head is not available")
+            return None
+            
+        # Get logits from appropriate CTC head
+        with torch.no_grad():
+            if feature_source == "encoder":
+                features_matched = features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
+                logits = self.ctc_head_encoder(features_matched)
+            else:
+                features_matched = features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
+                logits = self.ctc_head_projector(features_matched)
+            
+            # Apply log softmax
+            log_probs = F.log_softmax(logits, dim=-1)  # [B, T, V]
+        
+        # Simple beam search implementation
+        batch_size = log_probs.size(0)
+        vocab_size = log_probs.size(2)
+        blank_idx = self.cfg.ctc_blank_idx
+        
+        decoded_seqs = []
+        
+        for b in range(batch_size):
+            # Initialize with empty sequence and score 0
+            beams = [{'sequence': [], 'score': 0.0, 'last_token': -1}]
+            
+            # Process each timestep
+            for t in range(log_probs.size(1)):
+                new_beams = []
+                
+                # For each existing beam
+                for beam in beams:
+                    # Get log probabilities for this timestep
+                    t_log_probs = log_probs[b, t]
+                    
+                    # Try extending with each token
+                    for v in range(vocab_size):
+                        # Skip if same as last token or blank
+                        if v == beam['last_token'] or v == blank_idx:
+                            continue
+                        
+                        # Create new beam with this token
+                        new_sequence = beam['sequence'] + [v]
+                        new_score = beam['score'] + t_log_probs[v].item()
+                        new_beams.append({
+                            'sequence': new_sequence,
+                            'score': new_score,
+                            'last_token': v
+                        })
+                    
+                    # Try the blank token as well (keeps sequence unchanged)
+                    new_beams.append({
+                        'sequence': beam['sequence'],
+                        'score': beam['score'] + t_log_probs[blank_idx].item(),
+                        'last_token': beam['last_token']
+                    })
+                
+                # Sort by score and keep top-k
+                beams = sorted(new_beams, key=lambda x: x['score'], reverse=True)[:beam_size]
+            
+            # Get best beam
+            best_beam = beams[0]['sequence']
+            
+            # Convert to string if using phonetic vocabulary
+            if hasattr(self, 'idx_to_phonetic'):
+                decoded_str = ''.join([self.idx_to_phonetic.get(idx, '?') for idx in best_beam])
+                decoded_seqs.append(decoded_str)
+            else:
+                # Return indices
+                decoded_seqs.append(best_beam)
+        
+        return decoded_seqs
+
+    def print_outputs(self, tokenizer, result):
+        """
+        Print both CTC and LLM outputs in a readable format
+        
+        Args:
+            tokenizer: The tokenizer to decode LLM outputs
+            result: The result from generate() containing both outputs
+        """
+        if isinstance(result, dict) and 'llm_output' in result and 'ctc_output' in result:
+            # Print CTC output
+            print("\n===== CTC Output =====")
+            for i, ctc_seq in enumerate(result['ctc_output']):
+                print(f"Sample {i+1}: {ctc_seq}")
+            
+            # Print LLM output
+            print("\n===== LLM Output =====")
+            for i in range(result['llm_output'].size(0)):
+                decoded = tokenizer.decode(result['llm_output'][i], skip_special_tokens=True)
+                print(f"Sample {i+1}: {decoded}")
+        else:
+            # Handle case where only LLM output is available
+            print("\n===== LLM Output Only =====")
+            if hasattr(result, 'size'):  # Tensor output
+                for i in range(result.size(0)):
+                    decoded = tokenizer.decode(result[i], skip_special_tokens=True)
+                    print(f"Sample {i+1}: {decoded}")
+            else:
+                print("No recognizable output format")
