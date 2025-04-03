@@ -74,6 +74,9 @@ class decoder_only_language_modeling_loss(FairseqCriterion):
             try:
                 n_err = 0
                 n_total = 0
+                n_char_err = 0  # Add counter for character errors
+                n_char_total = 0  # Add counter for total characters
+                
                 with torch.no_grad():
                     refs = model.tokenizer.batch_decode(sample['target'],
                                                       skip_special_tokens=True, 
@@ -84,14 +87,24 @@ class decoder_only_language_modeling_loss(FairseqCriterion):
                                                         clean_up_tokenization_spaces=False)
                     
                 for hypo, ref in zip(hypos, refs):
-                    hypo, ref = hypo.strip().split(), ref.strip().split()
-                    n_err += editdistance.eval(hypo, ref)
-                    n_total += len(ref)
+                    # Calculate WER
+                    hypo_words, ref_words = hypo.strip().split(), ref.strip().split()
+                    n_err += editdistance.eval(hypo_words, ref_words)
+                    n_total += len(ref_words)
+                    
+                    # Calculate CER
+                    hypo_chars = "".join(hypo.strip().split())
+                    ref_chars = "".join(ref.strip().split())
+                    n_char_err += editdistance.eval(hypo_chars, ref_chars)
+                    n_char_total += len(ref_chars)
                 
+                # Store all metrics in logging output
                 logging_output["n_err"] = n_err
                 logging_output["n_total"] = n_total
+                logging_output["n_char_err"] = n_char_err
+                logging_output["n_char_total"] = n_char_total
             except Exception as e:
-                print(f"Warning: WER calculation failed with error: {e}")
+                print(f"Warning: WER/CER calculation failed with error: {e}")
         
         return loss, sample_size, logging_output
 
@@ -267,9 +280,13 @@ class decoder_only_language_modeling_loss(FairseqCriterion):
                 else float("nan"),
             )
 
-        # Handle WER metrics if available (Llama 3)
+        # Handle WER metrics if available
         n_err = sum(log.get("n_err", 0) for log in logging_outputs)
         n_total = sum(log.get("n_total", 0) for log in logging_outputs)
+        
+        # Handle CER metrics if available
+        n_char_err = sum(log.get("n_char_err", 0) for log in logging_outputs)
+        n_char_total = sum(log.get("n_char_total", 0) for log in logging_outputs)
         
         if n_total > 0:
             metrics.log_scalar("_n_err", n_err)
@@ -280,6 +297,18 @@ class decoder_only_language_modeling_loss(FairseqCriterion):
                     meters["_n_err"].sum * 100.0 / meters["_n_total"].sum, 3
                 )
                 if meters["_n_total"].sum > 0
+                else float("nan"),
+            )
+            
+        if n_char_total > 0:
+            metrics.log_scalar("_n_char_err", n_char_err)
+            metrics.log_scalar("_n_char_total", n_char_total)
+            metrics.log_derived(
+                "cer",
+                lambda meters: safe_round(
+                    meters["_n_char_err"].sum * 100.0 / meters["_n_char_total"].sum, 3
+                )
+                if meters["_n_char_total"].sum > 0
                 else float("nan"),
             )
 

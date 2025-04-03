@@ -29,7 +29,7 @@ DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data     # path to test datas
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2/auto/lrs2/lrs2_video_seg24s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
 
-MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Llama2_proj_linear_with_ctc/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
+MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/llama2_lrs3_linear_ctc_projector_new/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
 #MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt
 #MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
 #MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt

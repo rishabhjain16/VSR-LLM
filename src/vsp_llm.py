@@ -1,7 +1,7 @@
+#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
 #
-# This source code is licensed under the license found in the
+# This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
 import sys, logging
@@ -46,7 +46,8 @@ MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(
 @dataclass
 class VSPLLMConfig(FairseqDataclass):
     w2v_path: str = field(
-        default=MISSING, metadata={"help": "path to hubert model"}
+        default=os.path.join("checkpoints", "large_vox_iter5.pt"), 
+        metadata={"help": "path to hubert model"}
     )
     llm_ckpt_path: str = field(
         default=MISSING, metadata={"help": "path to llama model"}
@@ -205,6 +206,10 @@ class VSPLLMConfig(FairseqDataclass):
         default=0.3,
         metadata={"help": "Weight for CTC loss (0.3 means 30% CTC, 70% LM)"}
     )
+    ctc_weight_decode: float = field(
+        default=0.3,
+        metadata={"help": "Weight for CTC during inference (0.3 means 30% CTC, 70% LM)"}
+    )
     ctc_blank_idx: Optional[int] = field(
         default=0, 
         metadata={"help": "Index to use for blank token in CTC (if 0 or empty, will use last token in vocabulary)"}
@@ -348,8 +353,30 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         }
 
         if cfg.w2v_args is None:
+            # Try to create a flexible path that works across different environments
+            w2v_paths_to_try = [
+                cfg.w2v_path,  # Original path (could be absolute or relative)
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), cfg.w2v_path),  # Try relative to project root
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints", "large_vox_iter5.pt"),  # Try in project checkpoints dir
+                os.path.abspath(cfg.w2v_path)  # Try absolute path
+            ]
+            
+            # Try each path in order
+            w2v_path = None
+            for path in w2v_paths_to_try:
+                if os.path.exists(path):
+                    w2v_path = path
+                    logger.info(f"Found AV-HuBERT model at: {w2v_path}")
+                    break
+            
+            if w2v_path is None:
+                raise FileNotFoundError(
+                    f"Could not find AV-HuBERT model. Tried the following paths: {w2v_paths_to_try}. "
+                    f"Please ensure the model file exists or specify the correct path."
+                )
+                
             state = checkpoint_utils.load_checkpoint_to_cpu(
-                cfg.w2v_path, arg_overrides
+                w2v_path, arg_overrides
             )
             w2v_args = state.get("cfg", None)
             if w2v_args is None:
@@ -1048,10 +1075,15 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
     @classmethod
     def build_model(cls, cfg, task):
         """Build a new model instance."""
-        model = super().build_model(cfg, task)
+        # Use the parent class to create the base model
+        base_model = super().build_model(cfg, task)
         
-        # Replace with our CTC-enabled version
-        return VSP_LLM_With_CTC(model.encoder, model.decoder, cfg)
+        # Add CTC weight decode param if not present
+        if not hasattr(cfg, 'ctc_weight_decode'):
+            cfg.ctc_weight_decode = getattr(cfg, 'ctc_weight', 0.3)
+        
+        # Create our CTC-enabled version
+        return cls(base_model.encoder, base_model.decoder, cfg)
     
     def forward(self, **kwargs):
         # Increment batch counter for logging

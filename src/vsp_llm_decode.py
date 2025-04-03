@@ -230,10 +230,26 @@ def _main(cfg, output_file):
         # Remove trailing '#' and '!'
         return text.rstrip('#').rstrip('!').strip()
     
+    # Add function to calculate character error rate
+    def calculate_cer(hypo_str, ref_str):
+        """Calculate character error rate between hypothesis and reference."""
+        # Convert to string if they're not already
+        hypo_chars = "".join(hypo_str.strip().split())
+        ref_chars = "".join(ref_str.strip().split())
+        
+        # Calculate edit distance at character level
+        edit_distance = editdistance.eval(hypo_chars, ref_chars)
+        
+        # Avoid division by zero
+        if len(ref_chars) == 0:
+            return 1.0
+        
+        return edit_distance / len(ref_chars)
+    
     num_sentences = 0
     has_target = True
     wps_meter = TimeMeter()
-    result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'instruction': []}
+    result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'instruction': [], 'wer': [], 'cer': []}
     model = models[0]
     for sample in progress:
         sample = utils.move_to_cuda(sample) if use_cuda else sample
@@ -302,7 +318,18 @@ def _main(cfg, output_file):
             instruction = tokenizer.decode(sample['net_input']['source']['text'][i].int().cpu(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
             result_dict['instruction'].append(instruction)
             result_dict['hypo'].append(hypo_str)
-            logger.info(f"\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}\n")
+            
+            # Calculate per-sample WER and CER
+            hypo_words, ref_words = hypo_str.strip().split(), ref_sent.strip().split()
+            sample_wer = 100 * editdistance.eval(hypo_words, ref_words) / len(ref_words) if len(ref_words) > 0 else 0
+            sample_cer = 100 * calculate_cer(hypo_str, ref_sent)
+            
+            # Store metrics in result dictionary
+            result_dict['wer'].append(sample_wer)
+            result_dict['cer'].append(sample_cer)
+            
+            # Log with metrics included
+            logger.info(f"\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}\nWER:{sample_wer:.2f}%\nCER:{sample_cer:.2f}%\n")
 
     yaml_str = OmegaConf.to_yaml(cfg.generation)
     fid = int(hashlib.md5(yaml_str.encode("utf-8")).hexdigest(), 16)
@@ -311,18 +338,36 @@ def _main(cfg, output_file):
     json.dump(result_dict, open(result_fn, 'w'), indent=4)
     if not cfg.override.eval_bleu:
         n_err, n_total = 0, 0
+        n_char_err, n_char_total = 0, 0
         assert len(result_dict['hypo']) == len(result_dict['ref'])
         for hypo, ref in zip(result_dict['hypo'], result_dict['ref']):
-            hypo, ref = hypo.strip().split(), ref.strip().split()
-            n_err += editdistance.eval(hypo, ref)
-            n_total += len(ref)
-        wer = 100 * n_err / n_total
+            # Calculate WER
+            hypo_words, ref_words = hypo.strip().split(), ref.strip().split()
+            n_err += editdistance.eval(hypo_words, ref_words)
+            n_total += len(ref_words)
+            
+            # Calculate CER
+            hypo_chars = "".join(hypo.strip().split())
+            ref_chars = "".join(ref.strip().split())
+            n_char_err += editdistance.eval(hypo_chars, ref_chars)
+            n_char_total += len(ref_chars)
+            
+        # Calculate overall WER and CER
+        wer = 100 * n_err / n_total if n_total > 0 else 0
+        cer = 100 * n_char_err / n_char_total if n_char_total > 0 else 0
+        
+        # Write results to file
         wer_fn = f"{cfg.common_eval.results_path}/wer.{fid}"
         with open(wer_fn, "w") as fo:
-            fo.write(f"WER: {wer}\n")
-            fo.write(f"err / num_ref_words = {n_err} / {n_total}\n\n")
+            fo.write(f"WER: {wer:.2f}%\n")
+            fo.write(f"CER: {cer:.2f}%\n")
+            fo.write(f"WER err / num_ref_words = {n_err} / {n_total}\n")
+            fo.write(f"CER err / num_ref_chars = {n_char_err} / {n_char_total}\n\n")
             fo.write(f"{yaml_str}")
-        logger.info(f"WER: {wer}%")
+            
+        # Log overall metrics
+        logger.info(f"WER: {wer:.2f}%")
+        logger.info(f"CER: {cer:.2f}%")
         logger.info("Tokenizer name: %s", getattr(tokenizer, "name_or_path", "Unknown"))
     else:
         bleu = sacrebleu.corpus_bleu(result_dict['hypo'], [result_dict['ref']])
