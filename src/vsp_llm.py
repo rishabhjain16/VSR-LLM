@@ -603,6 +603,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
                 ctc_logits = self.ctc_head_encoder(ctc_features_matched)
                 
+                # Initialize input_lengths to None to avoid UnboundLocalError
+                input_lengths = None
+                
                 # For encoder output, be careful with input lengths
                 if hasattr(self, 'encoder_outputs_per_layer'):
                     # Use encoder-specific information if available
@@ -770,6 +773,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 ctc_beam_size=10,
                 ctc_weight_decode=0.3,  # Set default weight for hybrid decoding
                 return_ctc_outputs=True,  # Added to return CTC outputs
+                return_both_outputs=False,  # Return both LLM-only and hybrid outputs
                 **kwargs,
                 ):
         output = self.encoder(**kwargs)
@@ -953,14 +957,24 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             max_new_tokens=128,
             min_length=min_length,
             repetition_penalty=repetition_penalty,
-            do_sample=True,
+            do_sample=False,  # Changed to False to get deterministic outputs
             length_penalty=length_penalty,
             output_scores=True,
             return_dict_in_generate=True,
+            num_return_sequences=num_beams,  # Important: return multiple sequences
         )
         
         # Store the original sequences for returning with CTC output
         original_sequences = outputs.sequences
+        
+        # Log the shape of output sequences to debug beam search
+        logger.info(f"LLM output sequences shape: {original_sequences.shape}")
+        if hasattr(outputs, 'sequences_scores'):
+            logger.info(f"LLM sequences_scores shape: {outputs.sequences_scores.shape}")
+            logger.info(f"LLM sequences_scores: {outputs.sequences_scores}")
+        
+        # Store pure LLM output for comparison
+        llm_only_output = original_sequences
         
         # Check if reranking with CTC is needed
         if use_ctc_decoding and hasattr(self, '_ctc_features_for_reranking') and ctc_weight_decode is not None and ctc_weight_decode > 0:
@@ -968,25 +982,55 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             sequences = outputs.sequences
             
             # Convert sequences to list of token lists for each batch item
-            batch_size = sequences.size(0)
+            batch_size = kwargs['source']['video'].size(0)  # Get actual batch size from input
+            num_return_sequences = sequences.size(0) // batch_size if batch_size > 0 else 1
+            
+            logger.info(f"Actual batch size: {batch_size}, num_return_sequences: {num_return_sequences}")
+            
             sequence_lists = [[] for _ in range(batch_size)]
             
             # Group by batch
             for i in range(sequences.size(0)):
-                # Skip instruction token IDs which are the same for all beams
-                seq = sequences[i, instruction.size(1):]
-                sequence_lists[i % batch_size].append(seq)
+                batch_idx = i // num_return_sequences
+                if batch_idx < len(sequence_lists):
+                    # Skip instruction token IDs which are the same for all beams
+                    seq = sequences[i, instruction.size(1):]
+                    sequence_lists[batch_idx].append(seq)
             
             # Calculate LLM scores
             llm_scores = []
             for i in range(batch_size):
-                # Use sequence_scores from beam search
                 if hasattr(outputs, 'sequences_scores'):
-                    beam_scores = outputs.sequences_scores.reshape(batch_size, -1)[i].tolist()
+                    beam_scores = []
+                    for j in range(num_return_sequences):
+                        idx = i * num_return_sequences + j
+                        if idx < len(outputs.sequences_scores):
+                            beam_scores.append(outputs.sequences_scores[idx].item())
                     llm_scores.append(beam_scores)
                 else:
                     # Fallback - equal weights if scores not available
                     llm_scores.append([1.0] * len(sequence_lists[i]))
+            
+            # Log the actual number of beam hypotheses collected
+            for i, seqs in enumerate(sequence_lists):
+                logger.info(f"BATCH {i}: Collected {len(seqs)} beam hypotheses")
+                logger.info(f"BATCH {i}: LLM scores: {llm_scores[i]}")
+            
+            # If we have empty beam lists or not enough beams, exit early
+            if any(len(seqs) == 0 for seqs in sequence_lists) or all(len(seqs) == 1 for seqs in sequence_lists):
+                logger.warning("Not enough beam hypotheses collected for reranking, returning LLM output only")
+                
+                # Return both LLM and CTC outputs if requested
+                if return_ctc_outputs and hasattr(self, '_ctc_decoded_outputs'):
+                    result = {
+                        'llm_output': llm_only_output,
+                        'ctc_output': self._ctc_decoded_outputs,
+                        'hybrid_output': None  # No hybrid reranking performed
+                    }
+                    delattr(self, '_ctc_decoded_outputs')
+                    return result
+                
+                return llm_only_output
             
             # Perform hybrid reranking
             reranked_indices = self.hybrid_reranking(
@@ -1002,12 +1046,51 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             for b in range(batch_size):
                 # Get the top reranked sequence
                 top_idx = reranked_indices[b][0]
-                reranked_sequences.append(sequences[b * len(sequence_lists[b]) + top_idx])
+                original_idx = b * num_return_sequences + top_idx
+                reranked_sequences.append(sequences[original_idx])
+                
+                # For debugging: log the selected sequence after reranking
+                if hasattr(self.decoder, 'tokenizer'):
+                    tokenizer = self.decoder.tokenizer
+                    logger.info(f"BATCH {b}: SELECTED OUTPUT AFTER RERANKING (index {top_idx}):")
+                    decoded = tokenizer.decode(sequences[original_idx], skip_special_tokens=True)
+                    logger.info(f"  {decoded}")
             
             # Return reranked sequences
             if len(reranked_sequences) == 1:
+                # For comparison with the original
+                if hasattr(self.decoder, 'tokenizer') and batch_size == 1:
+                    tokenizer = self.decoder.tokenizer
+                    orig_decoded = tokenizer.decode(sequences[0], skip_special_tokens=True)
+                    new_decoded = tokenizer.decode(reranked_sequences[0], skip_special_tokens=True)
+                    logger.info(f"ORIGINAL TOP: {orig_decoded}")
+                    logger.info(f"RERANKED TOP: {new_decoded}")
+                    logger.info(f"CHANGED: {orig_decoded != new_decoded}")
+                
+                # If requested, return both LLM and hybrid outputs
+                if return_both_outputs:
+                    result = {
+                        'llm_output': llm_only_output,
+                        'hybrid_output': reranked_sequences[0],
+                        'ctc_output': self._ctc_decoded_outputs if hasattr(self, '_ctc_decoded_outputs') else None
+                    }
+                    if hasattr(self, '_ctc_decoded_outputs'):
+                        delattr(self, '_ctc_decoded_outputs')
+                    return result
+                
                 return reranked_sequences[0]
             else:
+                # If requested, return both LLM and hybrid outputs
+                if return_both_outputs:
+                    result = {
+                        'llm_output': llm_only_output,
+                        'hybrid_output': torch.stack(reranked_sequences),
+                        'ctc_output': self._ctc_decoded_outputs if hasattr(self, '_ctc_decoded_outputs') else None
+                    }
+                    if hasattr(self, '_ctc_decoded_outputs'):
+                        delattr(self, '_ctc_decoded_outputs')
+                    return result
+                
                 return torch.stack(reranked_sequences)
             
         # Clear temporary storage
@@ -1019,7 +1102,8 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             # Create a structure to return both
             result = {
                 'llm_output': outputs.sequences,
-                'ctc_output': self._ctc_decoded_outputs
+                'ctc_output': self._ctc_decoded_outputs,
+                'hybrid_output': None  # No hybrid reranking performed
             }
             # Clean up temporary storage
             delattr(self, '_ctc_decoded_outputs')
@@ -1092,6 +1176,8 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             logger.warning("Requested projector CTC scoring but projector CTC head is not available")
             return None
         
+        logger.info(f"Calculating CTC scores using {feature_source} features")
+        
         # Get logits from appropriate CTC head
         with torch.no_grad():
             if feature_source == "encoder":
@@ -1109,54 +1195,74 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         input_lengths = torch.full((batch_size,), log_probs.size(1), device=log_probs.device, dtype=torch.long)
         scores = []
         
+        logger.info(f"CTC log_probs shape: {log_probs.shape}, device: {log_probs.device}")
+        logger.info(f"Number of batch items: {batch_size}, sequences per batch: {[len(s) for s in sequences]}")
+        
         for b in range(batch_size):
             batch_scores = []
             batch_log_probs = log_probs[b].unsqueeze(0)  # [1, T, V]
             
             # Process each sequence
-            for sequence in sequences[b]:
-                # Skip empty sequences
-                if len(sequence) == 0:
-                    batch_scores.append(float('-inf'))
-                    continue
-                
-                # Convert to tensor if needed
-                if not isinstance(sequence, torch.Tensor):
-                    sequence = torch.tensor(sequence, device=log_probs.device, dtype=torch.long)
-                
-                # Reshape for CTC loss
-                sequence = sequence.unsqueeze(0)  # [1, S]
-                target_length = torch.tensor([sequence.size(1)], device=log_probs.device, dtype=torch.long)
-                
-                # If using phonetic vocabulary, map sequence to phonetic indices
-                if not hasattr(sequence, 'already_mapped'):
-                    # Here we need a mapping from LLM tokens to phonetic tokens
-                    # Implement a more sophisticated mapping for real systems
-                    unk_idx = self.phonetic_vocab.get('<unk>', 1)
-                    phonetic_sequence = torch.full_like(sequence, unk_idx)
-                    phonetic_sequence.already_mapped = True
-                    sequence = phonetic_sequence
-                
+            for seq in sequences[b]:
                 try:
-                    # CTC loss (negative = score)
-                    batch_log_probs_float = batch_log_probs.float().transpose(0, 1)  # [T, 1, V]
+                    # Map sequence to phonetic indices for scoring
+                    # This is a simplified approach - ideally we would do proper mapping
+                    phonetic_target = torch.zeros_like(seq)
+                    
+                    # Fill with known indices or defaults
+                    for i, token_id in enumerate(seq):
+                        # Skip padding tokens
+                        if token_id == 0:
+                            continue
+                        
+                        # Try to map to a phonetic token (simplified)
+                        # In a real implementation, this would use a proper mapping
+                        phonetic_target[i] = self.phonetic_vocab.get('<unk>', 1)  # Default to <unk> if not found
+                    
+                    # Calculate target length (non-padding tokens)
+                    target_length = (phonetic_target != 0).sum().item()
+                    
+                    # Skip empty targets
+                    if target_length == 0:
+                        batch_scores.append(0.0)
+                        continue
+                    
+                    # Make sure target length doesn't exceed input length
+                    if target_length > input_lengths[0].item():
+                        logger.warning(f"Target length {target_length} exceeds input length {input_lengths[0].item()}, reducing")
+                        target_length = input_lengths[0].item()
+                    
+                    # Prepare target tensor
+                    target = phonetic_target[:target_length].unsqueeze(0)  # [1, L]
+                    target_lengths = torch.tensor([target_length], device=target.device, dtype=torch.long)
+                    
+                    # CTC forward-backward algorithm to get probability
+                    batch_log_probs_float = batch_log_probs.float()  # Ensure float32 for CTC calculation
                     loss = F.ctc_loss(
-                        batch_log_probs_float,
-                        sequence,
-                        input_lengths[b].unsqueeze(0),
-                        target_length,
+                        batch_log_probs_float.transpose(0, 1),  # [T, 1, V]
+                        target,
+                        input_lengths,
+                        target_lengths,
                         blank=self.cfg.ctc_blank_idx,
-                        reduction="sum",
-                        zero_infinity=True,
+                        reduction='mean',
+                        zero_infinity=True
                     )
-                    # Convert loss to score (negative) and normalize by length
-                    batch_scores.append(-loss.item() / target_length.item())
+                    
+                    # Convert loss to score (negative loss)
+                    score = -loss.item()
+                    
+                    # Debug logging
+                    logger.info(f"CTC score for sequence: {score:.4f}, length: {target_length}")
+                    
+                    batch_scores.append(score)
                 except Exception as e:
-                    logger.warning(f"Error calculating CTC score: {e}")
-                    batch_scores.append(float('-inf'))
+                    logger.error(f"Error calculating CTC score: {e}")
+                    # Default to a very low score
+                    batch_scores.append(-1000.0)
             
             scores.append(batch_scores)
         
+        logger.info(f"Final CTC scores: {scores}")
         return scores
         
     def hybrid_reranking(self, encoder_features, llm_scores, sequences, ctc_weight=0.3, feature_source="projector"):
@@ -1173,16 +1279,23 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         Returns:
             reranked_indices: list of reranked indices for each batch item
         """
+        logger.info(f"HYBRID RERANKING: Using CTC weight {ctc_weight}")
+        
         # Calculate CTC scores
         ctc_scores = self.calculate_ctc_scores(encoder_features, sequences, feature_source)
         
         if ctc_scores is None:
             # Fallback to original rankings if CTC scoring failed
+            logger.warning("HYBRID RERANKING: CTC scoring failed, using original order")
             return list(range(len(llm_scores[0])))
         
         # Combine scores
         reranked_indices = []
         for b in range(len(llm_scores)):
+            # Log original ranking
+            logger.info(f"BATCH {b}: Original LLM scores: {llm_scores[b]}")
+            logger.info(f"BATCH {b}: CTC scores: {ctc_scores[b]}")
+            
             # Normalize scores
             llm_scores_norm = torch.tensor(llm_scores[b])
             llm_scores_norm = (llm_scores_norm - llm_scores_norm.mean()) / (llm_scores_norm.std() + 1e-9)
@@ -1196,6 +1309,12 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             # Get indices of sorted combined scores
             _, indices = torch.sort(combined_scores, descending=True)
             reranked_indices.append(indices.tolist())
+            
+            # Log reranking results
+            logger.info(f"BATCH {b}: Normalized LLM scores: {llm_scores_norm.tolist()}")
+            logger.info(f"BATCH {b}: Normalized CTC scores: {ctc_scores_norm.tolist()}")
+            logger.info(f"BATCH {b}: Combined scores: {combined_scores.tolist()}")
+            logger.info(f"BATCH {b}: Reranked indices: {indices.tolist()}")
         
         return reranked_indices
 
@@ -1552,6 +1671,9 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Calculate CTC loss if enabled and in training mode
         total_loss = lm_loss
         if self._use_ctc_in_forward:
+            # Initialize input_lengths to None to avoid UnboundLocalError
+            input_lengths = None
+            
             # Get CTC features based on the configured source
             if self.cfg.ctc_feature_source == "encoder":
                 # Use raw encoder output for CTC

@@ -49,7 +49,7 @@ PROJECTOR_TYPE="linear"
 # CTC configuration
 USE_CTC="true"  # Set to "true" to enable CTC loss
 CTC_WEIGHT="0.3"  # Weight for CTC loss (0.3 means 30% CTC, 70% LM)
-CTC_FEATURE_SOURCE="projector"  # Source of features for CTC: "encoder" or "projector"
+CTC_FEATURE_SOURCE="encoder"  # Source of features for CTC: "encoder" or "projector"
 MODEL_TYPE="vsp_llm_ctc"  # Use "vsp_llm_ctc" when USE_CTC is true
 
 

@@ -200,7 +200,7 @@ def _main(cfg, output_file):
             model.half()
 
     # Load dataset (possibly sharded)
-    cfg.dataset.batch_size = 4
+    cfg.dataset.batch_size = 1
     cfg.dataset.max_tokens = 2000
     itr = task.get_batch_iterator(
         dataset=task.dataset(cfg.dataset.gen_subset),
@@ -291,23 +291,51 @@ def _main(cfg, output_file):
             use_ctc_decoding=True,  # Explicitly enable CTC decoding
             ctc_weight_decode=0.3,  # Set hybrid decoding weight
             return_ctc_outputs=True,  # Return both CTC and LLM outputs
+            return_both_outputs=True,  # Return both LLM-only and hybrid outputs
             **sample["net_input"]
         )
+        
+        # Log explicitly that hybrid approach is activated
+        logger.info(f"=== HYBRID RERANKING ENABLED: Weight={0.3} Beam={cfg.generation.beam} ===")
+        
         import re
 
-        # If the output contains both LLM and CTC results
-        if isinstance(best_hypo, dict) and 'llm_output' in best_hypo and 'ctc_output' in best_hypo:
-            # Print both outputs using the helper method
-            model.print_outputs(tokenizer, best_hypo)
+        # Process the outputs based on the return type
+        if isinstance(best_hypo, dict):
+            llm_output = best_hypo.get('llm_output', None)
+            hybrid_output = best_hypo.get('hybrid_output', None)
+            ctc_output = best_hypo.get('ctc_output', None)
             
-            # Extract LLM output for further processing
-            llm_hypo = best_hypo['llm_output']
+            # Extract the first hypothesis from each if they're batched
+            if llm_output is not None and not isinstance(llm_output, list) and llm_output.dim() > 1 and llm_output.size(0) > 1:
+                # Take first item from first batch as LLM output
+                llm_hypo = llm_output[0].unsqueeze(0) if llm_output.dim() > 1 else llm_output
+            else:
+                llm_hypo = llm_output
+                
+            if hybrid_output is not None:
+                hybrid_hypo = hybrid_output
+            else:
+                hybrid_hypo = None
+                
+            # Store both in result dict
+            if 'llm_only_output' not in result_dict:
+                result_dict['llm_only_output'] = []
+                result_dict['llm_only_wer'] = []
+                result_dict['llm_only_cer'] = []
+            
+            if 'hybrid_output' not in result_dict:
+                result_dict['hybrid_output'] = []
+                result_dict['hybrid_wer'] = []
+                result_dict['hybrid_cer'] = []
             
             # Store CTC outputs in result dictionary
-            result_dict['ctc_output'] = best_hypo['ctc_output']
+            if ctc_output is not None:
+                result_dict['ctc_output'] = ctc_output
         else:
-            # Fall back to just using LLM output
+            # Fallback to just using LLM output
             llm_hypo = best_hypo
+            hybrid_hypo = None
             
         def clean_hyp_output(hyp_text):     
             hyp_text = re.sub(r"[#]+", "", hyp_text)  # Remove '#' artifacts
@@ -322,26 +350,67 @@ def _main(cfg, output_file):
 
             return ". ".join(cleaned_hyp).strip()
         
-        llm_hypo_decoded = tokenizer.batch_decode(
+        # Decode both outputs
+        llm_hypo_decoded = None
+        if llm_hypo is not None:
+            llm_hypo_decoded = tokenizer.batch_decode(
                 llm_hypo, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
-        #best_hypo = [post_process(hyp) for hyp in best_hypo]
-        #best_hypo = [clean_hyp_output(hyp) for hyp in best_hypo]
-        #best_hypo = [hyp.rstrip('#').rstrip('!') for hyp in best_hypo]
+            
+        hybrid_hypo_decoded = None
+        if hybrid_hypo is not None:
+            hybrid_hypo_decoded = tokenizer.batch_decode(
+                hybrid_hypo, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            
         for i in range(len(sample["id"])):
             result_dict['utt_id'].append(sample['utt_id'][i])
             target = sample['target'][i].masked_fill(
                 sample['target'][i] == -100, 0
             )
             ref_sent = tokenizer.decode(target.int().cpu(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            #ref_sent = ref_sent.rstrip('#').rstrip('!')
-            #ref_sent = post_process(ref_sent)
-            #ref_sent = clean_hyp_output(ref_sent)
             result_dict['ref'].append(ref_sent)
-            hypo_str = llm_hypo_decoded[i]
+            
             instruction = tokenizer.decode(sample['net_input']['source']['text'][i].int().cpu(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
             result_dict['instruction'].append(instruction)
-            result_dict['hypo'].append(hypo_str)
+            
+            # Process LLM-only output if available
+            llm_only_str = ""
+            llm_only_wer = None
+            llm_only_cer = None
+            if llm_hypo_decoded is not None and i < len(llm_hypo_decoded):
+                llm_only_str = llm_hypo_decoded[i]
+                result_dict['llm_only_output'].append(llm_only_str)
+                
+                # Calculate WER and CER for LLM-only
+                llm_words, ref_words = llm_only_str.strip().split(), ref_sent.strip().split()
+                llm_only_wer = 100 * editdistance.eval(llm_words, ref_words) / len(ref_words) if len(ref_words) > 0 else 0
+                llm_only_cer = 100 * calculate_cer(llm_only_str, ref_sent)
+                result_dict['llm_only_wer'].append(llm_only_wer)
+                result_dict['llm_only_cer'].append(llm_only_cer)
+            
+            # Process hybrid output if available
+            hybrid_str = ""
+            hybrid_wer = None
+            hybrid_cer = None
+            if hybrid_hypo_decoded is not None and i < len(hybrid_hypo_decoded):
+                hybrid_str = hybrid_hypo_decoded[i]
+                result_dict['hybrid_output'].append(hybrid_str)
+                result_dict['hypo'].append(hybrid_str)  # For backward compatibility
+                
+                # Calculate WER and CER for hybrid
+                hybrid_words, ref_words = hybrid_str.strip().split(), ref_sent.strip().split()
+                hybrid_wer = 100 * editdistance.eval(hybrid_words, ref_words) / len(ref_words) if len(ref_words) > 0 else 0
+                hybrid_cer = 100 * calculate_cer(hybrid_str, ref_sent)
+                result_dict['hybrid_wer'].append(hybrid_wer)
+                result_dict['hybrid_cer'].append(hybrid_cer)
+                result_dict['wer'].append(hybrid_wer)  # For backward compatibility
+                result_dict['cer'].append(hybrid_cer)  # For backward compatibility
+            elif llm_hypo_decoded is not None:
+                # Fallback to LLM-only output if hybrid not available
+                result_dict['hypo'].append(llm_only_str)
+                result_dict['wer'].append(llm_only_wer)
+                result_dict['cer'].append(llm_only_cer)
             
             # Include CTC output in log if available
             ctc_output_str = ""
@@ -380,17 +449,16 @@ def _main(cfg, output_file):
                 else:
                     result_dict['ctc_cer'][i] = ctc_cer
             
-            # Calculate per-sample WER and CER
-            hypo_words, ref_words = hypo_str.strip().split(), ref_sent.strip().split()
-            sample_wer = 100 * editdistance.eval(hypo_words, ref_words) / len(ref_words) if len(ref_words) > 0 else 0
-            sample_cer = 100 * calculate_cer(hypo_str, ref_sent)
+            # Log everything together for comparison
+            logger.info(f"\nINST:{instruction}\nREF:{ref_sent}")
             
-            # Store metrics in result dictionary
-            result_dict['wer'].append(sample_wer)
-            result_dict['cer'].append(sample_cer)
-            
-            # Log with metrics included
-            logger.info(f"\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}{ctc_output_str}\nWER:{sample_wer:.2f}%\nCER:{sample_cer:.2f}%\n")
+            if llm_only_str:
+                logger.info(f"LLM:{llm_only_str}\nLLM-WER:{llm_only_wer:.2f}%\nLLM-CER:{llm_only_cer:.2f}%")
+                
+            if hybrid_str:
+                logger.info(f"HYBRID:{hybrid_str}\nHYBRID-WER:{hybrid_wer:.2f}%\nHYBRID-CER:{hybrid_cer:.2f}%")
+                
+            logger.info(f"{ctc_output_str}")
 
     yaml_str = OmegaConf.to_yaml(cfg.generation)
     fid = int(hashlib.md5(yaml_str.encode("utf-8")).hexdigest(), 16)
@@ -417,6 +485,50 @@ def _main(cfg, output_file):
         wer = 100 * n_err / n_total if n_total > 0 else 0
         cer = 100 * n_char_err / n_char_total if n_char_total > 0 else 0
         
+        # Calculate overall LLM-only WER and CER if available 
+        llm_wer, llm_cer = None, None
+        llm_n_err, llm_n_total = 0, 0
+        llm_n_char_err, llm_n_char_total = 0, 0
+        
+        if 'llm_only_output' in result_dict and len(result_dict['llm_only_output']) > 0:
+            for i, (llm_output, ref) in enumerate(zip(result_dict['llm_only_output'], result_dict['ref'])):
+                # Calculate WER
+                llm_words, ref_words = llm_output.strip().split(), ref.strip().split()
+                llm_n_err += editdistance.eval(llm_words, ref_words)
+                llm_n_total += len(ref_words)
+                
+                # Calculate CER
+                llm_chars = "".join(llm_output.strip().split())
+                ref_chars = "".join(ref.strip().split())
+                llm_n_char_err += editdistance.eval(llm_chars, ref_chars)
+                llm_n_char_total += len(ref_chars)
+            
+            # Calculate overall metrics
+            llm_wer = 100 * llm_n_err / llm_n_total if llm_n_total > 0 else 0
+            llm_cer = 100 * llm_n_char_err / llm_n_char_total if llm_n_char_total > 0 else 0
+        
+        # Calculate overall Hybrid WER and CER if available
+        hybrid_wer, hybrid_cer = None, None
+        hybrid_n_err, hybrid_n_total = 0, 0
+        hybrid_n_char_err, hybrid_n_char_total = 0, 0
+        
+        if 'hybrid_output' in result_dict and len(result_dict['hybrid_output']) > 0:
+            for i, (hybrid_output, ref) in enumerate(zip(result_dict['hybrid_output'], result_dict['ref'])):
+                # Calculate WER
+                hybrid_words, ref_words = hybrid_output.strip().split(), ref.strip().split()
+                hybrid_n_err += editdistance.eval(hybrid_words, ref_words)
+                hybrid_n_total += len(ref_words)
+                
+                # Calculate CER
+                hybrid_chars = "".join(hybrid_output.strip().split())
+                ref_chars = "".join(ref.strip().split())
+                hybrid_n_char_err += editdistance.eval(hybrid_chars, ref_chars)
+                hybrid_n_char_total += len(ref_chars)
+            
+            # Calculate overall metrics
+            hybrid_wer = 100 * hybrid_n_err / hybrid_n_total if hybrid_n_total > 0 else 0
+            hybrid_cer = 100 * hybrid_n_char_err / hybrid_n_char_total if hybrid_n_char_total > 0 else 0
+        
         # Calculate overall CTC WER and CER if available
         ctc_wer, ctc_cer = None, None
         ctc_n_err, ctc_n_total = 0, 0
@@ -442,6 +554,26 @@ def _main(cfg, output_file):
         # Write results to file
         wer_fn = f"{cfg.common_eval.results_path}/wer.{fid}"
         with open(wer_fn, "w") as fo:
+            # If hybrid metrics are available, use them as the primary metrics
+            if hybrid_wer is not None:
+                fo.write(f"HYBRID-WER: {hybrid_wer:.2f}%\n")
+                fo.write(f"HYBRID-CER: {hybrid_cer:.2f}%\n")
+                fo.write(f"HYBRID-WER err / num_ref_words = {hybrid_n_err} / {hybrid_n_total}\n")
+                fo.write(f"HYBRID-CER err / num_ref_chars = {hybrid_n_char_err} / {hybrid_n_char_total}\n\n")
+            
+            # Always include the LLM-only metrics for comparison
+            if llm_wer is not None:
+                fo.write(f"LLM-WER: {llm_wer:.2f}%\n")
+                fo.write(f"LLM-CER: {llm_cer:.2f}%\n")
+                fo.write(f"LLM-WER err / num_ref_words = {llm_n_err} / {llm_n_total}\n")
+                fo.write(f"LLM-CER err / num_ref_chars = {llm_n_char_err} / {llm_n_char_total}\n\n")
+                
+                # If we have both, show the difference
+                if hybrid_wer is not None:
+                    fo.write(f"WER DIFF (HYBRID - LLM): {hybrid_wer - llm_wer:.2f}%\n")
+                    fo.write(f"CER DIFF (HYBRID - LLM): {hybrid_cer - llm_cer:.2f}%\n\n")
+            
+            # Include legacy format for backward compatibility
             fo.write(f"WER: {wer:.2f}%\n")
             fo.write(f"CER: {cer:.2f}%\n")
             fo.write(f"WER err / num_ref_words = {n_err} / {n_total}\n")
@@ -457,6 +589,14 @@ def _main(cfg, output_file):
             fo.write(f"{yaml_str}")
             
         # Log overall metrics
+        if hybrid_wer is not None:
+            logger.info(f"HYBRID-WER: {hybrid_wer:.2f}%")
+            logger.info(f"HYBRID-CER: {hybrid_cer:.2f}%")
+            
+        if llm_wer is not None:
+            logger.info(f"LLM-WER: {llm_wer:.2f}%")
+            logger.info(f"LLM-CER: {llm_cer:.2f}%")
+            
         logger.info(f"WER: {wer:.2f}%")
         logger.info(f"CER: {cer:.2f}%")
         
