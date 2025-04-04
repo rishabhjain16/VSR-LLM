@@ -318,15 +318,19 @@ def _main(cfg, output_file):
             else:
                 hybrid_hypo = None
                 
-            # Store both in result dict
+            # Ensure these keys exist in result_dict
             if 'llm_only_output' not in result_dict:
                 result_dict['llm_only_output'] = []
+            if 'llm_only_wer' not in result_dict:
                 result_dict['llm_only_wer'] = []
+            if 'llm_only_cer' not in result_dict:
                 result_dict['llm_only_cer'] = []
             
             if 'hybrid_output' not in result_dict:
                 result_dict['hybrid_output'] = []
+            if 'hybrid_wer' not in result_dict:
                 result_dict['hybrid_wer'] = []
+            if 'hybrid_cer' not in result_dict:
                 result_dict['hybrid_cer'] = []
             
             # Store CTC outputs in result dictionary
@@ -337,6 +341,14 @@ def _main(cfg, output_file):
             llm_hypo = best_hypo
             hybrid_hypo = None
             
+            # Ensure these keys exist in result_dict even in fallback case
+            if 'llm_only_output' not in result_dict:
+                result_dict['llm_only_output'] = []
+            if 'llm_only_wer' not in result_dict:
+                result_dict['llm_only_wer'] = []
+            if 'llm_only_cer' not in result_dict:
+                result_dict['llm_only_cer'] = []
+        
         def clean_hyp_output(hyp_text):     
             hyp_text = re.sub(r"[#]+", "", hyp_text)  # Remove '#' artifacts
             sentences = hyp_text.split(". ")  # Split by sentence

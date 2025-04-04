@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/test_vsp_llm2   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/test_vsp_llm3   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src

@@ -763,93 +763,71 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
     @torch.no_grad()
     def generate(self,
-                num_beams=20,
-                max_length=30,
-                min_length=1,
+                target_list=None,
+                num_beams=1,
                 top_p=0.9,
+                min_length=1,
+                length_penalty=1.0,
                 repetition_penalty=1.0,
-                length_penalty=0.0,
-                use_ctc_decoding=True,  # Changed default to True
-                ctc_beam_size=10,
-                ctc_weight_decode=0.3,  # Set default weight for hybrid decoding
-                return_ctc_outputs=True,  # Added to return CTC outputs
-                return_both_outputs=False,  # Return both LLM-only and hybrid outputs
-                **kwargs,
-                ):
+                return_attn_mask=False,
+                pad_token_id=None,
+                eos_token_id=None,
+                attention_mask=None,
+                use_ctc_decoding=False,
+                ctc_weight_decode=0.3,
+                return_ctc_outputs=False,
+                return_both_outputs=False,
+                **kwargs):
+        """Generate text using the LLM model with optional CTC decoding.
+        
+        Args:
+            target_list: Target sequence for cross attention
+            num_beams: Number of beams for beam search
+            top_p: Nucleus sampling probability
+            min_length: Minimum generation length
+            length_penalty: Length penalty for beam search
+            repetition_penalty: Repetition penalty for generation
+            return_attn_mask: Whether to return attention mask
+            pad_token_id: Padding token ID
+            eos_token_id: End of sequence token ID
+            attention_mask: Attention mask
+            use_ctc_decoding: Whether to use CTC decoding
+            return_ctc_outputs: Whether to return CTC outputs alongside LLM outputs
+            **kwargs: Additional arguments for encoder
+            
+        Returns:
+            LLM outputs or dictionary of LLM and CTC outputs
+        """
+        # First get encoder output
         output = self.encoder(**kwargs)
         
-        # Check if the projector supports text conditioning for alignment loss
-        is_text_aware = any(qp in self.cfg.projector_type.lower() for qp in [
-            "qformer", "blip2_qformer", "comprehensive_qformer", 
-            "visual_speech_qformer", "visual_speech_text_qformer"
-        ])
+        # Get the original size before applying projector
+        orig_seq_len = output['encoder_out'].size(1)
         
-        # For all projectors, try to use text information if available
-        if is_text_aware:
-            # Get text tokens from kwargs (only instruction tokens are available during inference)
-            text_tokens = kwargs['source']['text']
-            
-            # Add debug info about text tokens
-            logger.info(f"Generate - Text tokens shape: {text_tokens.shape}, non-zero tokens: {(text_tokens != 0).sum().item()}")
-            
-            # Create attention mask (1 for real tokens, 0 for padding)
-            text_mask = (text_tokens != 0)
-            logger.info(f"Using instruction tokens in generate() mode (transcript tokens not available during inference)")
-            
-            # Get embeddings for the tokens
-            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
-                text_embeddings = self.decoder.model.model.embed_tokens(text_tokens)
-            elif hasattr(self.decoder, 'model'):
-                text_embeddings = self.decoder.model.embed_tokens(text_tokens)
+        # Continue with normal forward pass
+        B, T, D = output['encoder_out'].size()
+        
+        # Apply projector
+        # For qformer-based projectors, we need to run forward with the right signature
+        if self.cfg.projector_type.lower() not in ['linear', 'mlp']:
+            # Query-based projector (need special handling)
+            if hasattr(self.avfeat_to_llm, 'get_tokens'):
+                num_query_tokens = self.avfeat_to_llm.num_queries
+                output['encoder_out'] = self.avfeat_to_llm.get_tokens(output['encoder_out'])
             else:
-                text_embeddings = self.decoder.embed_tokens(text_tokens)
-            
-            # Match dtype with encoder output for compatibility
-            text_embeddings_matched = text_embeddings.to(dtype=output['encoder_out'].dtype)
-            
-            # Check projector's forward method signature to determine which parameters to pass
-            forward_params = inspect.signature(self.avfeat_to_llm.forward).parameters
-            
-            # Base parameters that all projectors accept
-            projector_args = {
-                "x": output['encoder_out']
-            }
-            
-            # Add text_tokens parameter if it exists in the signature
-            if "text_tokens" in forward_params:
-                projector_args["text_tokens"] = text_embeddings_matched
-                
-            # Add text_mask parameter if it exists in the signature
-            if "text_mask" in forward_params:
-                projector_args["text_mask"] = text_mask
-                
-            # For QFormer-specific implementations that use text_embeddings instead of text_tokens
-            if "text_embeddings" in forward_params and "text_tokens" not in forward_params:
-                projector_args["text_embeddings"] = text_embeddings_matched
-                
-            # Pass the appropriate parameters to the projector
-            output['encoder_out'] = self.avfeat_to_llm(**projector_args)
+                # For other query-based projectors like QFormer, call directly
+                output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
         else:
-            # For non-text-aware projectors, just pass the video features
+            # For linear/MLP projectors, just apply directly
             output['encoder_out'] = self.avfeat_to_llm(output['encoder_out'])
+        
+        # Get if we're using a query-based projector that returns fixed number of tokens
+        is_query_based = self.cfg.projector_type.lower() not in ['linear', 'mlp']
             
         # Handle different projector types
-        proj_seq_len = output['encoder_out'].size(1)
-        orig_seq_len = kwargs['source']['video'].size(1)  # Original sequence length
-        
-        # First check projector type name (more reliable)
-        is_query_based = any(qp in self.cfg.projector_type.lower() for qp in [
-            "qformer", "visual_speech_qformer", "cross_attention",
-            "blip2_qformer", "comprehensive_qformer",
-            "visual_speech_text_qformer", "multiscale_contrastive"
-        ])
-        
-        # Fallback to sequence length check if needed
-        if not is_query_based:
-            is_query_based = proj_seq_len != orig_seq_len
-        
         if is_query_based:
-            # For query-based projectors, use the output directly
+            # For query-based projectors that return fixed number of tokens
+            # We skip the cluster-based aggregation as these projectors already aggregate
             reduced_enc_out = output['encoder_out']
         else:
             # For projectors that maintain sequence length, use cluster-based aggregation
@@ -868,67 +846,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 start_idx = end_idx
     
             # Verify we processed the entire sequence
-            assert(cluster_counts.sum().item() == proj_seq_len)
+            assert(cluster_counts.sum().item() == output['encoder_out'].size(1))
             reduced_enc_out = torch.cat(results_tensor, dim=1)
-            # Only log the shape once
-            if not self.logged_projector_shape:
-                logger.info(f"Using mean cluster aggregation with output shape: {reduced_enc_out.size()}")
-                self.logged_projector_shape = True
-        
-        # Option to use CTC decoding
-        if use_ctc_decoding and hasattr(self, 'ctc_vocab_size'):
-            # Get CTC logits based on configured CTC head
-            if self.cfg.ctc_feature_source == "encoder" and self.ctc_head_encoder is not None:
-                ctc_features = output['encoder_out'].clone()
-                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
-                ctc_logits = self.ctc_head_encoder(ctc_features_matched)
-            elif self.ctc_head_projector is not None:
-                ctc_features = reduced_enc_out.clone()
-                ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
-                ctc_logits = self.ctc_head_projector(ctc_features_matched)
-            else:
-                # Fall back to normal generation if CTC head is not available
-                logger.warning("CTC decoding requested but appropriate CTC head is not available")
-                use_ctc_decoding = False
             
-            if use_ctc_decoding:
-                # Apply log softmax to CTC logits
-                log_probs = F.log_softmax(ctc_logits, dim=-1)  # [B, T, V]
-                
-                # Simplified greedy decoding (we could implement beam search in a more sophisticated system)
-                # This just demonstrates the basic approach
-                best_paths = torch.argmax(log_probs, dim=-1)  # [B, T]
-                
-                # Remove repeated tokens and blanks (basic CTC decoding)
-                decoded_seqs = []
-                for seq in best_paths:
-                    decoded = []
-                    prev = -1  # Different from all valid indices
-                    for token_idx in seq:
-                        token = token_idx.item()
-                        if token != prev and token != self.cfg.ctc_blank_idx:
-                            decoded.append(token)
-                        prev = token
-                    
-                    # Convert to tensor
-                    decoded_tensor = torch.tensor(decoded, device=best_paths.device)
-                    decoded_seqs.append(decoded_tensor)
-                
-                # If we're using a phonetic vocabulary, convert to a readable format
-                if hasattr(self, 'idx_to_phonetic'):
-                    readable_seqs = []
-                    for seq in decoded_seqs:
-                        readable = ''.join([self.idx_to_phonetic.get(idx.item(), '?') for idx in seq])
-                        readable_seqs.append(readable)
-                    
-                    # Store for return
-                    self._ctc_decoded_outputs = readable_seqs
-                    logger.info(f"CTC decoded sequences: {readable_seqs}")
-                
-                # Store CTC feature for later use in reranking
-                self._ctc_features_for_reranking = reduced_enc_out if self.cfg.ctc_feature_source == "projector" else output['encoder_out']
-        
-        B, T, D = reduced_enc_out.size()
         instruction = kwargs['source']['text']
         
         # Get instruction embedding with model structure awareness
@@ -961,155 +881,122 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             length_penalty=length_penalty,
             output_scores=True,
             return_dict_in_generate=True,
-            num_return_sequences=num_beams,  # Important: return multiple sequences
+            num_return_sequences=1,  # Simplified to just return 1 sequence
         )
         
-        # Store the original sequences for returning with CTC output
-        original_sequences = outputs.sequences
+        # Store the original sequences for returning
+        llm_output = outputs.sequences
         
-        # Log the shape of output sequences to debug beam search
-        logger.info(f"LLM output sequences shape: {original_sequences.shape}")
-        if hasattr(outputs, 'sequences_scores'):
-            logger.info(f"LLM sequences_scores shape: {outputs.sequences_scores.shape}")
-            logger.info(f"LLM sequences_scores: {outputs.sequences_scores}")
+        # If CTC decoding is not requested, return just the LLM output
+        if not use_ctc_decoding or not hasattr(self, 'ctc_vocab_size'):
+            return llm_output
         
-        # Store pure LLM output for comparison
-        llm_only_output = original_sequences
-        
-        # Check if reranking with CTC is needed
-        if use_ctc_decoding and hasattr(self, '_ctc_features_for_reranking') and ctc_weight_decode is not None and ctc_weight_decode > 0:
-            # Get sequences from outputs
-            sequences = outputs.sequences
+        # Option to use CTC decoding
+        ctc_decoded_outputs = None
+        if self.cfg.ctc_feature_source == "encoder" and self.ctc_head_encoder is not None:
+            # Process encoder output with CTC head
+            ctc_features = output['encoder_out'].clone()
             
-            # Convert sequences to list of token lists for each batch item
-            batch_size = kwargs['source']['video'].size(0)  # Get actual batch size from input
-            num_return_sequences = sequences.size(0) // batch_size if batch_size > 0 else 1
+            # Check if there's a dimension mismatch in CTC head
+            expected_dim = next(self.ctc_head_encoder.parameters()).shape[1]
+            actual_dim = ctc_features.shape[-1]
             
-            logger.info(f"Actual batch size: {batch_size}, num_return_sequences: {num_return_sequences}")
+            if actual_dim != expected_dim:
+                logger.warning(f"CTC dimension mismatch: model expects {expected_dim}, got {actual_dim}")
+                logger.warning("This suggests the model was trained with different dimensions than being used for inference.")
+                logger.warning("Please ensure the same model configuration is used for both training and inference.")
+                logger.warning("CTC decoding will be skipped due to dimension mismatch.")
+                
+                # Just return LLM output if dimensions don't match
+                return llm_output
             
-            sequence_lists = [[] for _ in range(batch_size)]
+            ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
+            ctc_logits = self.ctc_head_encoder(ctc_features_matched)
             
-            # Group by batch
-            for i in range(sequences.size(0)):
-                batch_idx = i // num_return_sequences
-                if batch_idx < len(sequence_lists):
-                    # Skip instruction token IDs which are the same for all beams
-                    seq = sequences[i, instruction.size(1):]
-                    sequence_lists[batch_idx].append(seq)
+            # Apply log softmax to CTC logits
+            log_probs = F.log_softmax(ctc_logits, dim=-1)  # [B, T, V]
             
-            # Calculate LLM scores
-            llm_scores = []
-            for i in range(batch_size):
-                if hasattr(outputs, 'sequences_scores'):
-                    beam_scores = []
-                    for j in range(num_return_sequences):
-                        idx = i * num_return_sequences + j
-                        if idx < len(outputs.sequences_scores):
-                            beam_scores.append(outputs.sequences_scores[idx].item())
-                    llm_scores.append(beam_scores)
+            # Simple greedy decoding
+            best_paths = torch.argmax(log_probs, dim=-1)  # [B, T]
+            
+            # Remove repeated tokens and blanks (basic CTC decoding)
+            ctc_decoded_outputs = []
+            for seq in best_paths:
+                decoded = []
+                prev = -1  # Different from all valid indices
+                for token_idx in seq:
+                    token = token_idx.item()
+                    if token != prev and token != self.cfg.ctc_blank_idx:
+                        decoded.append(token)
+                    prev = token
+                
+                # Convert to string if using phonetic vocabulary
+                if hasattr(self, 'idx_to_phonetic'):
+                    decoded_str = ''.join([self.idx_to_phonetic.get(idx, '?') for idx in decoded])
+                    ctc_decoded_outputs.append(decoded_str)
                 else:
-                    # Fallback - equal weights if scores not available
-                    llm_scores.append([1.0] * len(sequence_lists[i]))
+                    # Return indices
+                    ctc_decoded_outputs.append(decoded)
+                    
+        elif self.ctc_head_projector is not None:
+            # Process projector output with CTC head 
+            ctc_features = reduced_enc_out.clone()
             
-            # Log the actual number of beam hypotheses collected
-            for i, seqs in enumerate(sequence_lists):
-                logger.info(f"BATCH {i}: Collected {len(seqs)} beam hypotheses")
-                logger.info(f"BATCH {i}: LLM scores: {llm_scores[i]}")
+            # Check if there's a dimension mismatch in CTC head
+            expected_dim = next(self.ctc_head_projector.parameters()).shape[1]
+            actual_dim = ctc_features.shape[-1]
             
-            # If we have empty beam lists or not enough beams, exit early
-            if any(len(seqs) == 0 for seqs in sequence_lists) or all(len(seqs) == 1 for seqs in sequence_lists):
-                logger.warning("Not enough beam hypotheses collected for reranking, returning LLM output only")
+            if actual_dim != expected_dim:
+                logger.warning(f"CTC dimension mismatch: model expects {expected_dim}, got {actual_dim}")
+                logger.warning("This suggests the model was trained with different dimensions than being used for inference.")
+                logger.warning("Please ensure the same model configuration is used for both training and inference.")
+                logger.warning("CTC decoding will be skipped due to dimension mismatch.")
                 
-                # Return both LLM and CTC outputs if requested
-                if return_ctc_outputs and hasattr(self, '_ctc_decoded_outputs'):
-                    result = {
-                        'llm_output': llm_only_output,
-                        'ctc_output': self._ctc_decoded_outputs,
-                        'hybrid_output': None  # No hybrid reranking performed
-                    }
-                    delattr(self, '_ctc_decoded_outputs')
-                    return result
+                # Just return LLM output if dimensions don't match
+                return llm_output
                 
-                return llm_only_output
+            ctc_features_matched = ctc_features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
+            ctc_logits = self.ctc_head_projector(ctc_features_matched)
             
-            # Perform hybrid reranking
-            reranked_indices = self.hybrid_reranking(
-                self._ctc_features_for_reranking,
-                llm_scores,
-                sequence_lists,
-                ctc_weight=ctc_weight_decode,
-                feature_source=self.cfg.ctc_feature_source
-            )
+            # Apply log softmax to CTC logits
+            log_probs = F.log_softmax(ctc_logits, dim=-1)  # [B, T, V]
             
-            # Reorder sequences based on reranking
-            reranked_sequences = []
-            for b in range(batch_size):
-                # Get the top reranked sequence
-                top_idx = reranked_indices[b][0]
-                original_idx = b * num_return_sequences + top_idx
-                reranked_sequences.append(sequences[original_idx])
-                
-                # For debugging: log the selected sequence after reranking
-                if hasattr(self.decoder, 'tokenizer'):
-                    tokenizer = self.decoder.tokenizer
-                    logger.info(f"BATCH {b}: SELECTED OUTPUT AFTER RERANKING (index {top_idx}):")
-                    decoded = tokenizer.decode(sequences[original_idx], skip_special_tokens=True)
-                    logger.info(f"  {decoded}")
+            # Simple greedy decoding
+            best_paths = torch.argmax(log_probs, dim=-1)  # [B, T]
             
-            # Return reranked sequences
-            if len(reranked_sequences) == 1:
-                # For comparison with the original
-                if hasattr(self.decoder, 'tokenizer') and batch_size == 1:
-                    tokenizer = self.decoder.tokenizer
-                    orig_decoded = tokenizer.decode(sequences[0], skip_special_tokens=True)
-                    new_decoded = tokenizer.decode(reranked_sequences[0], skip_special_tokens=True)
-                    logger.info(f"ORIGINAL TOP: {orig_decoded}")
-                    logger.info(f"RERANKED TOP: {new_decoded}")
-                    logger.info(f"CHANGED: {orig_decoded != new_decoded}")
+            # Remove repeated tokens and blanks (basic CTC decoding)
+            ctc_decoded_outputs = []
+            for seq in best_paths:
+                decoded = []
+                prev = -1  # Different from all valid indices
+                for token_idx in seq:
+                    token = token_idx.item()
+                    if token != prev and token != self.cfg.ctc_blank_idx:
+                        decoded.append(token)
+                    prev = token
                 
-                # If requested, return both LLM and hybrid outputs
-                if return_both_outputs:
-                    result = {
-                        'llm_output': llm_only_output,
-                        'hybrid_output': reranked_sequences[0],
-                        'ctc_output': self._ctc_decoded_outputs if hasattr(self, '_ctc_decoded_outputs') else None
-                    }
-                    if hasattr(self, '_ctc_decoded_outputs'):
-                        delattr(self, '_ctc_decoded_outputs')
-                    return result
-                
-                return reranked_sequences[0]
-            else:
-                # If requested, return both LLM and hybrid outputs
-                if return_both_outputs:
-                    result = {
-                        'llm_output': llm_only_output,
-                        'hybrid_output': torch.stack(reranked_sequences),
-                        'ctc_output': self._ctc_decoded_outputs if hasattr(self, '_ctc_decoded_outputs') else None
-                    }
-                    if hasattr(self, '_ctc_decoded_outputs'):
-                        delattr(self, '_ctc_decoded_outputs')
-                    return result
-                
-                return torch.stack(reranked_sequences)
-            
-        # Clear temporary storage
-        if hasattr(self, '_ctc_features_for_reranking'):
-            delattr(self, '_ctc_features_for_reranking')
-
-        # Return both LLM and CTC outputs if requested
-        if return_ctc_outputs and hasattr(self, '_ctc_decoded_outputs'):
-            # Create a structure to return both
-            result = {
-                'llm_output': outputs.sequences,
-                'ctc_output': self._ctc_decoded_outputs,
-                'hybrid_output': None  # No hybrid reranking performed
-            }
-            # Clean up temporary storage
-            delattr(self, '_ctc_decoded_outputs')
-            return result
+                # Convert to string if using phonetic vocabulary
+                if hasattr(self, 'idx_to_phonetic'):
+                    decoded_str = ''.join([self.idx_to_phonetic.get(idx, '?') for idx in decoded])
+                    ctc_decoded_outputs.append(decoded_str)
+                else:
+                    # Return indices
+                    ctc_decoded_outputs.append(decoded)
+        else:
+            # No CTC head available
+            logger.warning("CTC decoding requested but appropriate CTC head is not available")
+            return llm_output
         
-        return outputs.sequences
+        # Return both LLM and CTC outputs if requested
+        if return_ctc_outputs:
+            result = {
+                'llm_output': llm_output,
+                'ctc_output': ctc_decoded_outputs
+            }
+            return result
+            
+        # Otherwise just return LLM output
+        return llm_output
 
     def get_ctc_target(self, sample):
         return sample["target"], sample["target_lengths"]
@@ -1181,9 +1068,45 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Get logits from appropriate CTC head
         with torch.no_grad():
             if feature_source == "encoder":
+                # Get the expected input dimension from the first layer of ctc_head_encoder
+                expected_dim = next(self.ctc_head_encoder.parameters()).shape[1]
+                actual_dim = encoder_features.shape[-1]
+                
+                # Log the dimension mismatch for debugging
+                if actual_dim != expected_dim:
+                    logger.warning(f"CTC feature dimension mismatch in calculate_ctc_scores: got {actual_dim}, expected {expected_dim}")
+                
+                # Match dimensions if needed
+                if actual_dim != expected_dim:
+                    # Use the first layer's weight to determine the expected input dimension
+                    if isinstance(self.ctc_head_encoder[0], nn.Linear):
+                        # Just take the first n features where n is the expected dimension
+                        if actual_dim > expected_dim:
+                            logger.warning(f"Truncating CTC features from {actual_dim} to {expected_dim}")
+                            encoder_features = encoder_features[:, :, :expected_dim]
+                        # If actual dimension is smaller, this will fail but at least we'll have a clearer error
+                
                 ctc_features_matched = encoder_features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
                 ctc_logits = self.ctc_head_encoder(ctc_features_matched)
             else:
+                # Get the expected input dimension from the first layer of ctc_head_projector
+                expected_dim = next(self.ctc_head_projector.parameters()).shape[1]
+                actual_dim = encoder_features.shape[-1]
+                
+                # Log the dimension mismatch for debugging
+                if actual_dim != expected_dim:
+                    logger.warning(f"CTC projector feature dimension mismatch in calculate_ctc_scores: got {actual_dim}, expected {expected_dim}")
+                
+                # Match dimensions if needed
+                if actual_dim != expected_dim:
+                    # Use the first layer's weight to determine the expected input dimension
+                    if isinstance(self.ctc_head_projector[0], nn.Linear):
+                        # Just take the first n features where n is the expected dimension
+                        if actual_dim > expected_dim:
+                            logger.warning(f"Truncating CTC projector features from {actual_dim} to {expected_dim}")
+                            encoder_features = encoder_features[:, :, :expected_dim]
+                        # If actual dimension is smaller, this will fail but at least we'll have a clearer error
+                
                 ctc_features_matched = encoder_features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
                 ctc_logits = self.ctc_head_projector(ctc_features_matched)
             
@@ -1882,9 +1805,29 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Get logits from appropriate CTC head
         with torch.no_grad():
             if feature_source == "encoder":
+                # Check if there's a dimension mismatch in CTC head
+                expected_dim = next(self.ctc_head_encoder.parameters()).shape[1]
+                actual_dim = features.shape[-1]
+                
+                if actual_dim != expected_dim:
+                    logger.warning(f"CTC dimension mismatch: model expects {expected_dim}, got {actual_dim}")
+                    logger.warning("This suggests the model was trained with different dimensions than being used for inference.")
+                    logger.warning("Please ensure the same model configuration is used for both training and inference.")
+                    return None
+                
                 features_matched = features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
                 logits = self.ctc_head_encoder(features_matched)
             else:
+                # Check if there's a dimension mismatch in CTC head
+                expected_dim = next(self.ctc_head_projector.parameters()).shape[1]
+                actual_dim = features.shape[-1]
+                
+                if actual_dim != expected_dim:
+                    logger.warning(f"CTC dimension mismatch: model expects {expected_dim}, got {actual_dim}")
+                    logger.warning("This suggests the model was trained with different dimensions than being used for inference.")
+                    logger.warning("Please ensure the same model configuration is used for both training and inference.")
+                    return None
+                
                 features_matched = features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
                 logits = self.ctc_head_projector(features_matched)
             
@@ -1939,9 +1882,29 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Get logits from appropriate CTC head
         with torch.no_grad():
             if feature_source == "encoder":
+                # Check if there's a dimension mismatch in CTC head
+                expected_dim = next(self.ctc_head_encoder.parameters()).shape[1]
+                actual_dim = features.shape[-1]
+                
+                if actual_dim != expected_dim:
+                    logger.warning(f"CTC dimension mismatch: model expects {expected_dim}, got {actual_dim}")
+                    logger.warning("This suggests the model was trained with different dimensions than being used for inference.")
+                    logger.warning("Please ensure the same model configuration is used for both training and inference.")
+                    return None
+                
                 features_matched = features.to(dtype=next(self.ctc_head_encoder.parameters()).dtype)
                 logits = self.ctc_head_encoder(features_matched)
             else:
+                # Check if there's a dimension mismatch in CTC head
+                expected_dim = next(self.ctc_head_projector.parameters()).shape[1]
+                actual_dim = features.shape[-1]
+                
+                if actual_dim != expected_dim:
+                    logger.warning(f"CTC dimension mismatch: model expects {expected_dim}, got {actual_dim}")
+                    logger.warning("This suggests the model was trained with different dimensions than being used for inference.")
+                    logger.warning("Please ensure the same model configuration is used for both training and inference.")
+                    return None
+                
                 features_matched = features.to(dtype=next(self.ctc_head_projector.parameters()).dtype)
                 logits = self.ctc_head_projector(features_matched)
             
