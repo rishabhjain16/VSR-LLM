@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/test_vsp_llm   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/TEST_CTC_Scratch_Encoder   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -44,12 +44,12 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # -------------------------------------------------------------
 
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
-PROJECTOR_TYPE="visual_speech_qformer"
+PROJECTOR_TYPE="linear"
 
 # CTC configuration
 USE_CTC="true"  # Set to "true" to enable CTC loss
 CTC_WEIGHT="0.3"  # Weight for CTC loss (0.3 means 30% CTC, 70% LM)
-CTC_FEATURE_SOURCE="projector"  # Source of features for CTC: "encoder" or "projector"
+CTC_FEATURE_SOURCE="encoder"  # Source of features for CTC: "encoder" or "projector"
 MODEL_TYPE="vsp_llm_ctc"  # Use "vsp_llm_ctc" when USE_CTC is true
 
 

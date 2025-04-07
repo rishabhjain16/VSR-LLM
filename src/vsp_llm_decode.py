@@ -193,7 +193,7 @@ def _main(cfg, output_file):
             model.half()
 
     # Load dataset (possibly sharded)
-    cfg.dataset.batch_size = 4
+    cfg.dataset.batch_size = 2
     cfg.dataset.max_tokens = 2000
     itr = task.get_batch_iterator(
         dataset=task.dataset(cfg.dataset.gen_subset),
@@ -250,39 +250,77 @@ def _main(cfg, output_file):
     has_target = True
     wps_meter = TimeMeter()
     result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'instruction': [], 'wer': [], 'cer': []}
+    if hasattr(model, 'cfg') and model.cfg.use_ctc:
+        result_dict['ctc_wer'] = []
     model = models[0]
-    for sample in progress:
+    for sample_idx, sample in enumerate(progress):
+        # Simple log message for each group of samples
+        logger.info(f"Processing video group {sample_idx + 1} ({len(sample['id'])} videos)")
+        
         sample = utils.move_to_cuda(sample) if use_cuda else sample
         if "net_input" not in sample:
             continue
         
         sample['net_input']['source']['video'] = sample['net_input']['source']['video'].to(torch.half)
         
-        # best_hypo = model.generate(
-        #     target_list=sample["target"], 
-        #     num_beams=cfg.generation.beam, 
-        #     length_penalty=cfg.generation.lenpen,
-        #     pad_token_id=tokenizer.pad_token_id,       # Correctly set pad_token_id
-        #     eos_token_id=tokenizer.eos_token_id,       # Correctly set eos_token_id
-        #     attention_mask=sample["net_input"].get("attention_mask"),
-        #     **sample["net_input"]
-        # )
+        # Get CTC emissions if enabled
+        ctc_decoded = []
+        if hasattr(model, 'cfg') and model.cfg.use_ctc:
+            output = model.encoder(**sample["net_input"])
+            
+            # Ensure CTC head projector is on the same device as features
+            if use_cuda:
+                if hasattr(model, 'ctc_head_projector'):
+                    model.ctc_head_projector = model.ctc_head_projector.cuda()
+                if hasattr(model, 'ctc_head_encoder'):
+                    model.ctc_head_encoder = model.ctc_head_encoder.cuda()
+            
+            try:
+                ctc_log_probs = model.get_ctc_emissions(output, model.cfg.ctc_feature_source)
+                ctc_decoded = model.decode_ctc(ctc_log_probs.transpose(0, 1))
+                
+                # Simply report number of CTC outputs
+                logger.info(f"CTC decoding: {len(ctc_decoded)} outputs")
+                
+                # Ensure CTC outputs are not empty
+                for i, text in enumerate(ctc_decoded):
+                    if len(text.strip()) < 2:  # If text is too short (empty or just whitespace)
+                        ctc_decoded[i] = "no valid ctc output"
+            except Exception as e:
+                logger.error(f"Error during CTC decoding: {str(e)}")
+                ctc_decoded = []
+        
         eos_token_id = tokenizer.convert_tokens_to_ids("Transcript:")
+        logger.info("Starting generation...")
+        
+        # Temporarily disable CTC for generation to avoid double processing
+        use_ctc_original = None
+        if hasattr(model, 'cfg') and hasattr(model.cfg, 'use_ctc'):
+            use_ctc_original = model.cfg.use_ctc
+            model.cfg.use_ctc = False
+            
+        logger.info(f"Generating LLM outputs for {len(sample['id'])} videos (beam={cfg.generation.beam})...")
         best_hypo = model.generate(
             target_list=sample["target"], 
             num_beams=cfg.generation.beam,
-            #max_length=cfg.generation.max_len_b,
-            #min_length=cfg.generation.min_len,
+            max_length=cfg.generation.max_len_b,
+            min_length=cfg.generation.min_len,
             length_penalty=cfg.generation.lenpen,
-            #no_repeat_ngram_size=cfg.generation.no_repeat_ngram_size,
-            #temperature=0.1 ,  # Added temperature
-            #repetition_penalty=1.5,  # Increased penalty
-            #top_p=0.9,  # Added nucleus sampling
-            #pad_token_id=tokenizer.pad_token_id,
-            #eos_token_id=eos_token_id,
-            #attention_mask=sample["net_input"].get("attention_mask"),
+            no_repeat_ngram_size=cfg.generation.no_repeat_ngram_size,
+            temperature=0.1,
+            repetition_penalty=1.5,
+            top_p=0.9,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=eos_token_id,
             **sample["net_input"]
         )
+        
+        # Restore original CTC setting
+        if use_ctc_original is not None:
+            model.cfg.use_ctc = use_ctc_original
+            
+        logger.info("LLM generation complete")
+        
         import re
 
         def clean_hyp_output(hyp_text):     
@@ -297,10 +335,12 @@ def _main(cfg, output_file):
                     seen.add(sentence)
 
             return ". ".join(cleaned_hyp).strip()
-        
+            
         best_hypo = tokenizer.batch_decode(
                 best_hypo, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
+        logger.info(f"Decoded hypotheses: {best_hypo}")
+        
         #best_hypo = [post_process(hyp) for hyp in best_hypo]
         #best_hypo = [clean_hyp_output(hyp) for hyp in best_hypo]
         #best_hypo = [hyp.rstrip('#').rstrip('!') for hyp in best_hypo]
@@ -324,12 +364,44 @@ def _main(cfg, output_file):
             sample_wer = 100 * editdistance.eval(hypo_words, ref_words) / len(ref_words) if len(ref_words) > 0 else 0
             sample_cer = 100 * calculate_cer(hypo_str, ref_sent)
             
+            # Calculate CTC WER if available
+            if hasattr(model, 'cfg') and model.cfg.use_ctc and i < len(ctc_decoded):
+                ctc_hypo = ctc_decoded[i]
+                
+                # Handle empty or whitespace-only CTC outputs
+                if ctc_hypo.strip() == "":
+                    ctc_hypo = "no valid ctc output"
+                    
+                ctc_hypo_words = ctc_hypo.strip().split()
+                
+                # Only calculate WER if we have words to compare
+                if len(ctc_hypo_words) > 0 and len(ref_words) > 0:
+                    ctc_wer = 100 * editdistance.eval(ctc_hypo_words, ref_words) / len(ref_words)
+                else:
+                    ctc_wer = 100.0  # If no words to compare, set to 100% error
+                
+                # Ensure ctc_wer key exists
+                if 'ctc_wer' not in result_dict:
+                    result_dict['ctc_wer'] = []
+                    
+                result_dict['ctc_wer'].append(ctc_wer)
+                logger.info(f"CTC WER: {ctc_wer:.2f}%, CTC text: '{ctc_hypo}'")
+            
             # Store metrics in result dictionary
             result_dict['wer'].append(sample_wer)
             result_dict['cer'].append(sample_cer)
             
             # Log with metrics included
-            logger.info(f"\nINST:{instruction}\nREF:{ref_sent}\nHYP:{hypo_str}\nWER:{sample_wer:.2f}%\nCER:{sample_cer:.2f}%\n")
+            log_msg = f"VIDEO {sample_idx + 1}.{i + 1} (ID: {sample['utt_id'][i]})"
+            log_msg += f"\n  REF: {ref_sent}"
+            log_msg += f"\n  LLM: {hypo_str}"
+            log_msg += f"\n  LLM WER: {sample_wer:.1f}%  CER: {sample_cer:.1f}%"
+            
+            if hasattr(model, 'cfg') and model.cfg.use_ctc and i < len(ctc_decoded):
+                log_msg += f"\n  CTC: {ctc_hypo}"
+                log_msg += f"\n  CTC WER: {ctc_wer:.1f}%"
+                
+            logger.info(log_msg)
 
     yaml_str = OmegaConf.to_yaml(cfg.generation)
     fid = int(hashlib.md5(yaml_str.encode("utf-8")).hexdigest(), 16)
@@ -356,11 +428,21 @@ def _main(cfg, output_file):
         wer = 100 * n_err / n_total if n_total > 0 else 0
         cer = 100 * n_char_err / n_char_total if n_char_total > 0 else 0
         
+        # Calculate overall CTC WER if available
+        ctc_wer = 0
+        if 'ctc_wer' in result_dict and len(result_dict['ctc_wer']) > 0:
+            ctc_wer = sum(result_dict['ctc_wer']) / len(result_dict['ctc_wer'])
+            logger.info(f"Overall CTC WER: {ctc_wer:.2f}%")
+        else:
+            logger.info("No CTC WER data available")
+        
         # Write results to file
         wer_fn = f"{cfg.common_eval.results_path}/wer.{fid}"
         with open(wer_fn, "w") as fo:
             fo.write(f"WER: {wer:.2f}%\n")
             fo.write(f"CER: {cer:.2f}%\n")
+            if 'ctc_wer' in result_dict and len(result_dict['ctc_wer']) > 0:
+                fo.write(f"CTC WER: {ctc_wer:.2f}%\n")
             fo.write(f"WER err / num_ref_words = {n_err} / {n_total}\n")
             fo.write(f"CER err / num_ref_chars = {n_char_err} / {n_char_total}\n\n")
             fo.write(f"{yaml_str}")

@@ -11,7 +11,7 @@ common:
 checkpoint:
   save_interval: 1
   keep_interval_updates: 1
-  save_interval_updates: 2500
+  save_interval_updates: 500
   no_epoch_checkpoints: true
   best_checkpoint_metric: accuracy
   maximize_best_checkpoint_metric: true

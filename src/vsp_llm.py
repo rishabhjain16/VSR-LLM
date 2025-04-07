@@ -202,6 +202,10 @@ class VSPLLMConfig(FairseqDataclass):
         default=False,
         metadata={"help": "Whether to use CTC auxiliary loss during training"}
     )
+    ctc_use_char_level: bool = field(
+        default=True,
+        metadata={"help": "Use character-level tokenization for CTC instead of word-level (recommended)"}
+    )
     ctc_weight: float = field(
         default=0.3,
         metadata={"help": "Weight for CTC loss (0.3 means 30% CTC, 70% LM)"}
@@ -454,7 +458,6 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         self.batch_counter += 1
         
         # Always update CTC status at the start of forward to ensure it's correct
-        # This prevents issues when transitioning between train and validation
         if hasattr(self, 'cfg') and hasattr(self.cfg, 'use_ctc'):
             self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
         
@@ -462,7 +465,11 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         ft = self.freeze_finetune_updates <= self.num_updates
         with torch.no_grad() if not ft else contextlib.ExitStack():
             output = self.encoder(**kwargs)
-    
+        
+        # Store raw encoder output for CTC loss if needed
+        raw_encoder_out = output['encoder_out'].clone()
+        
+        # Continue with normal forward pass
         # Get the original size before applying projector
         orig_seq_len = output['encoder_out'].size(1)
         
@@ -593,11 +600,11 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         
         # Calculate CTC loss if enabled and in training mode
         total_loss = lm_loss
-        if hasattr(self, '_use_ctc_in_forward') and self._use_ctc_in_forward:
+        if self._use_ctc_in_forward:
             # Choose the CTC feature source based on configuration
             if self.cfg.ctc_feature_source == "encoder":
                 # Use raw encoder output for CTC
-                ctc_features = output['encoder_out'].clone()
+                ctc_features = raw_encoder_out.clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
                 ctc_logits = self.ctc_head_encoder(ctc_features_matched)
                 
@@ -605,72 +612,48 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 if 'padding_mask' in output and output['padding_mask'] is not None:
                     input_lengths = (~output['padding_mask']).long().sum(-1)
                 else:
-                    input_lengths = torch.full((output['encoder_out'].size(0),), 
-                                            output['encoder_out'].size(1),
-                                            device=output['encoder_out'].device,
+                    input_lengths = torch.full((raw_encoder_out.size(0),), 
+                                            raw_encoder_out.size(1),
+                                            device=raw_encoder_out.device,
                                             dtype=torch.long)
-                
-                # Log which feature source is being used
-                if self.batch_counter % 20 == 0:
-                    logger.info(f"Using raw encoder output for CTC, shape: {ctc_features.shape}")
             else:
-                # Use projector output for CTC (default)
-                ctc_features = reduced_enc_out.clone()
+                # Use projector output for CTC
+                ctc_features = output['encoder_out'].clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_projector.weight.dtype)
                 ctc_logits = self.ctc_head_projector(ctc_features_matched)
                 
-                # For projector output, be more careful with input lengths
-                # Key difference: projector outputs might have different sequence length characteristics
-                # compared to encoder outputs, especially after clustering/aggregation
-                if is_query_based:
-                    # For query-based projectors, each output token should be considered
-                    input_lengths = torch.full((ctc_features.size(0),), 
-                                          ctc_features.size(1),
-                                          device=ctc_features.device,
-                                          dtype=torch.long)
+                # Get input lengths from projector output
+                if 'padding_mask' in output and output['padding_mask'] is not None:
+                    input_lengths = (~output['padding_mask']).long().sum(-1)
                 else:
-                    # For clustering-based approaches, the sequence reflects the number of clusters
-                    # which should match the number of distinct segments in the input
                     input_lengths = torch.full((ctc_features.size(0),), 
-                                          ctc_features.size(1),
-                                          device=ctc_features.device,
-                                          dtype=torch.long)
-                
-                # Log which feature source is being used
-                if self.batch_counter % 20 == 0:
-                    logger.info(f"Using projector output for CTC, shape: {ctc_features.shape}")
-                
+                                            ctc_features.size(1),
+                                            device=ctc_features.device,
+                                            dtype=torch.long)
+            
             # Apply log softmax to CTC logits
             log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # [T, B, V]
             
-            # Get target sequence (same text used for LLM loss)
-            target = labels
-            
-            # Remove padding tokens for CTC loss
-            pad_mask = (target != 0)  # 0 is padding token
-            target_lengths = pad_mask.sum(-1)
+            # Convert word-level targets to character-level tokens for CTC
+            ctc_tokens, ctc_lengths = self.get_ctc_targets_from_llm_batch(kwargs)
             
             # Add diagnostic logs to help debug CTC issues
             if self.batch_counter % 20 == 0:
-                non_zero_targets = (target_lengths > 0).sum().item()
-                total_targets = target_lengths.size(0)
+                non_zero_targets = (ctc_lengths > 0).sum().item()
+                total_targets = ctc_lengths.size(0)
                 logger.info(f"CTC target stats: {non_zero_targets}/{total_targets} sequences have non-zero length")
                 logger.info(f"CTC input_lengths: min={input_lengths.min().item()}, max={input_lengths.max().item()}")
-                logger.info(f"CTC target_lengths: min={target_lengths.min().item()}, max={target_lengths.max().item()}")
+                logger.info(f"CTC target_lengths: min={ctc_lengths.min().item()}, max={ctc_lengths.max().item()}")
                 
                 # Check if we have invalid CTC constraints (input shorter than target)
-                invalid_lens = (input_lengths < target_lengths).sum().item()
+                invalid_lens = (input_lengths < ctc_lengths).sum().item()
                 if invalid_lens > 0:
                     logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
-                
-                # Verify our blank index isn't causing issues with padding
-                if self.cfg.ctc_blank_idx == 0 or self.cfg.ctc_blank_idx is None or (isinstance(self.cfg.ctc_blank_idx, str) and not self.cfg.ctc_blank_idx.strip()):
-                    logger.warning("CTC blank_idx is set to 0, which is also the padding token - this may cause issues")
             
             # Calculate CTC loss
             try:
                 # Check for empty targets or input
-                if (target_lengths == 0).all() or (input_lengths == 0).all():
+                if (ctc_lengths == 0).all() or (input_lengths == 0).all():
                     logger.warning(f"Empty CTC targets or inputs detected - CTC loss will be ignored")
                     ctc_loss = torch.tensor(0.0, device=lm_loss.device, dtype=lm_loss.dtype)
                 else:
@@ -678,72 +661,47 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                     log_probs_float = log_probs.float()
                     ctc_loss = F.ctc_loss(
                         log_probs_float,
-                        target,
+                        ctc_tokens,
                         input_lengths,
-                        target_lengths,
-                        blank=self.cfg.ctc_blank_idx,
+                        ctc_lengths,
+                        blank=self.ctc_blank_idx,
                         reduction="mean",
                         zero_infinity=True,
                     )
-                    
-                    # Check if loss is suspiciously close to zero
-                    if ctc_loss.item() < 1e-6:
-                        logger.warning(f"CTC loss is suspiciously close to zero: {ctc_loss.item()}")
-                        
-                        # Check logits for possible numerical issues
-                        max_logit = ctc_logits.max().item()
-                        min_logit = ctc_logits.min().item()
-                        mean_logit = ctc_logits.mean().item()
-                        logger.warning(f"CTC logits stats: min={min_logit:.4f}, max={max_logit:.4f}, mean={mean_logit:.4f}")
-                        
-                        # Try with a fixed minimum loss to prevent zero gradient
-                        if self.cfg.ctc_feature_source == "projector" and ctc_loss.item() < 1e-6:
-                            # If using projector and getting zero loss, fall back to a nominal minimum loss
-                            # to ensure some gradient signal reaches the CTC head
-                            logger.warning("Applying minimum loss floor for numerical stability")
-                            ctc_loss = torch.max(ctc_loss, torch.tensor(0.1, device=ctc_loss.device, dtype=ctc_loss.dtype))
                 
                 # Combine losses with weighting
-                # Convert to same dtype for combination
-                # Add alignment loss if available (for cross-modal learning)
-                if is_text_based and alignment_loss.item() > 0:
-                    # Add alignment loss with a weight (e.g., 0.1)
-                    alignment_weight = 0.1
-                    total_loss = (1 - self.cfg.ctc_weight - alignment_weight) * lm_loss + \
-                                self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype) + \
-                                alignment_weight * alignment_loss.to(lm_loss.dtype)
-                    
-                    # Log all losses
-                    if self.batch_counter % 20 == 0:
-                        lm_loss_val = float(lm_loss.detach().cpu().item())
-                        ctc_loss_val = float(ctc_loss.detach().cpu().item())
-                        align_loss_val = float(alignment_loss.detach().cpu().item())
-                        logger.info(f"Batch {self.batch_counter}: LM loss: {lm_loss_val:.4f}, "
-                                   f"CTC loss: {ctc_loss_val:.4f}, "
-                                   f"Alignment loss: {align_loss_val:.4f}")
-                else:
-                    # Standard weighting without alignment loss
-                    total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
-                    
-                    # Log losses occasionally
-                    if self.batch_counter % 20 == 0:
-                        lm_loss_val = float(lm_loss.detach().cpu().item())
-                        ctc_loss_val = float(ctc_loss.detach().cpu().item())
-                        logger.info(f"Batch {self.batch_counter}: LM loss: {lm_loss_val:.4f}, CTC loss: {ctc_loss_val:.4f}")
+                total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
                 
-            except Exception as e:
-                logger.warning(f"CTC loss calculation failed: {e}")
-                # Add detailed exception information for debugging
-                import traceback
-                logger.warning(f"CTC exception traceback: {traceback.format_exc()}")
-                logger.warning(f"CTC input shape: {ctc_features.shape}, target shape: {target.shape}")
-                logger.warning(f"input_lengths: {input_lengths}")
-                logger.warning(f"target_lengths: {target_lengths}")
-                total_loss = lm_loss  # Fallback to just LM loss
+                # Log losses periodically
+                if self.batch_counter % 20 == 0:
+                    logger.info(f"Losses - LM: {lm_loss.item():.4f}, CTC: {ctc_loss.item():.4f}, Total: {total_loss.item():.4f}")
+            
+            except RuntimeError as e:
+                logger.error(f"Error in CTC loss calculation: {str(e)}")
+                logger.error(f"Shapes - log_probs: {log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
+                logger.error(f"Lengths - input: {input_lengths}, target: {ctc_lengths}")
+                # Fall back to just LM loss if CTC fails
+                total_loss = lm_loss
         
-        # Return combined loss, logits, and labels
+        # Return combined loss, logits, and labels as expected by the criterion
         return total_loss, llm_out.logits, llm_labels
 
+    def get_ctc_emissions(self, output, feature_source="projector"):
+        """Get CTC emissions from encoder or projector output."""
+        if feature_source == "encoder":
+            ctc_features = output['encoder_out'].clone()
+            ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
+            ctc_logits = self.ctc_head_encoder(ctc_features_matched)
+        else:
+            # For projector source, we need to apply the projector first
+            # Get the projector output
+            proj_output = self.avfeat_to_llm(output['encoder_out'])
+            ctc_features_matched = proj_output.to(dtype=self.ctc_head_projector.weight.dtype)
+            ctc_logits = self.ctc_head_projector(ctc_features_matched)
+        
+        # Apply log softmax
+        ctc_log_probs = F.log_softmax(ctc_logits, dim=-1)
+        return ctc_log_probs
 
     @torch.no_grad()
     def generate(self,
@@ -756,6 +714,13 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 **kwargs,
                 ):
         output = self.encoder(**kwargs)
+        
+        # Get CTC emissions if enabled
+        if self.cfg.use_ctc:
+            ctc_log_probs = self.get_ctc_emissions(output, self.cfg.ctc_feature_source)
+            # Decode CTC
+            ctc_decoded = self.decode_ctc(ctc_log_probs.transpose(0, 1))
+            logger.info(f"CTC decoded text: {ctc_decoded}")
         
         # Check if the projector supports text conditioning for alignment loss
         is_text_aware = any(qp in self.cfg.projector_type.lower() for qp in [
@@ -901,7 +866,17 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         return out, lens
 
     def upgrade_state_dict_named(self, state_dict, name):
+        """Upgrade old state dicts to work with newer code."""
         super().upgrade_state_dict_named(state_dict, name)
+        
+        # Handle any CTC-specific state dict upgrades here
+        if name == "":
+            # Check if this is an old checkpoint without CTC heads
+            if 'ctc_head_encoder' not in state_dict and 'ctc_head_projector' not in state_dict:
+                logger.info("Loading checkpoint without CTC heads - initializing new CTC heads")
+                # The CTC heads will be initialized with default weights
+                return state_dict
+            
         return state_dict
 
     def set_num_updates(self, num_updates):
@@ -928,9 +903,136 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         return self.num_updates
 
     def state_dict(self):
-        old_state = super().state_dict()
-        state = {k:v for k,v in old_state.items() if 'lora' in k or 'avfeat_to_llm' in k or 'encoder' in k}
+        """Save all model state including encoder, decoder, projectors, and CTC components."""
+        # Get the full state dict from parent
+        state = super().state_dict()
+        
+        # Log what we're saving for debugging
+        logger.info("Saving model state with keys: " + ", ".join(state.keys()))
+        
         return state
+
+    def text_to_ctc_tokens(self, text_batch, device):
+        """
+        Convert a batch of text strings to character-level CTC tokens.
+        
+        Args:
+            text_batch: List of text strings
+            device: Device to create tensors on
+            
+        Returns:
+            ctc_tokens: tensor of shape [batch_size, max_seq_len] with character indices
+            ctc_lengths: tensor of shape [batch_size] with lengths of each sequence
+        """
+        # For each item in batch, convert to character sequence
+        batch_tokens = []
+        batch_lengths = []
+        
+        for text in text_batch:
+            # Convert text to lowercase and strip whitespace
+            text = text.lower().strip()
+            
+            # Convert to character indices
+            char_indices = [self.ctc_token_to_idx.get(c, self.ctc_token_to_idx[' ']) 
+                          for c in text]
+            
+            # Store in batch
+            batch_tokens.append(torch.tensor(char_indices, device=device))
+            batch_lengths.append(len(char_indices))
+        
+        # Pad sequences to max length
+        max_len = max(batch_lengths)
+        padded_tokens = []
+        
+        for tokens, length in zip(batch_tokens, batch_lengths):
+            # Pad with CTC pad token
+            padding = torch.full((max_len - length,), self.ctc_pad_idx, 
+                               device=device, dtype=torch.long)
+            padded_tokens.append(torch.cat([tokens, padding]))
+        
+        # Stack into batch tensor
+        ctc_tokens = torch.stack(padded_tokens)
+        ctc_lengths = torch.tensor(batch_lengths, device=device)
+        
+        return ctc_tokens, ctc_lengths
+
+    def get_ctc_targets_from_llm_batch(self, batch):
+        """
+        Extract and prepare CTC targets from a batch containing LLM targets.
+        
+        Args:
+            batch: Dictionary containing 'target_list' from the LLM
+            
+        Returns:
+            ctc_tokens: tensor of shape [batch_size, max_seq_len] with character indices
+            ctc_lengths: tensor of shape [batch_size] with lengths of each sequence
+        """
+        # Get the device
+        device = batch['target_list'].device
+        
+        # Get raw text sequences from the batch
+        text_batch = []
+        for seq in batch['target_list']:
+            # Get non-padding indices
+            valid_indices = seq[seq != 0].tolist()
+            # Convert to text using character-level mapping
+            text = ''.join([self.ctc_vocab[idx] if idx < len(self.ctc_vocab) else ' ' 
+                          for idx in valid_indices])
+            text_batch.append(text)
+            
+        # Convert text batch to CTC tokens
+        ctc_tokens, ctc_lengths = self.text_to_ctc_tokens(text_batch, device)
+        
+        return ctc_tokens, ctc_lengths
+
+    def decode_ctc(self, log_probs, input_lengths=None, beam_size=5):
+        """Decode CTC log probabilities to text."""
+        # Move to CPU for decoding
+        log_probs = log_probs.cpu()
+        if input_lengths is not None:
+            input_lengths = input_lengths.cpu()
+        
+        decoded_seqs = []
+        batch_size = log_probs.size(1)
+        
+        for b in range(batch_size):
+            # Get sequence up to input length if provided
+            if input_lengths is not None:
+                seq_log_probs = log_probs[:input_lengths[b], b]
+            else:
+                seq_log_probs = log_probs[:, b]
+            
+            # Initialize beam
+            beam = [([], 0.0)]  # (prefix, score)
+            
+            # Beam search
+            for t in range(seq_log_probs.size(0)):
+                new_beam = []
+                for prefix, score in beam:
+                    # Get top k tokens at current timestep
+                    top_k_log_probs, top_k_indices = seq_log_probs[t].topk(beam_size)
+                    
+                    for log_prob, token in zip(top_k_log_probs, top_k_indices):
+                        # Skip blank token
+                        if token == self.ctc_blank_idx:
+                            new_beam.append((prefix, score + log_prob))
+                            continue
+                        
+                        # Add new token (removed repeated token check)
+                        new_prefix = prefix + [token]
+                        new_beam.append((new_prefix, score + log_prob))
+                
+                # Keep top beam_size candidates
+                beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:beam_size]
+            
+            # Get best path
+            best_prefix, _ = max(beam, key=lambda x: x[1])
+            
+            # Convert tokens to text
+            text = ''.join([self.ctc_vocab[t] for t in best_prefix])
+            decoded_seqs.append(text)
+        
+        return decoded_seqs
 
 
 def Embedding(num_embeddings, embedding_dim, padding_idx):
@@ -958,6 +1060,18 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         self.num_updates = 0
         self.batch_counter = 0  # Add batch counter for more frequent logging
         self._use_ctc_in_forward = cfg.use_ctc  # Add tracking attribute for CTC usage
+        
+        # Set up CTC character vocabulary (standard English characters + common symbols)
+        # Index 0 = padding, Index 1 = blank token (CTC standard), rest = characters
+        self.ctc_vocab = ['<pad>', '<blank>'] + list(' abcdefghijklmnopqrstuvwxyz0123456789.,?!-\'\":;()[]')
+        self.ctc_vocab_size = len(self.ctc_vocab)
+        self.ctc_token_to_idx = {token: idx for idx, token in enumerate(self.ctc_vocab)}
+        self.ctc_blank_idx = 1  # Index of <blank> in self.ctc_vocab (for CTC loss)
+        self.ctc_pad_idx = 0    # Index of <pad> in self.ctc_vocab (for padding)
+        
+        # Log CTC vocabulary details
+        logger.info(f"Initialized character-level CTC vocabulary with {self.ctc_vocab_size} tokens")
+        logger.info(f"CTC blank token is at index {self.ctc_blank_idx}, pad token at index {self.ctc_pad_idx}")
         
         # Get hidden size dynamically from the decoder's configuration
         # This will be the output dimension of our projector
@@ -1030,23 +1144,13 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             encoder_dim = 1024  # Common AV-HuBERT dimension
             logger.warning(f"Could not determine encoder dimension, using default: {encoder_dim}")
         
-        # Get vocabulary size for CTC output dimension
-        vocab_size = None
-        if hasattr(decoder, 'config') and hasattr(decoder.config, 'vocab_size'):
-            vocab_size = decoder.config.vocab_size
-        elif hasattr(decoder, 'vocab_size'):
-            vocab_size = decoder.vocab_size
-        
-        if vocab_size is None:
-            raise ValueError("Could not determine vocabulary size for CTC head output dimension.")
-        
         # Log the determined dimensions
-        logger.info(f"Encoder CTC head will use dimensions: {encoder_dim} → {vocab_size}")
-        logger.info(f"Projector CTC head will use dimensions: {projector_out_dim} → {vocab_size}")
+        logger.info(f"Encoder CTC head will use dimensions: {encoder_dim} → {self.ctc_vocab_size}")
+        logger.info(f"Projector CTC head will use dimensions: {projector_out_dim} → {self.ctc_vocab_size}")
         
-        # Add CTC heads for both feature sources
-        self.ctc_head_encoder = nn.Linear(encoder_dim, vocab_size)
-        self.ctc_head_projector = nn.Linear(projector_out_dim, vocab_size)
+        # Add CTC heads for both feature sources using the character-level CTC vocab
+        self.ctc_head_encoder = nn.Linear(encoder_dim, self.ctc_vocab_size)
+        self.ctc_head_projector = nn.Linear(projector_out_dim, self.ctc_vocab_size)
         
         # Initialize the projection layers
         nn.init.xavier_normal_(self.ctc_head_encoder.weight)
@@ -1054,21 +1158,9 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         nn.init.xavier_normal_(self.ctc_head_projector.weight)
         nn.init.zeros_(self.ctc_head_projector.bias)
         
-        # Auto-set blank index to avoid conflict with padding token
-        if not hasattr(cfg, 'ctc_blank_idx') or cfg.ctc_blank_idx == 0 or cfg.ctc_blank_idx is None or (isinstance(cfg.ctc_blank_idx, str) and not cfg.ctc_blank_idx.strip()):
-            # Use last token in vocabulary as blank
-            self.cfg.ctc_blank_idx = vocab_size - 1
-            logger.info(f"Auto-setting CTC blank_idx to {self.cfg.ctc_blank_idx} (last token in vocabulary)")
-            
-            # Try to print the actual token if tokenizer is available
-            if hasattr(decoder, 'tokenizer'):
-                tokenizer = decoder.tokenizer
-                if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
-                    logger.info(f"CTC blank_token: {tokenizer.pad_token}")
-        
         # Log CTC configuration
         logger.info(f"==========================================================")
-        logger.info(f"INITIALIZING MODEL WITH CTC: weight={cfg.ctc_weight}, blank={cfg.ctc_blank_idx}")
+        logger.info(f"INITIALIZING MODEL WITH CTC: weight={cfg.ctc_weight}, blank={self.ctc_blank_idx}")
         logger.info(f"CTC feature source: {cfg.ctc_feature_source}")
         logger.info(f"==========================================================")
     
@@ -1090,7 +1182,6 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         self.batch_counter += 1
         
         # Always update CTC status at the start of forward to ensure it's correct
-        # This prevents issues when transitioning between train and validation
         if hasattr(self, 'cfg') and hasattr(self.cfg, 'use_ctc'):
             self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
         
@@ -1099,7 +1190,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         with torch.no_grad() if not ft else contextlib.ExitStack():
             output = self.encoder(**kwargs)
         
-        # Store raw encoder output for CTC loss if needed for comparison
+        # Store raw encoder output for CTC loss if needed
         raw_encoder_out = output['encoder_out'].clone()
         
         # Continue with normal forward pass
@@ -1233,11 +1324,11 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         
         # Calculate CTC loss if enabled and in training mode
         total_loss = lm_loss
-        if hasattr(self, '_use_ctc_in_forward') and self._use_ctc_in_forward:
+        if self._use_ctc_in_forward:
             # Choose the CTC feature source based on configuration
             if self.cfg.ctc_feature_source == "encoder":
                 # Use raw encoder output for CTC
-                ctc_features = raw_encoder_out
+                ctc_features = raw_encoder_out.clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
                 ctc_logits = self.ctc_head_encoder(ctc_features_matched)
                 
@@ -1249,68 +1340,44 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                                             raw_encoder_out.size(1),
                                             device=raw_encoder_out.device,
                                             dtype=torch.long)
-                
-                # Log which feature source is being used
-                if self.batch_counter % 20 == 0:
-                    logger.info(f"Using raw encoder output for CTC, shape: {ctc_features.shape}")
             else:
-                # Use projector output for CTC (default)
-                ctc_features = reduced_enc_out.clone()
+                # Use projector output for CTC
+                ctc_features = output['encoder_out'].clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_projector.weight.dtype)
                 ctc_logits = self.ctc_head_projector(ctc_features_matched)
                 
-                # For projector output, be more careful with input lengths
-                # Key difference: projector outputs might have different sequence length characteristics
-                # compared to encoder outputs, especially after clustering/aggregation
-                if is_query_based:
-                    # For query-based projectors, each output token should be considered
-                    input_lengths = torch.full((ctc_features.size(0),), 
-                                          ctc_features.size(1),
-                                          device=ctc_features.device,
-                                          dtype=torch.long)
+                # Get input lengths from projector output
+                if 'padding_mask' in output and output['padding_mask'] is not None:
+                    input_lengths = (~output['padding_mask']).long().sum(-1)
                 else:
-                    # For clustering-based approaches, the sequence reflects the number of clusters
-                    # which should match the number of distinct segments in the input
                     input_lengths = torch.full((ctc_features.size(0),), 
-                                          ctc_features.size(1),
-                                          device=ctc_features.device,
-                                          dtype=torch.long)
-                
-                # Log which feature source is being used
-                if self.batch_counter % 20 == 0:
-                    logger.info(f"Using projector output for CTC, shape: {ctc_features.shape}")
-                
+                                            ctc_features.size(1),
+                                            device=ctc_features.device,
+                                            dtype=torch.long)
+            
             # Apply log softmax to CTC logits
             log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # [T, B, V]
             
-            # Get target sequence (same text used for LLM loss)
-            target = labels
-            
-            # Remove padding tokens for CTC loss
-            pad_mask = (target != 0)  # 0 is padding token
-            target_lengths = pad_mask.sum(-1)
+            # Convert word-level targets to character-level tokens for CTC
+            ctc_tokens, ctc_lengths = self.get_ctc_targets_from_llm_batch(kwargs)
             
             # Add diagnostic logs to help debug CTC issues
             if self.batch_counter % 20 == 0:
-                non_zero_targets = (target_lengths > 0).sum().item()
-                total_targets = target_lengths.size(0)
+                non_zero_targets = (ctc_lengths > 0).sum().item()
+                total_targets = ctc_lengths.size(0)
                 logger.info(f"CTC target stats: {non_zero_targets}/{total_targets} sequences have non-zero length")
                 logger.info(f"CTC input_lengths: min={input_lengths.min().item()}, max={input_lengths.max().item()}")
-                logger.info(f"CTC target_lengths: min={target_lengths.min().item()}, max={target_lengths.max().item()}")
+                logger.info(f"CTC target_lengths: min={ctc_lengths.min().item()}, max={ctc_lengths.max().item()}")
                 
                 # Check if we have invalid CTC constraints (input shorter than target)
-                invalid_lens = (input_lengths < target_lengths).sum().item()
+                invalid_lens = (input_lengths < ctc_lengths).sum().item()
                 if invalid_lens > 0:
                     logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
-                
-                # Verify our blank index isn't causing issues with padding
-                if self.cfg.ctc_blank_idx == 0 or self.cfg.ctc_blank_idx is None or (isinstance(self.cfg.ctc_blank_idx, str) and not self.cfg.ctc_blank_idx.strip()):
-                    logger.warning("CTC blank_idx is set to 0, which is also the padding token - this may cause issues")
             
             # Calculate CTC loss
             try:
                 # Check for empty targets or input
-                if (target_lengths == 0).all() or (input_lengths == 0).all():
+                if (ctc_lengths == 0).all() or (input_lengths == 0).all():
                     logger.warning(f"Empty CTC targets or inputs detected - CTC loss will be ignored")
                     ctc_loss = torch.tensor(0.0, device=lm_loss.device, dtype=lm_loss.dtype)
                 else:
@@ -1318,70 +1385,29 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                     log_probs_float = log_probs.float()
                     ctc_loss = F.ctc_loss(
                         log_probs_float,
-                        target,
+                        ctc_tokens,
                         input_lengths,
-                        target_lengths,
-                        blank=self.cfg.ctc_blank_idx,
+                        ctc_lengths,
+                        blank=self.ctc_blank_idx,
                         reduction="mean",
                         zero_infinity=True,
                     )
-                    
-                    # Check if loss is suspiciously close to zero
-                    if ctc_loss.item() < 1e-6:
-                        logger.warning(f"CTC loss is suspiciously close to zero: {ctc_loss.item()}")
-                        
-                        # Check logits for possible numerical issues
-                        max_logit = ctc_logits.max().item()
-                        min_logit = ctc_logits.min().item()
-                        mean_logit = ctc_logits.mean().item()
-                        logger.warning(f"CTC logits stats: min={min_logit:.4f}, max={max_logit:.4f}, mean={mean_logit:.4f}")
-                        
-                        # Try with a fixed minimum loss to prevent zero gradient
-                        if self.cfg.ctc_feature_source == "projector" and ctc_loss.item() < 1e-6:
-                            # If using projector and getting zero loss, fall back to a nominal minimum loss
-                            # to ensure some gradient signal reaches the CTC head
-                            logger.warning("Applying minimum loss floor for numerical stability")
-                            ctc_loss = torch.max(ctc_loss, torch.tensor(0.1, device=ctc_loss.device, dtype=ctc_loss.dtype))
                 
                 # Combine losses with weighting
-                # Convert to same dtype for combination
-                # Add alignment loss if available (for cross-modal learning)
-                if is_text_based and alignment_loss.item() > 0:
-                    # Add alignment loss with a weight (e.g., 0.1)
-                    alignment_weight = 0.1
-                    total_loss = (1 - self.cfg.ctc_weight - alignment_weight) * lm_loss + \
-                                self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype) + \
-                                alignment_weight * alignment_loss.to(lm_loss.dtype)
-                    
-                    # Log all losses
-                    if self.batch_counter % 20 == 0:
-                        lm_loss_val = float(lm_loss.detach().cpu().item())
-                        ctc_loss_val = float(ctc_loss.detach().cpu().item())
-                        align_loss_val = float(alignment_loss.detach().cpu().item())
-                        logger.info(f"Batch {self.batch_counter}: LM loss: {lm_loss_val:.4f}, "
-                                   f"CTC loss: {ctc_loss_val:.4f}, "
-                                   f"Alignment loss: {align_loss_val:.4f}")
-                else:
-                    # Standard weighting without alignment loss
-                    total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
-                    
-                    # Log losses occasionally
-                    if self.batch_counter % 20 == 0:
-                        lm_loss_val = float(lm_loss.detach().cpu().item())
-                        ctc_loss_val = float(ctc_loss.detach().cpu().item())
-                        logger.info(f"Batch {self.batch_counter}: LM loss: {lm_loss_val:.4f}, CTC loss: {ctc_loss_val:.4f}")
+                total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
                 
-            except Exception as e:
-                logger.warning(f"CTC loss calculation failed: {e}")
-                # Add detailed exception information for debugging
-                import traceback
-                logger.warning(f"CTC exception traceback: {traceback.format_exc()}")
-                logger.warning(f"CTC input shape: {ctc_features.shape}, target shape: {target.shape}")
-                logger.warning(f"input_lengths: {input_lengths}")
-                logger.warning(f"target_lengths: {target_lengths}")
-                total_loss = lm_loss  # Fallback to just LM loss
+                # Log losses periodically
+                if self.batch_counter % 20 == 0:
+                    logger.info(f"Losses - LM: {lm_loss.item():.4f}, CTC: {ctc_loss.item():.4f}, Total: {total_loss.item():.4f}")
+            
+            except RuntimeError as e:
+                logger.error(f"Error in CTC loss calculation: {str(e)}")
+                logger.error(f"Shapes - log_probs: {log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
+                logger.error(f"Lengths - input: {input_lengths}, target: {ctc_lengths}")
+                # Fall back to just LM loss if CTC fails
+                total_loss = lm_loss
         
-        # Return combined loss, logits, and labels
+        # Return combined loss, logits, and labels as expected by the criterion
         return total_loss, llm_out.logits, llm_labels
 
     def set_num_updates(self, num_updates):
