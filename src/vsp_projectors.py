@@ -1109,7 +1109,6 @@ class TransformerCrossAttentionLayer(nn.Module):
         self.norm_first = norm_first
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -1207,25 +1206,38 @@ class VisualSpeechQFormer(BaseProjector):
         """
         try:
             batch_size = x.shape[0]
+            orig_dtype = x.dtype
             
             # Apply visual frontend for lip movement features
             x_conv = x.transpose(1, 2)  # [B, D, T]
+            
+            # Ensure consistent dtype in convolutional layers
+            # Check if any parameters in visual_frontend have different dtype than input
+            param_dtype = next(self.visual_frontend.parameters()).dtype
+            if x_conv.dtype != param_dtype:
+                # Match input to parameter dtype
+                x_conv = x_conv.to(dtype=param_dtype)
+                
+            # Process through frontend
             x_conv = self.visual_frontend(x_conv)
+            # Restore original dtype if needed
+            if orig_dtype != param_dtype:
+                x_conv = x_conv.to(dtype=orig_dtype)
+                
             x = x_conv.transpose(1, 2)  # [B, T, D]
             
             # Add subtle positional information to preserve temporal order in lip movements
-            # Cast to float32 for better precision during position calculation
-            orig_dtype = x.dtype
             position = torch.arange(x.size(1), device=x.device).unsqueeze(0).unsqueeze(-1)
             position = position.expand(batch_size, -1, x.size(-1))
-            position = position.to(torch.float32) / float(x.size(1))
-            
-            # Safer addition with position encoding - convert back to original dtype
-            position = (0.1 * position).to(orig_dtype)
+            position = (0.1 * position / float(x.size(1))).to(dtype=x.dtype)
             x = x + position
             
             # Expand query tokens to batch size
             query_tokens = self.query_tokens.expand(batch_size, -1, -1)
+            
+            # Ensure query tokens match input dtype
+            if query_tokens.dtype != x.dtype:
+                query_tokens = query_tokens.to(dtype=x.dtype)
             
             # Concatenate query tokens with visual features
             x_with_query = torch.cat([query_tokens, x], dim=1)
@@ -1257,6 +1269,11 @@ class VisualSpeechQFormer(BaseProjector):
                 for j in range(region_start, region_end):
                     mask[i, query_len + j] = False  # False = attend to this position
             
+            # Ensure transformer parameters match input dtype
+            transformer_dtype = next(self.transformer.parameters()).dtype
+            if x_with_query.dtype != transformer_dtype:
+                x_with_query = x_with_query.to(dtype=transformer_dtype)
+            
             # Process through transformer
             hidden_states = self.transformer(x_with_query, mask=mask)
             
@@ -1267,27 +1284,51 @@ class VisualSpeechQFormer(BaseProjector):
             query_output = self.norm(query_output)
             output = self.output_proj(query_output)
             
+            # Restore original dtype if needed
+            if output.dtype != orig_dtype:
+                output = output.to(dtype=orig_dtype)
+            
             return output
             
         except RuntimeError as e:
-            # Handle mixed precision error explicitly
-            if "cuda runtime error" in str(e).lower() or "nan" in str(e).lower() or "inf" in str(e).lower():
-                self.logger.warning(f"Mixed precision error in VisualSpeechQFormer: {e}")
-                # Fall back to float32 computation
+            self.logger.warning(f"Error in VisualSpeechQFormer: {e}")
+            self.logger.warning(f"Input shape: {x.shape}, dtype: {x.dtype}")
+            self.logger.warning(f"Visual frontend param dtype: {next(self.visual_frontend.parameters()).dtype}")
+            
+            # Handle specific dtype errors with fallback to full float32 computation
+            if "should be the same" in str(e) or "expected scalar type" in str(e):
+                self.logger.warning("Attempting to run with full float32 precision")
                 with torch.cuda.amp.autocast(enabled=False):
+                    # Force float32 for everything
                     return self.forward(x.float(), 
-                                       None if text_tokens is None else text_tokens.float(), 
-                                       text_mask)
+                                      None if text_tokens is None else text_tokens, 
+                                      text_mask)
             else:
+                # For other errors, provide component-specific diagnostics
+                try:
+                    # Test each component separately to identify the problematic one
+                    x_conv = x.transpose(1, 2).float()  # Convert to float32
+                    self.logger.warning("Testing visual frontend...")
+                    x_conv = self.visual_frontend(x_conv)
+                    x_tmp = x_conv.transpose(1, 2)
+                    
+                    self.logger.warning("Testing transformer...")
+                    query_tokens = self.query_tokens.expand(x.shape[0], -1, -1).float()
+                    x_with_query = torch.cat([query_tokens, x_tmp], dim=1)
+                    hidden_states = self.transformer(x_with_query)
+                    
+                    self.logger.warning("All components passed individual tests with float32")
+                except Exception as component_e:
+                    self.logger.error(f"Component error: {component_e}")
+                
+                # Re-raise the original error
                 raise e
 
 
-class VisualSpeechTextQFormer(VisualSpeechQFormer):
-    """QFormer for visual speech processing with text conditioning for disambiguation
-    
-    This projector adds text conditioning to the VisualSpeechQFormer, allowing it to
-    better disambiguate visually similar phonemes using text context. It is designed
-    to be numerically stable with mixed precision training.
+class VisualSpeechTextQFormer(BaseProjector):
+    """
+    A standalone QFormer for visual speech processing with text conditioning,
+    implemented from scratch to ensure consistent dimension and dtype handling.
     """
     def __init__(
         self, 
@@ -1301,114 +1342,243 @@ class VisualSpeechTextQFormer(VisualSpeechQFormer):
         text_dim: int = 768,
         text_num_layers: int = 2
     ):
-        super().__init__(
-            input_dim=input_dim, 
-            output_dim=output_dim,
-            num_queries=num_queries,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            dropout=dropout,
-            window_size=window_size
+        super().__init__(input_dim, output_dim)
+        self.num_queries = num_queries
+        self.window_size = window_size
+        self.logger = logging.getLogger(__name__)
+        
+        # Learnable query tokens - used to extract key information from sequence
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, input_dim))
+        nn.init.normal_(self.query_tokens, std=0.02)
+        
+        # Visual frontend with convolutional layers for lip movement features
+        self.visual_frontend = nn.Sequential(
+            nn.Conv1d(input_dim, input_dim, kernel_size=window_size, padding=window_size//2, groups=8),
+            nn.GELU(),
+            nn.Conv1d(input_dim, input_dim, kernel_size=window_size, padding=window_size//2),
+            nn.GELU()
         )
         
-        # Add text processing
-        self.text_dim = text_dim
+        # Self-attention transformer layers 
+        visual_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=input_dim,
+            nhead=num_heads,
+            dim_feedforward=input_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.visual_transformer = nn.TransformerEncoder(visual_encoder_layer, num_layers)
         
-        # Linear projection for text if dimensions don't match
-        if text_dim != input_dim:
-            self.text_projection = nn.Linear(text_dim, input_dim)
-        else:
-            self.text_projection = nn.Identity()
-            
-        # Cross-attention layers for text conditioning
-        # Create a separate visual-text cross attention that's numerically stable
+        # Text processing components
+        self.text_dim = text_dim
+        from transformers import BertModel
+        self.text_embedder = BertModel.from_pretrained('bert-base-uncased').embeddings.word_embeddings
+        self.text_projection = nn.Linear(text_dim, input_dim)
+        self.text_norm = nn.LayerNorm(input_dim)
+        
+        # Cross-attention layers for text-visual interaction
         self.cross_attn_layers = nn.ModuleList([
-            StableCrossAttentionLayer(
+            nn.TransformerDecoderLayer(
                 d_model=input_dim,
-                nhead=num_heads, 
-                dropout=dropout
+                nhead=num_heads,
+                dim_feedforward=input_dim * 4,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True
             ) for _ in range(text_num_layers)
         ])
+        
+        # Final normalization and projection
+        self.final_norm = nn.LayerNorm(input_dim)
+        self.output_proj = nn.Linear(input_dim, output_dim)
+        
+    def _process_visual_features(self, x):
+        """Process visual features with convolutions and self-attention"""
+        batch_size = x.shape[0]
+        device = x.device
+        dtype = x.dtype
+        
+        # Apply convolutional frontend for lip features
+        x_conv = x.transpose(1, 2)  # [B, D, T]
+        # Ensure consistent dtype with convolutional layers
+        conv_dtype = next(self.visual_frontend.parameters()).dtype
+        if x_conv.dtype != conv_dtype:
+            x_conv = x_conv.to(dtype=conv_dtype)
+            
+        x_conv = self.visual_frontend(x_conv)
+        x_processed = x_conv.transpose(1, 2)  # [B, T, D]
+        
+        # Add positional information
+        seq_len = x_processed.size(1)
+        position = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1)
+        position = position.expand(batch_size, -1, x_processed.size(-1))
+        position = (0.1 * position / float(seq_len)).to(dtype=x_processed.dtype)
+        x_processed = x_processed + position
+        
+        # Prepare query tokens
+        query_tokens = self.query_tokens.expand(batch_size, -1, -1)
+        query_tokens = query_tokens.to(dtype=x_processed.dtype)
+        
+        # Concatenate query tokens with processed features
+        x_with_query = torch.cat([query_tokens, x_processed], dim=1)
+        
+        # Create attention mask for local window attention
+        query_len = query_tokens.size(1)
+        mask = torch.ones(query_len + seq_len, query_len + seq_len, 
+                         device=device, dtype=torch.bool)
+        
+        # Allow diagonal (self) attention
+        for i in range(query_len + seq_len):
+            mask[i, i] = False
+        
+        # Set local window attention for queries
+        local_window = self.window_size
+        for i in range(query_len):
+            region_start = max(0, (i * seq_len // query_len) - local_window)
+            region_end = min(seq_len, ((i + 1) * seq_len // query_len) + local_window)
+            for j in range(region_start, region_end):
+                mask[i, query_len + j] = False
+        
+        # Ensure transformer dtype consistency
+        transformer_dtype = next(self.visual_transformer.parameters()).dtype
+        if x_with_query.dtype != transformer_dtype:
+            x_with_query = x_with_query.to(dtype=transformer_dtype)
+            
+        # Process through transformer
+        output = self.visual_transformer(x_with_query, mask=mask)
+        
+        # Extract only query outputs
+        query_output = output[:, :query_len]
+        return query_output.to(dtype=dtype)  # Restore original dtype
+    
+    def _process_text_features(self, text_tokens, target_dtype, target_device):
+        """Process text tokens into embeddings with proper dtype handling"""
+        if text_tokens is None:
+            return None
+            
+        # Convert to long for embedding lookup
+        text_tokens_long = text_tokens.to(dtype=torch.long, device=target_device)
+        
+        # Get embeddings using BERT
+        with torch.no_grad():
+            text_embeddings = self.text_embedder(text_tokens_long)
+        
+        # Project to match visual dimensions
+        text_embeddings = text_embeddings.to(dtype=target_dtype)
+        text_features = self.text_projection(text_embeddings)
+        text_features = self.text_norm(text_features)
+        
+        return text_features
+    
+    def _get_attention_mask(self, text_mask, target_device):
+        """Convert text mask to attention mask format"""
+        if text_mask is None:
+            return None
+            
+        # Convert mask format: True for valid tokens → False for padding positions
+        # PyTorch attention: True = position to ignore
+        attention_mask = ~text_mask.bool()
+        return attention_mask.to(device=target_device)
     
     def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
         """
-        Forward pass for VisualSpeechTextQFormer, which enhances visual query features with text conditioning.
-        
-        Unlike the base VisualSpeechQFormer which ignores text input, this implementation actively uses 
-        the text tokens to disambiguate visually similar phonemes via cross-attention.
+        Forward pass for VisualSpeechTextQFormer with explicit dtype handling
         
         Args:
-            x: Visual/audio features [B, T, input_dim]
-            text_tokens: Text token ids [B, L, D] - actively used for cross-modal alignment
-            text_mask: Attention mask for text (True for valid tokens, False for padding)
+            x: Visual features [B, T, input_dim]
+            text_tokens: Text token ids [B, L]
+            text_mask: Attention mask for text (True for valid tokens)
             
         Returns:
             Text-enhanced projected features [B, num_queries, output_dim]
         """
+        # Store original dtype and device for consistency
+        orig_dtype = x.dtype
+        orig_device = x.device
+        
         try:
-            # First get visual query outputs using parent class implementation
-            # We override parent class forward but call it directly to avoid recursive loop
-            with torch.no_grad():
-                query_output = super().forward(x, None, None)
+            # First process visual features to get query embeddings
+            self.logger.info(f"Processing visual features with shape {x.shape}")
+            query_output = self._process_visual_features(x)
             
-            # If no text conditioning provided, just return the visual query outputs
+            # If no text conditioning provided, return visual-only output
             if text_tokens is None:
-                return query_output
+                self.logger.info("No text tokens provided, using visual features only")
+                query_output = self.final_norm(query_output) 
+                return self.output_proj(query_output)
                 
-            # Process text tokens through projection if needed
-            text_features = self.text_projection(text_tokens)
+            # Process text tokens to get conditioned embeddings
+            self.logger.info(f"Processing text tokens with shape {text_tokens.shape}")
+            text_features = self._process_text_features(
+                text_tokens, 
+                target_dtype=query_output.dtype,
+                target_device=query_output.device
+            )
             
-            # Apply cross-attention between queries and text
-            for layer in self.cross_attn_layers:
-                # More stable cross-attention with better precision handling
-                text_attention_mask = None if text_mask is None else ~text_mask.bool()
-                query_output = layer(
-                    query_output, 
-                    text_features,
-                    key_padding_mask=text_attention_mask
+            # Get proper attention mask for padding
+            text_attention_mask = self._get_attention_mask(text_mask, query_output.device)
+            
+            # Use cross-attention to enhance visual with text
+            enhanced_queries = query_output
+            for i, layer in enumerate(self.cross_attn_layers):
+                self.logger.info(f"Applying cross-attention layer {i+1}/{len(self.cross_attn_layers)}")
+                enhanced_queries = layer(
+                    enhanced_queries,                  # tgt (queries)
+                    text_features,                     # memory (text)
+                    memory_key_padding_mask=text_attention_mask
                 )
                 
-            return query_output
+            # Apply final normalization and projection
+            output = self.final_norm(enhanced_queries)
+            output = self.output_proj(output)
+            
+            # Convert back to original dtype if needed
+            if output.dtype != orig_dtype:
+                output = output.to(dtype=orig_dtype)
+                
+            return output
             
         except RuntimeError as e:
-            # Handle mixed precision error explicitly
-            if "cuda runtime error" in str(e).lower() or "nan" in str(e).lower() or "inf" in str(e).lower():
-                self.logger.warning(f"Mixed precision error in VisualSpeechTextQFormer: {e}")
-                # Fall back to float32 computation
-                with torch.cuda.amp.autocast(enabled=False):
-                    return self.forward(x.float(), 
-                                       None if text_tokens is None else text_tokens.float(), 
-                                       text_mask)
-            else:
-                raise e
+            self.logger.error(f"Error in VisualSpeechTextQFormer: {e}")
+            self.logger.error(f"Visual features: shape={x.shape}, dtype={x.dtype}")
+            if text_tokens is not None:
+                self.logger.error(f"Text tokens: shape={text_tokens.shape}, dtype={text_tokens.dtype}")
+                
+            # Provide specific diagnostics for identified errors
+            if "normalized_shape" in str(e):
+                self.logger.error("DIMENSION MISMATCH ERROR: LayerNorm dimension doesn't match input")
+                self.logger.error(f"Last layer norm dims: {self.final_norm.normalized_shape}")
+                if len(x.shape) >= 3:
+                    self.logger.error(f"Output dimension: {x.shape[-1]}")
+            elif "expected scalar type" in str(e) or "same dtype" in str(e):
+                self.logger.error("DTYPE MISMATCH ERROR: Tensors have inconsistent dtypes")
+                
+            # Re-raise the exception to prevent silent failure
+            raise
 
 
 class StableCrossAttentionLayer(nn.Module):
     """Cross-attention layer with improved numerical stability for mixed precision training"""
     def __init__(self, d_model, nhead, dropout=0.1):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=nhead,
+        # Use standard PyTorch components for stability
+        self.cross_attn_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
             dropout=dropout,
-            batch_first=True
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
         )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        
-        # FFN components
-        self.linear1 = nn.Linear(d_model, d_model * 4)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_model * 4, d_model)
-        
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # Activation with better numerical stability
-        self.activation = F.gelu
+        # For error logging
+        self.logger = logging.getLogger(__name__)
         
     def forward(self, x, kv, key_padding_mask=None):
-        """Forward pass with improved numerical stability
+        """Forward pass with explicit dtype handling
         
         Args:
             x: Query tensor [B, seq_len, dim]
@@ -1418,33 +1588,39 @@ class StableCrossAttentionLayer(nn.Module):
         Returns:
             Tensor [B, seq_len, dim]
         """
-        # Store original dtype
-        orig_dtype = x.dtype
-        
-        # Pre-LayerNorm for better numerical stability
-        x_norm = self.norm1(x)
-        kv_norm = self.norm1(kv)
-        
-        # Cross-attention
-        attn_output, _ = self.multihead_attn(
-            query=x_norm,
-            key=kv_norm,
-            value=kv_norm,
-            key_padding_mask=key_padding_mask,
-            need_weights=False
-        )
-        
-        # Residual connection with dropout
-        x = x + self.dropout1(attn_output)
-        
-        # FFN with pre-LayerNorm
-        x_norm = self.norm2(x)
-        
-        # FFN with residual
-        ff_output = self.linear2(self.dropout(self.activation(self.linear1(x_norm))))
-        x = x + self.dropout2(ff_output)
-        
-        return x
+        try:
+            # Ensure consistent dtypes
+            if kv.dtype != x.dtype:
+                kv = kv.to(dtype=x.dtype)
+                
+            # Use the transformer decoder layer (target = x, memory = kv)
+            return self.cross_attn_layer(
+                x,  # Target 
+                kv, # Memory
+                memory_key_padding_mask=key_padding_mask
+            )
+        except RuntimeError as e:
+            self.logger.warning(f"Error in StableCrossAttentionLayer: {e}")
+            self.logger.warning(f"x shape: {x.shape}, kv shape: {kv.shape}")
+            
+            # If we have a dimension mismatch, provide more debug info
+            if "normalized_shape" in str(e) or "expected input of size" in str(e):
+                self.logger.error(f"Dimension mismatch: x.size(-1)={x.size(-1)}, kv.size(-1)={kv.size(-1)}")
+                
+                # Try to convert dimensions to match (fallback option)
+                if x.size(-1) != kv.size(-1):
+                    self.logger.warning(f"Attempting dimension correction")
+                    # Use a temporary linear projection as a fallback
+                    temp_proj = nn.Linear(kv.size(-1), x.size(-1), device=x.device)
+                    kv_projected = temp_proj(kv)
+                    return self.cross_attn_layer(
+                        x,
+                        kv_projected,
+                        memory_key_padding_mask=key_padding_mask
+                    )
+            
+            # Re-raise the exception if we couldn't handle it
+            raise e
 
 
 def get_projector(projector_name, input_dim, output_dim, **kwargs):

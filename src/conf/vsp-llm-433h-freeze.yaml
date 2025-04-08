@@ -11,7 +11,7 @@ common:
 checkpoint:
   save_interval: 1
   keep_interval_updates: 1
-  save_interval_updates: 500
+  save_interval_updates: 2500
   no_epoch_checkpoints: true
   best_checkpoint_metric: accuracy
   maximize_best_checkpoint_metric: true
@@ -53,7 +53,7 @@ criterion:
   label_smoothing: 0.1
 
 optimization:
-  max_update: 50000
+  max_update: 30000
   lr: [0.0005]
   sentence_avg: true
   update_freq: [8]

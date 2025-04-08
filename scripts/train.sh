@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/TEST_NOCTC_Scratch_Encoder1   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Non_CTC_L2_blip2qformer   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -44,7 +44,7 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # -------------------------------------------------------------
 
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
-PROJECTOR_TYPE="linear"
+PROJECTOR_TYPE="visual_speech_qformer"
 
 # CTC configuration
 USE_CTC="false"  # Set to "true" to enable CTC loss

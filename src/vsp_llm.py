@@ -512,7 +512,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             
             # Add text_tokens parameter if it exists in the signature
             if "text_tokens" in forward_params:
-                projector_args["text_tokens"] = labels_embedding_matched
+                projector_args["text_tokens"] = labels  # Pass raw token IDs for BLIP2 and Comprehensive QFormer
+                # Log for debugging - remove later
+                logger.info(f"Passing text_tokens to {self.cfg.projector_type} projector: shape={labels.shape}, dtype={labels.dtype}")
                 
             # Add text_mask parameter if it exists in the signature
             if "text_mask" in forward_params:
@@ -521,7 +523,22 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             # For QFormer-specific implementations that use text_embeddings instead of text_tokens
             if "text_embeddings" in forward_params and "text_tokens" not in forward_params:
                 projector_args["text_embeddings"] = labels_embedding_matched
+                # Log for debugging - remove later
+                logger.info(f"Passing text_embeddings to {self.cfg.projector_type} projector: shape={labels_embedding_matched.shape}, dtype={labels_embedding_matched.dtype}")
+
+            # Special handling for visual_speech_text_qformer
+            if self.cfg.projector_type.lower() == "visual_speech_text_qformer":
+                logger.info(f"Using visual_speech_text_qformer with text input")
+                # Ensure we're explicitly handling text tokens
+                if "text_tokens" not in projector_args:
+                    projector_args["text_tokens"] = labels
+                if "text_mask" not in projector_args:
+                    # Create attention mask (1 for real tokens, 0 for padding)
+                    projector_args["text_mask"] = (labels != 0)
                 
+                # Log some diagnostic information
+                logger.info(f"Text tokens shape: {labels.shape}, device: {labels.device}, dtype: {labels.dtype}")
+
             # Pass the appropriate parameters to the projector
             output['encoder_out'] = self.avfeat_to_llm(**projector_args)
         else:
@@ -1236,7 +1253,9 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             
             # Add text_tokens parameter if it exists in the signature
             if "text_tokens" in forward_params:
-                projector_args["text_tokens"] = labels_embedding_matched
+                projector_args["text_tokens"] = labels  # Pass raw token IDs for BLIP2 and Comprehensive QFormer
+                # Log for debugging - remove later
+                logger.info(f"Passing text_tokens to {self.cfg.projector_type} projector: shape={labels.shape}, dtype={labels.dtype}")
                 
             # Add text_mask parameter if it exists in the signature
             if "text_mask" in forward_params:
@@ -1245,7 +1264,22 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             # For QFormer-specific implementations that use text_embeddings instead of text_tokens
             if "text_embeddings" in forward_params and "text_tokens" not in forward_params:
                 projector_args["text_embeddings"] = labels_embedding_matched
+                # Log for debugging - remove later
+                logger.info(f"Passing text_embeddings to {self.cfg.projector_type} projector: shape={labels_embedding_matched.shape}, dtype={labels_embedding_matched.dtype}")
+
+            # Special handling for visual_speech_text_qformer
+            if self.cfg.projector_type.lower() == "visual_speech_text_qformer":
+                logger.info(f"Using visual_speech_text_qformer with text input")
+                # Ensure we're explicitly handling text tokens
+                if "text_tokens" not in projector_args:
+                    projector_args["text_tokens"] = labels
+                if "text_mask" not in projector_args:
+                    # Create attention mask (1 for real tokens, 0 for padding)
+                    projector_args["text_mask"] = (labels != 0)
                 
+                # Log some diagnostic information
+                logger.info(f"Text tokens shape: {labels.shape}, device: {labels.device}, dtype: {labels.dtype}")
+
             # Pass the appropriate parameters to the projector
             output['encoder_out'] = self.avfeat_to_llm(**projector_args)
         else:
