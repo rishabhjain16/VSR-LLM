@@ -277,7 +277,13 @@ def _main(cfg, output_file):
             
             try:
                 ctc_log_probs = model.get_ctc_emissions(output, model.cfg.ctc_feature_source)
-                ctc_decoded = model.decode_ctc(ctc_log_probs.transpose(0, 1))
+                
+                # Make sure tensor is in [T, B, V] format for CTC decoding
+                if ctc_log_probs.dim() == 3 and ctc_log_probs.size(0) != output['encoder_out'].size(1):
+                    # Transpose if necessary [B, T, V] -> [T, B, V]
+                    ctc_log_probs = ctc_log_probs.transpose(0, 1)
+                
+                ctc_decoded = model.decode_ctc(ctc_log_probs)
                 
                 # Simply report number of CTC outputs
                 logger.info(f"CTC decoding: {len(ctc_decoded)} outputs")

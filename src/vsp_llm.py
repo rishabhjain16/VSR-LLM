@@ -536,8 +536,18 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                     # Create attention mask (1 for real tokens, 0 for padding)
                     projector_args["text_mask"] = (labels != 0)
                 
-                # Log some diagnostic information
-                logger.info(f"Text tokens shape: {labels.shape}, device: {labels.device}, dtype: {labels.dtype}")
+                # Log some diagnostic information about CTC targets
+                if self.batch_counter % 20 == 0:
+                    non_zero_targets = (labels != 0).sum().item()
+                    total_targets = labels.size(0)
+                    logger.info(f"CTC target stats: {non_zero_targets}/{total_targets} sequences have non-zero length")
+                    logger.info(f"CTC input_lengths: min={labels.min().item()}, max={labels.max().item()}")
+                    logger.info(f"CTC target_lengths: min={labels.min().item()}, max={labels.max().item()}")
+                    
+                    # Check if we have invalid CTC constraints (input shorter than target)
+                    invalid_lens = (labels == 0).sum().item()
+                    if invalid_lens > 0:
+                        logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
 
             # Pass the appropriate parameters to the projector
             output['encoder_out'] = self.avfeat_to_llm(**projector_args)
@@ -623,33 +633,38 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 # Use raw encoder output for CTC
                 ctc_features = raw_encoder_out.clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
-                ctc_logits = self.ctc_head_encoder(ctc_features_matched)
                 
-                # Get input lengths from encoder output
-                if 'padding_mask' in output and output['padding_mask'] is not None:
-                    input_lengths = (~output['padding_mask']).long().sum(-1)
-                else:
-                    input_lengths = torch.full((raw_encoder_out.size(0),), 
-                                            raw_encoder_out.size(1),
-                                            device=raw_encoder_out.device,
-                                            dtype=torch.long)
+                # Apply dropout for regularization during training (if in training mode)
+                if self.training:
+                    ctc_features_matched = F.dropout(ctc_features_matched, p=0.1, training=self.training)
+                    
+                ctc_logits = self.ctc_head_encoder(ctc_features_matched)
             else:
                 # Use projector output for CTC
                 ctc_features = output['encoder_out'].clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_projector.weight.dtype)
-                ctc_logits = self.ctc_head_projector(ctc_features_matched)
                 
-                # Get input lengths from projector output
-                if 'padding_mask' in output and output['padding_mask'] is not None:
-                    input_lengths = (~output['padding_mask']).long().sum(-1)
-                else:
-                    input_lengths = torch.full((ctc_features.size(0),), 
-                                            ctc_features.size(1),
-                                            device=ctc_features.device,
-                                            dtype=torch.long)
+                # Apply dropout for regularization during training (if in training mode)
+                if self.training:
+                    ctc_features_matched = F.dropout(ctc_features_matched, p=0.1, training=self.training)
+                    
+                ctc_logits = self.ctc_head_projector(ctc_features_matched)
             
-            # Apply log softmax to CTC logits
-            log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # [T, B, V]
+            # Apply temperature scaling to make distributions less peaked (especially during inference)
+            temperature = 1.5 if not self.training else 1.0
+            ctc_logits = ctc_logits / temperature
+            
+            # Apply log softmax
+            ctc_log_probs = F.log_softmax(ctc_logits, dim=-1)
+            
+            # Get input lengths from encoder output
+            if 'padding_mask' in output and output['padding_mask'] is not None:
+                input_lengths = (~output['padding_mask']).long().sum(-1)
+            else:
+                input_lengths = torch.full((ctc_features.size(0),), 
+                                        ctc_features.size(1),
+                                        device=ctc_features.device,
+                                        dtype=torch.long)
             
             # Convert word-level targets to character-level tokens for CTC
             ctc_tokens, ctc_lengths = self.get_ctc_targets_from_llm_batch(kwargs)
@@ -670,17 +685,17 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             # Calculate CTC loss
             try:
                 # Check for empty targets or input
-                if (ctc_lengths == 0).all() or (input_lengths == 0).all():
+                if (ctc_lengths == 0).all() or (ctc_lengths == 0).all():
                     logger.warning(f"Empty CTC targets or inputs detected - CTC loss will be ignored")
                     ctc_loss = torch.tensor(0.0, device=lm_loss.device, dtype=lm_loss.dtype)
                 else:
                     # CTC needs float32 for loss calculation
-                    log_probs_float = log_probs.float()
+                    log_probs_float = ctc_log_probs.float()
                     ctc_loss = F.ctc_loss(
                         log_probs_float,
                         ctc_tokens,
-                        input_lengths,
                         ctc_lengths,
+                        input_lengths,
                         blank=self.ctc_blank_idx,
                         reduction="mean",
                         zero_infinity=True,
@@ -695,7 +710,7 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             
             except RuntimeError as e:
                 logger.error(f"Error in CTC loss calculation: {str(e)}")
-                logger.error(f"Shapes - log_probs: {log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
+                logger.error(f"Shapes - log_probs: {ctc_log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
                 logger.error(f"Lengths - input: {input_lengths}, target: {ctc_lengths}")
                 # Fall back to just LM loss if CTC fails
                 total_loss = lm_loss
@@ -708,16 +723,31 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         if feature_source == "encoder":
             ctc_features = output['encoder_out'].clone()
             ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
+            
+            # Apply dropout for regularization during training (if in training mode)
+            if self.training:
+                ctc_features_matched = F.dropout(ctc_features_matched, p=0.1, training=self.training)
+                
             ctc_logits = self.ctc_head_encoder(ctc_features_matched)
         else:
             # For projector source, we need to apply the projector first
             # Get the projector output
             proj_output = self.avfeat_to_llm(output['encoder_out'])
             ctc_features_matched = proj_output.to(dtype=self.ctc_head_projector.weight.dtype)
+            
+            # Apply dropout for regularization during training (if in training mode)
+            if self.training:
+                ctc_features_matched = F.dropout(ctc_features_matched, p=0.1, training=self.training)
+                
             ctc_logits = self.ctc_head_projector(ctc_features_matched)
+        
+        # Apply temperature scaling to make distributions less peaked (especially during inference)
+        temperature = 1.5 if not self.training else 1.0
+        ctc_logits = ctc_logits / temperature
         
         # Apply log softmax
         ctc_log_probs = F.log_softmax(ctc_logits, dim=-1)
+        
         return ctc_log_probs
 
     @torch.no_grad()
@@ -1019,34 +1049,39 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             else:
                 seq_log_probs = log_probs[:, b]
             
-            # Initialize beam
-            beam = [([], 0.0)]  # (prefix, score)
+            # Collapse repeated tokens and remove blanks
+            # First get greedy predictions for each timestep
+            pred_tokens = seq_log_probs.argmax(dim=-1).tolist()
             
-            # Beam search
-            for t in range(seq_log_probs.size(0)):
-                new_beam = []
-                for prefix, score in beam:
-                    # Get top k tokens at current timestep
-                    top_k_log_probs, top_k_indices = seq_log_probs[t].topk(beam_size)
-                    
-                    for log_prob, token in zip(top_k_log_probs, top_k_indices):
-                        # Skip blank token
-                        if token == self.ctc_blank_idx:
-                            new_beam.append((prefix, score + log_prob))
-                            continue
-                        
-                        # Add new token (removed repeated token check)
-                        new_prefix = prefix + [token]
-                        new_beam.append((new_prefix, score + log_prob))
-                
-                # Keep top beam_size candidates
-                beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:beam_size]
+            # Apply CTC decoding rules: collapse repeats and remove blanks
+            decoded_tokens = []
+            prev_token = -1  # Different from any token
+            for token in pred_tokens:
+                # Skip blanks
+                if token == self.ctc_blank_idx:
+                    continue
+                # Skip repeats (unless separated by blank, which we've removed)
+                if token != prev_token:
+                    decoded_tokens.append(token)
+                    prev_token = token
             
-            # Get best path
-            best_prefix, _ = max(beam, key=lambda x: x[1])
+            # If we have no tokens after removing blanks, check if we have any non-blank predictions
+            if len(decoded_tokens) == 0:
+                # Find positions of non-blank predictions with highest probability
+                for t in range(seq_log_probs.size(0)):
+                    probs = torch.exp(seq_log_probs[t])
+                    max_val, max_idx = probs.max(0)
+                    # If there's a reasonable non-blank prediction, use it
+                    if max_idx != self.ctc_blank_idx and max_val > 0.1:
+                        decoded_tokens.append(max_idx.item())
             
-            # Convert tokens to text
-            text = ''.join([self.ctc_vocab[t] for t in best_prefix])
+            # If still empty, use a placeholder
+            if len(decoded_tokens) == 0:
+                text = " "  # Empty space instead of "blank" to be less intrusive
+            else:
+                # Convert tokens to text
+                text = ''.join([self.ctc_vocab[t] for t in decoded_tokens])
+            
             decoded_seqs.append(text)
         
         return decoded_seqs
@@ -1169,11 +1204,17 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         self.ctc_head_encoder = nn.Linear(encoder_dim, self.ctc_vocab_size)
         self.ctc_head_projector = nn.Linear(projector_out_dim, self.ctc_vocab_size)
         
-        # Initialize the projection layers
-        nn.init.xavier_normal_(self.ctc_head_encoder.weight)
+        # Initialize the projection layers with a special bias for non-blank tokens
+        # This helps avoid the model getting stuck predicting all blanks
+        nn.init.xavier_normal_(self.ctc_head_encoder.weight, gain=0.1)
         nn.init.zeros_(self.ctc_head_encoder.bias)
-        nn.init.xavier_normal_(self.ctc_head_projector.weight)
+        # Set a negative bias for the blank token to make other tokens more likely initially
+        self.ctc_head_encoder.bias.data[self.ctc_blank_idx] = -2.0
+        
+        nn.init.xavier_normal_(self.ctc_head_projector.weight, gain=0.1)
         nn.init.zeros_(self.ctc_head_projector.bias)
+        # Set a negative bias for the blank token to make other tokens more likely initially
+        self.ctc_head_projector.bias.data[self.ctc_blank_idx] = -2.0
         
         # Log CTC configuration
         logger.info(f"==========================================================")
@@ -1277,8 +1318,18 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                     # Create attention mask (1 for real tokens, 0 for padding)
                     projector_args["text_mask"] = (labels != 0)
                 
-                # Log some diagnostic information
-                logger.info(f"Text tokens shape: {labels.shape}, device: {labels.device}, dtype: {labels.dtype}")
+                # Log some diagnostic information about CTC targets
+                if self.batch_counter % 20 == 0:
+                    non_zero_targets = (labels != 0).sum().item()
+                    total_targets = labels.size(0)
+                    logger.info(f"CTC target stats: {non_zero_targets}/{total_targets} sequences have non-zero length")
+                    logger.info(f"CTC input_lengths: min={labels.min().item()}, max={labels.max().item()}")
+                    logger.info(f"CTC target_lengths: min={labels.min().item()}, max={labels.max().item()}")
+                    
+                    # Check if we have invalid CTC constraints (input shorter than target)
+                    invalid_lens = (labels == 0).sum().item()
+                    if invalid_lens > 0:
+                        logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
 
             # Pass the appropriate parameters to the projector
             output['encoder_out'] = self.avfeat_to_llm(**projector_args)
@@ -1364,33 +1415,38 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                 # Use raw encoder output for CTC
                 ctc_features = raw_encoder_out.clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_encoder.weight.dtype)
-                ctc_logits = self.ctc_head_encoder(ctc_features_matched)
                 
-                # Get input lengths from encoder output
-                if 'padding_mask' in output and output['padding_mask'] is not None:
-                    input_lengths = (~output['padding_mask']).long().sum(-1)
-                else:
-                    input_lengths = torch.full((raw_encoder_out.size(0),), 
-                                            raw_encoder_out.size(1),
-                                            device=raw_encoder_out.device,
-                                            dtype=torch.long)
+                # Apply dropout for regularization during training (if in training mode)
+                if self.training:
+                    ctc_features_matched = F.dropout(ctc_features_matched, p=0.1, training=self.training)
+                    
+                ctc_logits = self.ctc_head_encoder(ctc_features_matched)
             else:
                 # Use projector output for CTC
                 ctc_features = output['encoder_out'].clone()
                 ctc_features_matched = ctc_features.to(dtype=self.ctc_head_projector.weight.dtype)
-                ctc_logits = self.ctc_head_projector(ctc_features_matched)
                 
-                # Get input lengths from projector output
-                if 'padding_mask' in output and output['padding_mask'] is not None:
-                    input_lengths = (~output['padding_mask']).long().sum(-1)
-                else:
-                    input_lengths = torch.full((ctc_features.size(0),), 
-                                            ctc_features.size(1),
-                                            device=ctc_features.device,
-                                            dtype=torch.long)
+                # Apply dropout for regularization during training (if in training mode)
+                if self.training:
+                    ctc_features_matched = F.dropout(ctc_features_matched, p=0.1, training=self.training)
+                    
+                ctc_logits = self.ctc_head_projector(ctc_features_matched)
             
-            # Apply log softmax to CTC logits
-            log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # [T, B, V]
+            # Apply temperature scaling to make distributions less peaked (especially during inference)
+            temperature = 1.5 if not self.training else 1.0
+            ctc_logits = ctc_logits / temperature
+            
+            # Apply log softmax
+            ctc_log_probs = F.log_softmax(ctc_logits, dim=-1)
+            
+            # Get input lengths from encoder output
+            if 'padding_mask' in output and output['padding_mask'] is not None:
+                input_lengths = (~output['padding_mask']).long().sum(-1)
+            else:
+                input_lengths = torch.full((ctc_features.size(0),), 
+                                        ctc_features.size(1),
+                                        device=ctc_features.device,
+                                        dtype=torch.long)
             
             # Convert word-level targets to character-level tokens for CTC
             ctc_tokens, ctc_lengths = self.get_ctc_targets_from_llm_batch(kwargs)
@@ -1411,17 +1467,17 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             # Calculate CTC loss
             try:
                 # Check for empty targets or input
-                if (ctc_lengths == 0).all() or (input_lengths == 0).all():
+                if (ctc_lengths == 0).all() or (ctc_lengths == 0).all():
                     logger.warning(f"Empty CTC targets or inputs detected - CTC loss will be ignored")
                     ctc_loss = torch.tensor(0.0, device=lm_loss.device, dtype=lm_loss.dtype)
                 else:
                     # CTC needs float32 for loss calculation
-                    log_probs_float = log_probs.float()
+                    log_probs_float = ctc_log_probs.float()
                     ctc_loss = F.ctc_loss(
                         log_probs_float,
                         ctc_tokens,
-                        input_lengths,
                         ctc_lengths,
+                        input_lengths,
                         blank=self.ctc_blank_idx,
                         reduction="mean",
                         zero_infinity=True,
@@ -1436,7 +1492,7 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
             
             except RuntimeError as e:
                 logger.error(f"Error in CTC loss calculation: {str(e)}")
-                logger.error(f"Shapes - log_probs: {log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
+                logger.error(f"Shapes - log_probs: {ctc_log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
                 logger.error(f"Lengths - input: {input_lengths}, target: {ctc_lengths}")
                 # Fall back to just LM loss if CTC fails
                 total_loss = lm_loss
