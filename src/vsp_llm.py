@@ -824,11 +824,9 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             text_tokens = kwargs['source']['text']
             
             # Add debug info about text tokens
-            logger.info(f"Generate - Text tokens shape: {text_tokens.shape}, non-zero tokens: {(text_tokens != 0).sum().item()}")
             
             # Create attention mask (1 for real tokens, 0 for padding)
             text_mask = (text_tokens != 0)
-            logger.info(f"Using instruction tokens in generate() mode (transcript tokens not available during inference)")
             
             # Get embeddings for the tokens
             if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):

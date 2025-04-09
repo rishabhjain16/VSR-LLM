@@ -140,3 +140,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     combine_datasets(args.lrs2, args.lrs3, args.output)
+
+#Usage: python combine_datasets.py   --lrs2 /home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2/   --lrs3 /home/rishabh/Desktop/Datasets/lrs3/433h_data   --output /home/rishabh/Desktop/Datasets/lrs_combined

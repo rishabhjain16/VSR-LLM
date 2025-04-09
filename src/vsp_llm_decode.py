@@ -43,6 +43,53 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from omegaconf import OmegaConf, MISSING
 import sacrebleu
 
+# Import BERTScore for semantic evaluation
+try:
+    from bert_score import score as bert_score
+    BERTSCORE_AVAILABLE = True
+except ImportError:
+    BERTSCORE_AVAILABLE = False
+    print("BERTScore not available. To enable, install: pip install bert-score")
+
+# Import Word Mover's Distance - simpler version without external dependencies
+try:
+    import gensim.downloader as api
+    from gensim.models import KeyedVectors
+    WMD_AVAILABLE = True
+    # Pre-download the model or use a cached version
+    wmd_model = None
+except ImportError:
+    WMD_AVAILABLE = False
+    print("Word Mover's Distance not available. To enable, install: pip install gensim")
+
+# Import METEOR Score
+try:
+    from nltk.translate.meteor_score import single_meteor_score
+    import nltk
+    nltk.download('wordnet', quiet=True)
+    METEOR_AVAILABLE = True
+except ImportError:
+    METEOR_AVAILABLE = False
+    print("METEOR score not available. To enable, install: pip install nltk")
+
+# Import for Semantic Embedding Distance
+try:
+    from sentence_transformers import SentenceTransformer
+    import torch.nn.functional as F
+    SEMANTIC_WER_AVAILABLE = True
+    semantic_model = None
+except ImportError:
+    SEMANTIC_WER_AVAILABLE = False
+    print("Semantic WER not available. To enable, install: pip install sentence-transformers")
+
+# Import ROUGE Score
+try:
+    from rouge_score import rouge_scorer
+    ROUGE_AVAILABLE = True
+except ImportError:
+    ROUGE_AVAILABLE = False
+    print("ROUGE score not available. To enable, install: pip install rouge-score")
+
 logging.root.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -77,6 +124,169 @@ class InferConfig(FairseqDataclass):
         },
     )
 
+# Function to calculate BERTScore
+def calculate_bertscore(hypos, refs, model_type="microsoft/deberta-xlarge-mnli"):
+    """
+    Calculate BERTScore for hypothesis and reference texts
+    Using state-of-the-art DeBERTa model for semantic similarity
+    """
+    if not BERTSCORE_AVAILABLE:
+        return {"precision": 0, "recall": 0, "f1": 0}
+    
+    try:
+        # Convert inputs to ensure they're strings
+        hypos = [str(h) for h in hypos]
+        refs = [str(r) for r in refs]
+        
+        # Use a simpler model for robustness
+        model_type = "roberta-base"  # More stable than DeBERTa for this use case
+        
+        # Use state-of-the-art model
+        P, R, F1 = bert_score(hypos, refs, lang="en", model_type=model_type, 
+                             rescale_with_baseline=True)
+        
+        # Return mean scores
+        return {
+            "precision": float(P.mean().item()),
+            "recall": float(R.mean().item()),
+            "f1": float(F1.mean().item())
+        }
+    except Exception as e:
+        logger.error(f"Error calculating BERTScore: {str(e)}")
+        return {"precision": 0, "recall": 0, "f1": 0}
+
+# Function to calculate Word Mover's Distance (WMD) - simplified version
+def calculate_wmd(hypo_str, ref_str):
+    """
+    Calculate word similarity between hypothesis and reference texts.
+    Uses Jaccard similarity (overlap/union) of word sets.
+    
+    Returns:
+        float: Similarity score (0-1, higher is better) or -1 if unavailable
+    """
+    global wmd_model
+    
+    if not WMD_AVAILABLE:
+        return -1
+    
+    try:
+        # Simple word overlap calculation as fallback
+        hypo_tokens = set(w.lower() for w in hypo_str.strip().split())
+        ref_tokens = set(w.lower() for w in ref_str.strip().split())
+        
+        # Jaccard similarity
+        if not hypo_tokens or not ref_tokens:
+            return 0
+            
+        overlap = len(hypo_tokens.intersection(ref_tokens))
+        union = len(hypo_tokens.union(ref_tokens))
+        
+        # Similarity score (0 to 1, higher is better)
+        similarity = overlap / union if union > 0 else 0
+        return similarity
+        
+    except Exception as e:
+        logger.error(f"Error calculating word similarity: {str(e)}")
+        return -1
+
+# Calculate METEOR score between hypothesis and reference
+def calculate_meteor(hypo_str, ref_str):
+    """
+    Calculate METEOR score between hypothesis and reference.
+    METEOR considers synonyms, stemming, and paraphrases.
+    
+    Returns:
+        float: METEOR score (0-1, higher is better)
+    """
+    if not METEOR_AVAILABLE:
+        return 0
+    
+    try:
+        # Check for empty strings
+        if not hypo_str.strip() or not ref_str.strip():
+            return 0
+            
+        # Calculate METEOR score
+        return single_meteor_score(ref_str.split(), hypo_str.split())
+    except Exception as e:
+        logger.error(f"Error calculating METEOR score: {str(e)}")
+        return 0
+
+# Calculate Word Error Rate with Semantic Embedding Distance
+def calculate_semantic_wer(hypo_str, ref_str):
+    """
+    Calculate Word Error Rate with Semantic Embedding Distance.
+    Uses sentence embeddings to calculate semantic similarity between words.
+    
+    Returns:
+        dict: Semantic WER score and similarity
+    """
+    global semantic_model
+    
+    if not SEMANTIC_WER_AVAILABLE:
+        return {"sem_wer": 100, "similarity": 0}
+    
+    try:
+        # Load model once for efficiency
+        if semantic_model is None:
+            logger.info("Loading sentence transformer model for semantic WER...")
+            semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')  # Better model for similarity
+            logger.info("Sentence transformer model loaded.")
+        
+        # Check for empty strings
+        if not hypo_str.strip() or not ref_str.strip():
+            return {"sem_wer": 100, "similarity": 0}
+        
+        # Get embeddings for whole sentences
+        hypo_emb = semantic_model.encode(hypo_str, convert_to_tensor=True)
+        ref_emb = semantic_model.encode(ref_str, convert_to_tensor=True)
+        
+        # Calculate cosine similarity between sentences
+        similarity = F.cosine_similarity(hypo_emb.unsqueeze(0), ref_emb.unsqueeze(0))[0].item()
+        
+        # Semantic WER: Lower is better, so we use (1 - similarity) * 100
+        # This scales from 0 (identical) to 100 (completely different)
+        sem_wer = (1 - similarity) * 100
+        
+        return {"sem_wer": sem_wer, "similarity": similarity}
+    except Exception as e:
+        logger.error(f"Error calculating semantic WER: {str(e)}")
+        return {"sem_wer": 100, "similarity": 0}
+
+# Function to calculate ROUGE scores
+def calculate_rouge(hypo_str, ref_str):
+    """
+    Calculate ROUGE scores between hypothesis and reference.
+    ROUGE measures overlap of n-grams, word sequences, and word pairs.
+    
+    Returns:
+        dict: ROUGE scores (precision, recall, f1) for ROUGE-1, ROUGE-2, and ROUGE-L
+    """
+    if not ROUGE_AVAILABLE:
+        return {"rouge1": 0, "rouge2": 0, "rougeL": 0}
+    
+    try:
+        # Check for empty strings
+        if not hypo_str.strip() or not ref_str.strip():
+            return {"rouge1": 0, "rouge2": 0, "rougeL": 0}
+        
+        # Initialize ROUGE scorer with desired metrics
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        
+        # Calculate ROUGE scores
+        scores = scorer.score(ref_str, hypo_str)
+        
+        # Extract F1 scores for simplicity
+        result = {
+            "rouge1": scores['rouge1'].fmeasure,
+            "rouge2": scores['rouge2'].fmeasure,
+            "rougeL": scores['rougeL'].fmeasure
+        }
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error calculating ROUGE score: {str(e)}")
+        return {"rouge1": 0, "rouge2": 0, "rougeL": 0}
 
 def main(cfg: DictConfig):
 
@@ -255,7 +465,6 @@ def _main(cfg, output_file):
     model = models[0]
     for sample_idx, sample in enumerate(progress):
         # Simple log message for each group of samples
-        logger.info(f"Processing video group {sample_idx + 1} ({len(sample['id'])} videos)")
         
         sample = utils.move_to_cuda(sample) if use_cuda else sample
         if "net_input" not in sample:
@@ -297,7 +506,7 @@ def _main(cfg, output_file):
                 ctc_decoded = []
         
         eos_token_id = tokenizer.convert_tokens_to_ids("Transcript:")
-        logger.info("Starting generation...")
+        
         
         # Temporarily disable CTC for generation to avoid double processing
         use_ctc_original = None
@@ -305,7 +514,6 @@ def _main(cfg, output_file):
             use_ctc_original = model.cfg.use_ctc
             model.cfg.use_ctc = False
             
-        logger.info(f"Generating LLM outputs for {len(sample['id'])} videos (beam={cfg.generation.beam})...")
         best_hypo = model.generate(
             target_list=sample["target"], 
             num_beams=cfg.generation.beam,
@@ -325,7 +533,7 @@ def _main(cfg, output_file):
         if use_ctc_original is not None:
             model.cfg.use_ctc = use_ctc_original
             
-        logger.info("LLM generation complete")
+        logger.info("--------------------------LLM generation complete----------------------------")
         
         import re
 
@@ -345,7 +553,6 @@ def _main(cfg, output_file):
         best_hypo = tokenizer.batch_decode(
                 best_hypo, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
-        logger.info(f"Decoded hypotheses: {best_hypo}")
         
         #best_hypo = [post_process(hyp) for hyp in best_hypo]
         #best_hypo = [clean_hyp_output(hyp) for hyp in best_hypo]
@@ -365,10 +572,97 @@ def _main(cfg, output_file):
             result_dict['instruction'].append(instruction)
             result_dict['hypo'].append(hypo_str)
             
-            # Calculate per-sample WER and CER
+            # Calculate per-sample metrics
             hypo_words, ref_words = hypo_str.strip().split(), ref_sent.strip().split()
             sample_wer = 100 * editdistance.eval(hypo_words, ref_words) / len(ref_words) if len(ref_words) > 0 else 0
             sample_cer = 100 * calculate_cer(hypo_str, ref_sent)
+
+            # Calculate per-sample BLEU score
+            try:
+                sample_bleu = sacrebleu.sentence_bleu(hypo_str, [ref_sent]).score
+                if 'bleu' not in result_dict:
+                    result_dict['bleu'] = []
+                result_dict['bleu'].append(sample_bleu)
+            except Exception as e:
+                logger.error(f"Error computing sample BLEU score: {str(e)}")
+                sample_bleu = 0
+            
+            # Calculate per-sample BERTScore
+            sample_bertscore_f1 = 0
+            if BERTSCORE_AVAILABLE:
+                try:
+                    # Only calculate BERTScore for non-empty outputs
+                    if len(hypo_str.strip()) > 0 and len(ref_sent.strip()) > 0:
+                        sample_bertscore = calculate_bertscore([hypo_str], [ref_sent])
+                        sample_bertscore_f1 = sample_bertscore['f1']
+                        
+                        # Store all BERTScore components
+                        for component in ['precision', 'recall', 'f1']:
+                            if f'bertscore_{component}' not in result_dict:
+                                result_dict[f'bertscore_{component}'] = []
+                            result_dict[f'bertscore_{component}'].append(sample_bertscore[component])
+                except Exception as e:
+                    logger.error(f"Error computing sample BERTScore: {str(e)}")
+            
+            # Calculate per-sample WordSim
+            sample_word_sim = 0
+            if WMD_AVAILABLE:
+                try:
+                    # Only calculate for non-empty outputs
+                    if len(hypo_str.strip()) > 0 and len(ref_sent.strip()) > 0:
+                        sample_word_sim = calculate_wmd(hypo_str, ref_sent)
+                        if 'word_sim' not in result_dict:
+                            result_dict['word_sim'] = []
+                        if sample_word_sim >= 0:
+                            result_dict['word_sim'].append(sample_word_sim)
+                except Exception as e:
+                    logger.error(f"Error computing word similarity: {str(e)}")
+            
+            # Calculate per-sample METEOR score
+            sample_meteor = 0
+            if METEOR_AVAILABLE:
+                try:
+                    sample_meteor = calculate_meteor(hypo_str, ref_sent)
+                    if 'meteor' not in result_dict:
+                        result_dict['meteor'] = []
+                    result_dict['meteor'].append(sample_meteor)
+                except Exception as e:
+                    logger.error(f"Error computing METEOR score: {str(e)}")
+            
+            # Calculate per-sample ROUGE scores
+            sample_rouge_scores = {"rouge1": 0, "rouge2": 0, "rougeL": 0}
+            if ROUGE_AVAILABLE:
+                try:
+                    # Only calculate for non-empty outputs
+                    if len(hypo_str.strip()) > 0 and len(ref_sent.strip()) > 0:
+                        sample_rouge_scores = calculate_rouge(hypo_str, ref_sent)
+                        
+                        # Store ROUGE scores
+                        for rouge_type in ['rouge1', 'rouge2', 'rougeL']:
+                            if rouge_type not in result_dict:
+                                result_dict[rouge_type] = []
+                            result_dict[rouge_type].append(sample_rouge_scores[rouge_type])
+                except Exception as e:
+                    logger.error(f"Error computing ROUGE scores: {str(e)}")
+            
+            # Calculate per-sample Semantic WER
+            sample_sem_wer = 100
+            sample_sem_sim = 0
+            if SEMANTIC_WER_AVAILABLE:
+                try:
+                    sem_result = calculate_semantic_wer(hypo_str, ref_sent)
+                    sample_sem_wer = sem_result['sem_wer']
+                    sample_sem_sim = sem_result['similarity']
+                    
+                    if 'sem_wer' not in result_dict:
+                        result_dict['sem_wer'] = []
+                    if 'sem_sim' not in result_dict:
+                        result_dict['sem_sim'] = []
+                        
+                    result_dict['sem_wer'].append(sample_sem_wer)
+                    result_dict['sem_sim'].append(sample_sem_sim)
+                except Exception as e:
+                    logger.error(f"Error computing Semantic WER: {str(e)}")
             
             # Calculate CTC WER if available
             if hasattr(model, 'cfg') and model.cfg.use_ctc and i < len(ctc_decoded):
@@ -398,10 +692,33 @@ def _main(cfg, output_file):
             result_dict['cer'].append(sample_cer)
             
             # Log with metrics included
-            log_msg = f"VIDEO {sample_idx + 1}.{i + 1} (ID: {sample['utt_id'][i]})"
-            log_msg += f"\n  REF: {ref_sent}"
+            log_msg = f"\n  REF: {ref_sent}"
             log_msg += f"\n  LLM: {hypo_str}"
             log_msg += f"\n  LLM WER: {sample_wer:.1f}%  CER: {sample_cer:.1f}%"
+            
+            # Add semantic metrics to log if available
+            semantic_metrics = []
+            if BERTSCORE_AVAILABLE and sample_bertscore_f1 > 0:
+                # Include precision and recall along with F1
+                if 'bertscore_precision' in result_dict and 'bertscore_recall' in result_dict:
+                    sample_precision = result_dict['bertscore_precision'][-1]
+                    sample_recall = result_dict['bertscore_recall'][-1]
+                    semantic_metrics.append(f"BERTScore: P={sample_precision:.4f}, R={sample_recall:.4f}, F1={sample_bertscore_f1:.4f}")
+                else:
+                    semantic_metrics.append(f"BERTScore: {sample_bertscore_f1:.4f}")
+            if WMD_AVAILABLE and sample_word_sim > 0:
+                semantic_metrics.append(f"WordSim: {sample_word_sim:.4f} (word overlap)")
+            if METEOR_AVAILABLE and sample_meteor > 0:
+                semantic_metrics.append(f"METEOR: {sample_meteor:.4f}")
+            if ROUGE_AVAILABLE and sample_rouge_scores["rougeL"] > 0:
+                semantic_metrics.append(f"ROUGE-L: {sample_rouge_scores['rougeL']:.4f}")
+            if SEMANTIC_WER_AVAILABLE and sample_sem_sim > 0:
+                semantic_metrics.append(f"SemWER: {sample_sem_wer:.1f}% (sim={sample_sem_sim:.4f})")
+            if sample_bleu > 0:
+                semantic_metrics.append(f"BLEU: {sample_bleu:.2f}")
+            
+            if semantic_metrics:
+                log_msg += f"  ({', '.join(semantic_metrics)})"
             
             if hasattr(model, 'cfg') and model.cfg.use_ctc and i < len(ctc_decoded):
                 log_msg += f"\n  CTC: {ctc_hypo}"
@@ -442,6 +759,51 @@ def _main(cfg, output_file):
         else:
             logger.info("No CTC WER data available")
         
+        # Calculate overall BERTScore if available
+        bertscore_avg = 0
+        if 'bertscore_f1' in result_dict and len(result_dict['bertscore_f1']) > 0:
+            bertscore_avg = sum(result_dict['bertscore_f1']) / len(result_dict['bertscore_f1'])
+            logger.info(f"Average BERTScore F1: {bertscore_avg:.4f}")
+        
+        # Calculate overall word similarity if available
+        word_sim_avg = -1
+        if 'word_sim' in result_dict and len(result_dict['word_sim']) > 0:
+            word_sim_avg = sum(result_dict['word_sim']) / len(result_dict['word_sim'])
+            logger.info(f"Average word similarity: {word_sim_avg:.4f}")
+        
+        # Calculate overall METEOR score if available
+        meteor_avg = 0
+        if 'meteor' in result_dict and len(result_dict['meteor']) > 0:
+            meteor_avg = sum(result_dict['meteor']) / len(result_dict['meteor'])
+            logger.info(f"Average METEOR score: {meteor_avg:.4f}")
+        
+        # Calculate overall ROUGE scores if available
+        rouge_avgs = {"rouge1": 0, "rouge2": 0, "rougeL": 0}
+        if ROUGE_AVAILABLE:
+            for rouge_type in ['rouge1', 'rouge2', 'rougeL']:
+                if rouge_type in result_dict and len(result_dict[rouge_type]) > 0:
+                    rouge_avgs[rouge_type] = sum(result_dict[rouge_type]) / len(result_dict[rouge_type])
+                    logger.info(f"Average {rouge_type.upper()} score: {rouge_avgs[rouge_type]:.4f}")
+        
+        # Calculate overall Semantic WER if available
+        sem_wer_avg = 0
+        sem_sim_avg = 0
+        if 'sem_wer' in result_dict and len(result_dict['sem_wer']) > 0:
+            sem_wer_avg = sum(result_dict['sem_wer']) / len(result_dict['sem_wer'])
+            sem_sim_avg = sum(result_dict['sem_sim']) / len(result_dict['sem_sim'])
+            logger.info(f"Average Semantic WER: {sem_wer_avg:.2f}% (similarity={sem_sim_avg:.4f})")
+        
+        # Calculate overall BLEU score
+        bleu_avg = 0
+        if 'bleu' in result_dict and len(result_dict['bleu']) > 0:
+            bleu_avg = sum(result_dict['bleu']) / len(result_dict['bleu'])
+            logger.info(f"Average BLEU score: {bleu_avg:.2f}")
+        
+        # Always calculate corpus BLEU score directly
+        corpus_bleu = sacrebleu.corpus_bleu(result_dict['hypo'], [result_dict['ref']])
+        corpus_bleu_score = corpus_bleu.score
+        logger.info(f"Corpus BLEU score: {corpus_bleu_score:.2f}")
+        
         # Write results to file
         wer_fn = f"{cfg.common_eval.results_path}/wer.{fid}"
         with open(wer_fn, "w") as fo:
@@ -449,22 +811,103 @@ def _main(cfg, output_file):
             fo.write(f"CER: {cer:.2f}%\n")
             if 'ctc_wer' in result_dict and len(result_dict['ctc_wer']) > 0:
                 fo.write(f"CTC WER: {ctc_wer:.2f}%\n")
+            
+            # Add average BERTScore from per-sample calculations
+            if bertscore_avg > 0:
+                fo.write(f"Average BERTScore F1: {bertscore_avg:.4f}\n")
+            
+            # Add average word similarity from per-sample calculations
+            if word_sim_avg >= 0:
+                fo.write(f"Average word similarity: {word_sim_avg:.4f}\n")
+            
+            # Add average METEOR score from per-sample calculations
+            if meteor_avg > 0:
+                fo.write(f"Average METEOR score: {meteor_avg:.4f}\n")
+            
+            # Add average ROUGE scores from per-sample calculations
+            if ROUGE_AVAILABLE:
+                if rouge_avgs['rouge1'] > 0:
+                    fo.write(f"Average ROUGE-1 score: {rouge_avgs['rouge1']:.4f}\n")
+                if rouge_avgs['rouge2'] > 0:
+                    fo.write(f"Average ROUGE-2 score: {rouge_avgs['rouge2']:.4f}\n")
+                if rouge_avgs['rougeL'] > 0:
+                    fo.write(f"Average ROUGE-L score: {rouge_avgs['rougeL']:.4f}\n")
+            
+            # Add average Semantic WER from per-sample calculations
+            if sem_wer_avg > 0:
+                fo.write(f"Average Semantic WER: {sem_wer_avg:.2f}%\n")
+                fo.write(f"Average Semantic Similarity: {sem_sim_avg:.4f}\n")
+            
+            # Add BLEU scores
+            if bleu_avg > 0:
+                fo.write(f"Average sentence BLEU score: {bleu_avg:.2f}\n")
+            fo.write(f"Corpus BLEU score: {corpus_bleu_score:.2f}\n")
+            
             fo.write(f"WER err / num_ref_words = {n_err} / {n_total}\n")
             fo.write(f"CER err / num_ref_chars = {n_char_err} / {n_char_total}\n\n")
+            
+            # Calculate and report BERTScore if available
+            if BERTSCORE_AVAILABLE:
+                try:
+                    # Calculate corpus-level BERTScore only if we have the per-sample scores
+                    if 'bertscore_f1' in result_dict and len(result_dict['bertscore_f1']) > 0:
+                        # Use the average of per-sample scores which is more reliable
+                        bertscore_precision = sum(result_dict.get('bertscore_precision', [0])) / len(result_dict['bertscore_f1']) if 'bertscore_precision' in result_dict else 0
+                        bertscore_recall = sum(result_dict.get('bertscore_recall', [0])) / len(result_dict['bertscore_f1']) if 'bertscore_recall' in result_dict else 0
+                        bertscore_f1 = sum(result_dict['bertscore_f1']) / len(result_dict['bertscore_f1'])
+                        
+                        fo.write(f"BERTScore Precision: {bertscore_precision:.4f}\n")
+                        fo.write(f"BERTScore Recall: {bertscore_recall:.4f}\n")
+                        fo.write(f"BERTScore F1: {bertscore_f1:.4f}\n\n")
+                        logger.info(f"BERTScore: P={bertscore_precision:.4f}, R={bertscore_recall:.4f}, F1={bertscore_f1:.4f} (semantic similarity)")
+                except Exception as e:
+                    logger.error(f"Error computing corpus BERTScore: {str(e)}")
+            
             fo.write(f"{yaml_str}")
             
-        # Log overall metrics
+        # Log overall metrics with more details
         logger.info(f"WER: {wer:.2f}%")
         logger.info(f"CER: {cer:.2f}%")
+        
+        # More descriptive BERTScore logging
+        if 'bertscore_f1' in result_dict and len(result_dict['bertscore_f1']) > 0:
+            bertscore_precision = sum(result_dict.get('bertscore_precision', [0])) / len(result_dict['bertscore_f1']) if 'bertscore_precision' in result_dict else 0
+            bertscore_recall = sum(result_dict.get('bertscore_recall', [0])) / len(result_dict['bertscore_f1']) if 'bertscore_recall' in result_dict else 0
+            bertscore_f1 = sum(result_dict['bertscore_f1']) / len(result_dict['bertscore_f1'])
+            logger.info(f"BERTScore: P={bertscore_precision:.4f}, R={bertscore_recall:.4f}, F1={bertscore_f1:.4f} (semantic similarity)")
+        
+        # More descriptive WordSim logging
+        if 'word_sim' in result_dict and len(result_dict['word_sim']) > 0:
+            word_sim_avg = sum(result_dict['word_sim']) / len(result_dict['word_sim'])
+            logger.info(f"WordSim: {word_sim_avg:.4f} (proportion of shared words)")
+        
+        # METEOR score logging
+        if 'meteor' in result_dict and len(result_dict['meteor']) > 0:
+            meteor_avg = sum(result_dict['meteor']) / len(result_dict['meteor'])
+            logger.info(f"METEOR: {meteor_avg:.4f} (considers synonyms and paraphrases)")
+        
+        # ROUGE score logging
+        if ROUGE_AVAILABLE:
+            if 'rougeL' in result_dict and len(result_dict['rougeL']) > 0:
+                rougeL_avg = sum(result_dict['rougeL']) / len(result_dict['rougeL'])
+                logger.info(f"ROUGE-L: {rougeL_avg:.4f} (longest common subsequence)")
+        
+        # Semantic WER logging
+        if 'sem_wer' in result_dict and len(result_dict['sem_wer']) > 0:
+            sem_wer_avg = sum(result_dict['sem_wer']) / len(result_dict['sem_wer'])
+            sem_sim_avg = sum(result_dict['sem_sim']) / len(result_dict['sem_sim'])
+            logger.info(f"Semantic WER: {sem_wer_avg:.2f}% (similarity={sem_sim_avg:.4f})")
+        
         logger.info("Tokenizer name: %s", getattr(tokenizer, "name_or_path", "Unknown"))
     else:
-        bleu = sacrebleu.corpus_bleu(result_dict['hypo'], [result_dict['ref']])
-        bleu_score = bleu.score
+        # BLEU score is already calculated in the main metrics section above
+        # Just write to the dedicated BLEU file for compatibility
         bleu_fn = f"{cfg.common_eval.results_path}/bleu.{fid}"
         with open(bleu_fn, "w") as fo:
-            fo.write(f"BLEU: {bleu_score}\n")
+            fo.write(f"BLEU: {corpus_bleu_score:.2f}\n")
+            if bleu_avg > 0:
+                fo.write(f"Average sentence BLEU: {bleu_avg:.2f}\n")
             fo.write(f"{yaml_str}")
-        logger.info(f"BLEU: {bleu_score}\n")
     return
 
 
