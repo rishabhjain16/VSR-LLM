@@ -7,7 +7,7 @@
 
 
 # set variables
-DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data    # path to train dataset dir
+DATA_PATH=/home/rishabh/Desktop/Datasets/lrs_combined   # path to train dataset dir
 
 OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Non_CTC_L2_blip2qformer   # output path to save
 
@@ -44,10 +44,10 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # -------------------------------------------------------------
 
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
-PROJECTOR_TYPE="comprehensive_qformer"
+PROJECTOR_TYPE="linear"
 
 # CTC configuration
-USE_CTC="true"  # Set to "true" to enable CTC loss
+USE_CTC="false"  # Set to "true" to enable CTC loss
 CTC_WEIGHT="0.3"  # Weight for CTC loss (0.3 means 30% CTC, 70% LM)
 CTC_FEATURE_SOURCE="projector"  # Source of features for CTC: "encoder" or "projector"
 

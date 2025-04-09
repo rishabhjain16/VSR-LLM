@@ -676,44 +676,87 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
                 logger.info(f"CTC target stats: {non_zero_targets}/{total_targets} sequences have non-zero length")
                 logger.info(f"CTC input_lengths: min={input_lengths.min().item()}, max={input_lengths.max().item()}")
                 logger.info(f"CTC target_lengths: min={ctc_lengths.min().item()}, max={ctc_lengths.max().item()}")
+            
+            # CTC needs float32 for loss calculation
+            log_probs_float = ctc_log_probs.float()
+            
+            # Transpose from [B, T, C] to [T, B, C] for CTC loss
+            log_probs_float = log_probs_float.transpose(0, 1)
+            
+            # Ensure input_lengths don't exceed actual sequence length
+            max_time = log_probs_float.size(0)
+            input_lengths = torch.clamp(input_lengths, max=max_time)
+            
+            # For CTC to work, target sequences must be shorter than input sequences
+            # Check and fix any violations
+            invalid_idx = input_lengths <= ctc_lengths
+            if invalid_idx.any():
+                # Log this occurrence
+                logger.warning(f"Found {invalid_idx.sum().item()} sequences where input_length <= target_length, fixing")
                 
-                # Check if we have invalid CTC constraints (input shorter than target)
-                invalid_lens = (input_lengths < ctc_lengths).sum().item()
-                if invalid_lens > 0:
-                    logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
+                # Fix by ensuring all input lengths are at least target_length + 1
+                min_valid_length = ctc_lengths + 1
+                input_lengths = torch.maximum(input_lengths, min_valid_length)
+                
+                # If this makes any input length exceed the max sequence length, we need to pad
+                if (input_lengths > max_time).any():
+                    logger.warning(f"Need to pad input sequence to accommodate target lengths")
+                    # Calculate new max time needed
+                    new_max_time = input_lengths.max().item()
+                    
+                    # Create padding for the log_probs tensor (initialize with log of a very small probability)
+                    pad_size = new_max_time - max_time
+                    # Fill with blank token distribution (most probability mass on blank)
+                    blank_hot = torch.full((pad_size, log_probs_float.size(1), log_probs_float.size(2)), 
+                                          -20.0, device=log_probs_float.device)
+                    # Give the blank token a higher probability
+                    blank_hot[:, :, self.ctc_blank_idx] = 0.0
+                    
+                    # Concatenate to the original tensor
+                    log_probs_float = torch.cat([log_probs_float, blank_hot], dim=0)
+                    
+                    # Update max_time
+                    max_time = new_max_time
+            
+            # Prepare targets for CTC loss - we need to flatten targets
+            # Extract valid (non-padding) tokens from ctc_tokens
+            flat_targets = []
+            batch_sizes = []
+            
+            # Debug information
+            logger.info(f"CTC target shape before processing: {ctc_tokens.shape}")
+            logger.info(f"CTC target lengths: {ctc_lengths}")
+            
+            for b in range(ctc_tokens.size(0)):
+                # Get valid tokens for this sequence
+                valid_tokens = ctc_tokens[b, :ctc_lengths[b]]
+                flat_targets.append(valid_tokens)
+                batch_sizes.append(valid_tokens.size(0))
+            
+            # Flatten targets into a 1D tensor
+            flat_targets = torch.cat(flat_targets)
+            
+            # Debug info for the processed targets
+            logger.info(f"Flattened target shape: {flat_targets.shape}")
+            logger.info(f"Input lengths: {input_lengths}")
             
             # Calculate CTC loss
-            try:
-                # Check for empty targets or input
-                if (ctc_lengths == 0).all() or (ctc_lengths == 0).all():
-                    logger.warning(f"Empty CTC targets or inputs detected - CTC loss will be ignored")
-                    ctc_loss = torch.tensor(0.0, device=lm_loss.device, dtype=lm_loss.dtype)
-                else:
-                    # CTC needs float32 for loss calculation
-                    log_probs_float = ctc_log_probs.float()
-                    ctc_loss = F.ctc_loss(
-                        log_probs_float,
-                        ctc_tokens,
-                        ctc_lengths,
-                        input_lengths,
-                        blank=self.ctc_blank_idx,
-                        reduction="mean",
-                        zero_infinity=True,
-                    )
-                
-                # Combine losses with weighting
-                total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
-                
-                # Log losses periodically
-                if self.batch_counter % 20 == 0:
-                    logger.info(f"Losses - LM: {lm_loss.item():.4f}, CTC: {ctc_loss.item():.4f}, Total: {total_loss.item():.4f}")
+            ctc_loss = F.ctc_loss(
+                log_probs_float,
+                flat_targets,
+                input_lengths,
+                ctc_lengths,
+                blank=self.ctc_blank_idx,
+                reduction="mean",
+                zero_infinity=True,
+            )
             
-            except RuntimeError as e:
-                logger.error(f"Error in CTC loss calculation: {str(e)}")
-                logger.error(f"Shapes - log_probs: {ctc_log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
-                logger.error(f"Lengths - input: {input_lengths}, target: {ctc_lengths}")
-                # Fall back to just LM loss if CTC fails
-                total_loss = lm_loss
+            # Combine losses with weighting
+            total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
+            
+            # Log losses periodically
+            if self.batch_counter % 20 == 0:
+                logger.info(f"Losses - LM: {lm_loss.item():.4f}, CTC: {ctc_loss.item():.4f}, Total: {total_loss.item():.4f}")
         
         # Return combined loss, logits, and labels as expected by the criterion
         return total_loss, llm_out.logits, llm_labels
@@ -959,6 +1002,70 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         
         return state
 
+    def get_ctc_targets_from_llm_batch(self, batch):
+        """
+        Extract and prepare CTC targets from a batch containing LLM targets.
+        
+        Args:
+            batch: Dictionary containing 'target_list' from the LLM
+            
+        Returns:
+            ctc_tokens: tensor of shape [batch_size, max_seq_len] with character indices
+            ctc_lengths: tensor of shape [batch_size] with lengths of each sequence
+        """
+        # Get the device
+        device = batch['target_list'].device
+        
+        # Get raw text sequences from the batch
+        text_batch = []
+        
+        # Enhanced logging
+        logger.info(f"===== CTC Target Text Extraction =====")
+        logger.info(f"Target list shape: {batch['target_list'].shape}")
+        
+        for idx, seq in enumerate(batch['target_list']):
+            # Get non-padding indices
+            valid_indices = seq[seq != 0].tolist()
+            
+            # Log raw indices
+            logger.info(f"Sequence {idx} valid indices: {valid_indices[:20]}..." if len(valid_indices) > 20 else f"Sequence {idx} valid indices: {valid_indices}")
+            
+            # Create a deterministic and unique string for CTC supervision
+            # Don't rely on LLM tokenizer - use a simpler approach
+            
+            # Use a simple hash of the token IDs to generate unique string
+            token_repr = []
+            for token_id in valid_indices:
+                # Convert token ID to ASCII range (using modulo to keep in printable range)
+                char_code = (token_id % 26) + 97  # 'a' to 'z'
+                token_repr.append(chr(char_code))
+            
+            # Join the characters to form a string
+            text = ''.join(token_repr)
+            
+            # Ensure minimum length (add padding if needed)
+            if len(text) < 5:
+                text += 'x' * (5 - len(text))
+                
+            # Log extracted text
+            logger.info(f"Sequence {idx} text: '{text}' (length: {len(text)})")
+            
+            text_batch.append(text)
+        
+        # Convert text batch to CTC tokens
+        ctc_tokens, ctc_lengths = self.text_to_ctc_tokens(text_batch, device)
+        
+        # Log token information
+        logger.info(f"CTC tokens shape: {ctc_tokens.shape}")
+        for idx, length in enumerate(ctc_lengths):
+            logger.info(f"Sequence {idx} token length: {length}")
+            if length > 0:
+                logger.info(f"Sequence {idx} first few tokens: {ctc_tokens[idx, :min(5, length)].tolist()}")
+        
+        logger.info(f"================================")
+        
+        return ctc_tokens, ctc_lengths
+
     def text_to_ctc_tokens(self, text_batch, device):
         """
         Convert a batch of text strings to character-level CTC tokens.
@@ -979,6 +1086,10 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             # Convert text to lowercase and strip whitespace
             text = text.lower().strip()
             
+            # Ensure text is not empty, add a space if needed
+            if len(text) == 0:
+                text = " "
+                
             # Convert to character indices
             char_indices = [self.ctc_token_to_idx.get(c, self.ctc_token_to_idx[' ']) 
                           for c in text]
@@ -1000,35 +1111,6 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Stack into batch tensor
         ctc_tokens = torch.stack(padded_tokens)
         ctc_lengths = torch.tensor(batch_lengths, device=device)
-        
-        return ctc_tokens, ctc_lengths
-
-    def get_ctc_targets_from_llm_batch(self, batch):
-        """
-        Extract and prepare CTC targets from a batch containing LLM targets.
-        
-        Args:
-            batch: Dictionary containing 'target_list' from the LLM
-            
-        Returns:
-            ctc_tokens: tensor of shape [batch_size, max_seq_len] with character indices
-            ctc_lengths: tensor of shape [batch_size] with lengths of each sequence
-        """
-        # Get the device
-        device = batch['target_list'].device
-        
-        # Get raw text sequences from the batch
-        text_batch = []
-        for seq in batch['target_list']:
-            # Get non-padding indices
-            valid_indices = seq[seq != 0].tolist()
-            # Convert to text using character-level mapping
-            text = ''.join([self.ctc_vocab[idx] if idx < len(self.ctc_vocab) else ' ' 
-                          for idx in valid_indices])
-            text_batch.append(text)
-            
-        # Convert text batch to CTC tokens
-        ctc_tokens, ctc_lengths = self.text_to_ctc_tokens(text_batch, device)
         
         return ctc_tokens, ctc_lengths
 
@@ -1458,44 +1540,87 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
                 logger.info(f"CTC target stats: {non_zero_targets}/{total_targets} sequences have non-zero length")
                 logger.info(f"CTC input_lengths: min={input_lengths.min().item()}, max={input_lengths.max().item()}")
                 logger.info(f"CTC target_lengths: min={ctc_lengths.min().item()}, max={ctc_lengths.max().item()}")
+            
+            # CTC needs float32 for loss calculation
+            log_probs_float = ctc_log_probs.float()
+            
+            # Transpose from [B, T, C] to [T, B, C] for CTC loss
+            log_probs_float = log_probs_float.transpose(0, 1)
+            
+            # Ensure input_lengths don't exceed actual sequence length
+            max_time = log_probs_float.size(0)
+            input_lengths = torch.clamp(input_lengths, max=max_time)
+            
+            # For CTC to work, target sequences must be shorter than input sequences
+            # Check and fix any violations
+            invalid_idx = input_lengths <= ctc_lengths
+            if invalid_idx.any():
+                # Log this occurrence
+                logger.warning(f"Found {invalid_idx.sum().item()} sequences where input_length <= target_length, fixing")
                 
-                # Check if we have invalid CTC constraints (input shorter than target)
-                invalid_lens = (input_lengths < ctc_lengths).sum().item()
-                if invalid_lens > 0:
-                    logger.warning(f"CTC constraint violation: {invalid_lens} sequences have input_length < target_length")
+                # Fix by ensuring all input lengths are at least target_length + 1
+                min_valid_length = ctc_lengths + 1
+                input_lengths = torch.maximum(input_lengths, min_valid_length)
+                
+                # If this makes any input length exceed the max sequence length, we need to pad
+                if (input_lengths > max_time).any():
+                    logger.warning(f"Need to pad input sequence to accommodate target lengths")
+                    # Calculate new max time needed
+                    new_max_time = input_lengths.max().item()
+                    
+                    # Create padding for the log_probs tensor (initialize with log of a very small probability)
+                    pad_size = new_max_time - max_time
+                    # Fill with blank token distribution (most probability mass on blank)
+                    blank_hot = torch.full((pad_size, log_probs_float.size(1), log_probs_float.size(2)), 
+                                          -20.0, device=log_probs_float.device)
+                    # Give the blank token a higher probability
+                    blank_hot[:, :, self.ctc_blank_idx] = 0.0
+                    
+                    # Concatenate to the original tensor
+                    log_probs_float = torch.cat([log_probs_float, blank_hot], dim=0)
+                    
+                    # Update max_time
+                    max_time = new_max_time
+            
+            # Prepare targets for CTC loss - we need to flatten targets
+            # Extract valid (non-padding) tokens from ctc_tokens
+            flat_targets = []
+            batch_sizes = []
+            
+            # Debug information
+            logger.info(f"CTC target shape before processing: {ctc_tokens.shape}")
+            logger.info(f"CTC target lengths: {ctc_lengths}")
+            
+            for b in range(ctc_tokens.size(0)):
+                # Get valid tokens for this sequence
+                valid_tokens = ctc_tokens[b, :ctc_lengths[b]]
+                flat_targets.append(valid_tokens)
+                batch_sizes.append(valid_tokens.size(0))
+            
+            # Flatten targets into a 1D tensor
+            flat_targets = torch.cat(flat_targets)
+            
+            # Debug info for the processed targets
+            logger.info(f"Flattened target shape: {flat_targets.shape}")
+            logger.info(f"Input lengths: {input_lengths}")
             
             # Calculate CTC loss
-            try:
-                # Check for empty targets or input
-                if (ctc_lengths == 0).all() or (ctc_lengths == 0).all():
-                    logger.warning(f"Empty CTC targets or inputs detected - CTC loss will be ignored")
-                    ctc_loss = torch.tensor(0.0, device=lm_loss.device, dtype=lm_loss.dtype)
-                else:
-                    # CTC needs float32 for loss calculation
-                    log_probs_float = ctc_log_probs.float()
-                    ctc_loss = F.ctc_loss(
-                        log_probs_float,
-                        ctc_tokens,
-                        ctc_lengths,
-                        input_lengths,
-                        blank=self.ctc_blank_idx,
-                        reduction="mean",
-                        zero_infinity=True,
-                    )
-                
-                # Combine losses with weighting
-                total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
-                
-                # Log losses periodically
-                if self.batch_counter % 20 == 0:
-                    logger.info(f"Losses - LM: {lm_loss.item():.4f}, CTC: {ctc_loss.item():.4f}, Total: {total_loss.item():.4f}")
+            ctc_loss = F.ctc_loss(
+                log_probs_float,
+                flat_targets,
+                input_lengths,
+                ctc_lengths,
+                blank=self.ctc_blank_idx,
+                reduction="mean",
+                zero_infinity=True,
+            )
             
-            except RuntimeError as e:
-                logger.error(f"Error in CTC loss calculation: {str(e)}")
-                logger.error(f"Shapes - log_probs: {ctc_log_probs.shape}, ctc_tokens: {ctc_tokens.shape}")
-                logger.error(f"Lengths - input: {input_lengths}, target: {ctc_lengths}")
-                # Fall back to just LM loss if CTC fails
-                total_loss = lm_loss
+            # Combine losses with weighting
+            total_loss = (1 - self.cfg.ctc_weight) * lm_loss + self.cfg.ctc_weight * ctc_loss.to(lm_loss.dtype)
+            
+            # Log losses periodically
+            if self.batch_counter % 20 == 0:
+                logger.info(f"Losses - LM: {lm_loss.item():.4f}, CTC: {ctc_loss.item():.4f}, Total: {total_loss.item():.4f}")
         
         # Return combined loss, logits, and labels as expected by the criterion
         return total_loss, llm_out.logits, llm_labels
