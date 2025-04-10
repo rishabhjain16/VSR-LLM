@@ -29,7 +29,7 @@ DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data     # path to test datas
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2/auto/lrs2/lrs2_video_seg24s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
 
-MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Non_CTC_L2_qformer/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
+MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/llama2_comprehensive_qformer/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
 #MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt
 #MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
 #MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
@@ -39,7 +39,7 @@ MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Non_CTC
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_UnordodoxPromptNew_bs4/checkpoints/checkpoint_best.pt
 
 
-OUT_PATH=${ROOT}/checkpoints/decode/decode_llama2_ctc   # output path to save results
+OUT_PATH=${ROOT}/checkpoints/decode/decode_visual_only_qformer   # output path to save results
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test_mytrained_lora_32
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test
 
@@ -72,4 +72,4 @@ CUDA_VISIBLE_DEVICES=0 python -B ${MODEL_SRC}/vsp_llm_decode.py \
         override.eval_bleu=${USE_BLEU} \
         override.llm_ckpt_path=${LLM_PATH} \
         common_eval.path=${MODEL_PATH} \
-        common_eval.results_path=${OUT_PATH}/${TASK}/${LANG}
+        common_eval.results_path=${OUT_PATH}/${TASK}/${LANG} \

@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs_combined   # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Non_CTC_L2_blip2qformer   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Non_CTC_L2_visual_only_qformer   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -44,7 +44,7 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # -------------------------------------------------------------
 
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
-PROJECTOR_TYPE="linear"
+PROJECTOR_TYPE="visual_only_qformer"
 
 # CTC configuration
 USE_CTC="false"  # Set to "true" to enable CTC loss
@@ -84,6 +84,7 @@ fairseq-hydra-train \
         +model.use_ctc=${USE_CTC} \
         +model.ctc_weight=${CTC_WEIGHT} \
         +model.ctc_feature_source=${CTC_FEATURE_SOURCE} \
+        +override.disable_text_conditioning=true \
         model._name=${MODEL_TYPE} \
         hydra.run.dir=${OUT_PATH} \
         distributed_training.distributed_world_size=1 \

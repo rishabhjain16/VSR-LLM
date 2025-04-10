@@ -488,6 +488,11 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Linear and MLP are cluster-based, everything else is text-based
         is_text_based = self.cfg.projector_type.lower() not in ['linear', 'mlp']
         
+        # Exclude visual-only projectors from receiving text tokens
+        is_visual_only = "visual_only" in self.cfg.projector_type.lower()
+        if is_visual_only:
+            is_text_based = False
+            
         # Apply projector based on type
         alignment_loss = torch.tensor(0.0, device=output['encoder_out'].device)
         
@@ -561,7 +566,13 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Query-based projectors are the same as text-based in our case, 
         # since only linear and mlp are not query-based
         is_query_based = is_text_based
-            
+        
+        # Visual-only projectors are query-based even though they're not text-based
+        if "visual_only" in self.cfg.projector_type.lower():
+            is_query_based = True
+            if not self.logged_projector_shape:
+                logger.info(f"Treating {self.cfg.projector_type} as a query-based projector")
+        
         # Handle different projector types
         if is_query_based:
             # For query-based projectors that return fixed number of tokens
@@ -818,6 +829,11 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             "visual_speech_qformer", "visual_speech_text_qformer"
         ])
         
+        # Don't use text conditioning for visual_only projectors
+        if "visual_only" in self.cfg.projector_type.lower():
+            is_text_aware = False
+            logger.info(f"Using visual-only projector without text conditioning: {self.cfg.projector_type}")
+            
         # For all projectors, try to use text information if available
         if is_text_aware:
             # Get text tokens from kwargs (only instruction tokens are available during inference)
@@ -873,12 +889,19 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         is_query_based = any(qp in self.cfg.projector_type.lower() for qp in [
             "qformer", "visual_speech_qformer", "cross_attention",
             "blip2_qformer", "comprehensive_qformer",
-            "visual_speech_text_qformer", "multiscale_contrastive"
+            "visual_speech_text_qformer", "multiscale_contrastive",
+            "visual_only"  # Add this to recognize all visual_only variants
         ])
         
         # Fallback to sequence length check if needed
         if not is_query_based:
             is_query_based = proj_seq_len != orig_seq_len
+        
+        # Visual-only projectors are query-based even though they're not text-based
+        if "visual_only" in self.cfg.projector_type.lower():
+            is_query_based = True
+            if not self.logged_projector_shape:
+                logger.info(f"Treating {self.cfg.projector_type} as a query-based projector")
         
         if is_query_based:
             # For query-based projectors, use the output directly
@@ -1350,6 +1373,11 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Linear and MLP are cluster-based, everything else is text-based
         is_text_based = self.cfg.projector_type.lower() not in ['linear', 'mlp']
         
+        # Exclude visual-only projectors from receiving text tokens
+        is_visual_only = "visual_only" in self.cfg.projector_type.lower()
+        if is_visual_only:
+            is_text_based = False
+            
         # Apply projector based on type
         alignment_loss = torch.tensor(0.0, device=output['encoder_out'].device)
         
@@ -1423,7 +1451,13 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Query-based projectors are the same as text-based in our case, 
         # since only linear and mlp are not query-based
         is_query_based = is_text_based
-            
+        
+        # Visual-only projectors are query-based even though they're not text-based
+        if "visual_only" in self.cfg.projector_type.lower():
+            is_query_based = True
+            if not self.logged_projector_shape:
+                logger.info(f"Treating {self.cfg.projector_type} as a query-based projector")
+        
         # Handle different projector types
         if is_query_based:
             # For query-based projectors that return fixed number of tokens

@@ -816,6 +816,9 @@ class QFormerLayer(nn.Module):
         )
         self.norm2 = nn.LayerNorm(d_model)
         
+        # Add the missing dropout layer that's used in the forward method
+        self.dropout = nn.Dropout(dropout)
+        
     def forward(self, query, visual, text=None, visual_attention_mask=None, text_attention_mask=None):
         # Self-attention
         q = self.norm1(query)
@@ -969,18 +972,20 @@ class ComprehensiveQFormerProjector(BaseProjector):
         """
         B = x.size(0)
         
-        # Check text input and create mask if needed
+        # SIMPLIFIED TEXT CONDITIONING CHECK:
+        # Only use text conditioning during training, never during inference
+        use_text = False
         if self.use_text_conditioning and text_tokens is not None:
-            if not isinstance(text_tokens, torch.Tensor):
-                logger.warning(f"text_tokens is not a tensor, but {type(text_tokens)}. Ignoring text input.")
-                text_tokens = None
-                text_mask = None
-            elif text_mask is None:
-                text_mask = (text_tokens != 0).float()
+            if torch.is_grad_enabled():  # Only condition with text during training
+                if isinstance(text_tokens, torch.Tensor) and text_tokens.dim() > 1:
+                    # We have proper text tokens and we're in training mode
+                    use_text = True
+                    if text_mask is None:
+                        text_mask = (text_tokens != 0).float()
                 
-        # Process text if available
+        # Process text if available and if we determined we should use it
         text_features = None
-        if self.use_text_conditioning and text_tokens is not None:
+        if use_text:
             # Convert IDs to embeddings
             with torch.no_grad():
                 text_tokens = text_tokens.to(dtype=torch.long)
@@ -1028,7 +1033,7 @@ class ComprehensiveQFormerProjector(BaseProjector):
                 hidden_states = layer(q=hidden_states, kv=x, mask=None)
                 
                 # Check if we need to apply text cross-attention next
-                if (self.use_text_conditioning and text_features is not None and 
+                if (use_text and text_features is not None and 
                     layer_idx + 1 < len(self.layers) and 
                     isinstance(self.layers[layer_idx + 1], TransformerCrossAttentionLayer)):
                     
@@ -1118,8 +1123,8 @@ class TransformerCrossAttentionLayer(nn.Module):
     def forward(self, q, kv, mask=None):
         """
         Args:
-            q: Query tensor [B, Q, D]
-            kv: Key/value tensor [B, T, D]
+            q: Query tensor [B, seq_len, dim]
+            kv: Key/value tensor [B, kv_len, dim]
             mask: Optional mask for kv
         
         Returns:
@@ -1127,14 +1132,43 @@ class TransformerCrossAttentionLayer(nn.Module):
         """
         # Apply layer norm first if using pre-norm
         if self.norm_first:
+            # Ensure dimensions are correct - apply reshape if needed
+            q_norm = self.norm1(q)
+            kv_norm = self.norm1(kv)
+            
+            # Handle potential 4D input (ensure key and value are 3D)
+            if len(kv_norm.shape) == 4:
+                # If we have a 4D tensor, reshape it to 3D
+                B, T, D1, D2 = kv_norm.shape
+                kv_norm = kv_norm.reshape(B, T * D1, D2)
+            
+            # Fix mask dimensions to match kv dimensions
+            if mask is not None and kv_norm.size(1) != mask.size(1):
+                # Disable masking if dimensions don't match
+                mask = None
+            
+            # Call cross attention with proper 3D shapes
             x = q + self.dropout1(self.cross_attn(
-                self.norm1(q), self.norm1(kv), self.norm1(kv), 
-                key_padding_mask=mask)[0])
+                q_norm, kv_norm, kv_norm, 
+                key_padding_mask=mask,
+                need_weights=False)[0])
             x = x + self.dropout2(self.linear2(self.dropout(self.activation(
                 self.linear1(self.norm2(x))))))
         else:
+            # Handle potential 4D input (ensure key and value are 3D)
+            if len(kv.shape) == 4:
+                # If we have a 4D tensor, reshape it to 3D
+                B, T, D1, D2 = kv.shape
+                kv = kv.reshape(B, T * D1, D2)
+            
+            # Fix mask dimensions to match kv dimensions
+            if mask is not None and kv.size(1) != mask.size(1):
+                # Disable masking if dimensions don't match
+                mask = None
+            
+            # Call cross attention with proper 3D shapes
             x = self.norm1(q + self.dropout1(self.cross_attn(
-                q, kv, kv, key_padding_mask=mask)[0]))
+                q, kv, kv, key_padding_mask=mask, need_weights=False)[0]))
             x = self.norm2(x + self.dropout2(self.linear2(self.dropout(self.activation(
                 self.linear1(x))))))
         
@@ -1239,7 +1273,7 @@ class VisualSpeechQFormer(BaseProjector):
             if query_tokens.dtype != x.dtype:
                 query_tokens = query_tokens.to(dtype=x.dtype)
             
-            # Concatenate query tokens with visual features
+            # Concatenate query tokens with processed features
             x_with_query = torch.cat([query_tokens, x], dim=1)
             
             # Create attention mask that allows queries to attend to all inputs
@@ -1269,7 +1303,7 @@ class VisualSpeechQFormer(BaseProjector):
                 for j in range(region_start, region_end):
                     mask[i, query_len + j] = False  # False = attend to this position
             
-            # Ensure transformer parameters match input dtype
+            # Ensure transformer dtype consistency
             transformer_dtype = next(self.transformer.parameters()).dtype
             if x_with_query.dtype != transformer_dtype:
                 x_with_query = x_with_query.to(dtype=transformer_dtype)
@@ -1519,7 +1553,7 @@ class VisualSpeechTextQFormer(BaseProjector):
             )
             
             # Get proper attention mask for padding
-            text_attention_mask = self._get_attention_mask(text_mask, query_output.device)
+            key_padding_mask = self._get_attention_mask(text_mask, query_output.device)
             
             # Use cross-attention to enhance visual with text
             enhanced_queries = query_output
@@ -1528,7 +1562,7 @@ class VisualSpeechTextQFormer(BaseProjector):
                 enhanced_queries = layer(
                     enhanced_queries,                  # tgt (queries)
                     text_features,                     # memory (text)
-                    memory_key_padding_mask=text_attention_mask
+                    memory_key_padding_mask=key_padding_mask
                 )
                 
             # Apply final normalization and projection
@@ -1623,22 +1657,405 @@ class StableCrossAttentionLayer(nn.Module):
             raise e
 
 
+class VisualOnlyQFormer(BaseProjector):
+    """
+    Visual-only QFormer that maintains the architecture strengths of ComprehensiveQFormer
+    but removes all text conditioning for stability and consistency between training and inference.
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        output_dim: int, 
+        num_queries: int = 32,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        intermediate_dim: int = 3072,
+        dropout: float = 0.1,
+        use_temporal_attention: bool = True,
+        temporal_window_size: int = 5
+    ):
+        super().__init__(input_dim, output_dim)
+        self.num_queries = num_queries
+        self.use_temporal_attention = use_temporal_attention
+        
+        # Learnable query tokens with optimal initialization
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, input_dim))
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        
+        # Input normalization and projection
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_proj = nn.Linear(input_dim, input_dim)
+        nn.init.normal_(self.input_proj.weight, std=0.02)
+        nn.init.zeros_(self.input_proj.bias)
+        
+        # Speech-specific temporal attention
+        if use_temporal_attention:
+            self.temporal_conv = nn.Conv1d(
+                input_dim, 
+                input_dim, 
+                kernel_size=temporal_window_size,
+                padding=(temporal_window_size-1)//2,
+                groups=num_heads  # Multi-headed temporal convolution
+            )
+            self.temporal_gate = nn.Sequential(
+                nn.Linear(input_dim, input_dim),
+                nn.Sigmoid()
+            )
+        
+        # Main transformer layers - simpler architecture without text cross-attention
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            # Self-attention layer
+            self.layers.append(
+                TransformerSelfAttentionLayer(
+                    d_model=input_dim,
+                    nhead=num_heads,
+                    dim_feedforward=intermediate_dim,
+                    dropout=dropout,
+                    norm_first=True
+                )
+            )
+            
+            # Cross-attention layer with visual features (every other layer)
+            if i % 2 == 1:
+                self.layers.append(
+                    TransformerCrossAttentionLayer(
+                        d_model=input_dim,
+                        nhead=num_heads,
+                        dim_feedforward=intermediate_dim,
+                        dropout=dropout,
+                        norm_first=True
+                    )
+                )
+        
+        # Final layer norm and projection
+        self.final_norm = nn.LayerNorm(input_dim)
+        self.output_proj = nn.Linear(input_dim, output_dim)
+        nn.init.normal_(self.output_proj.weight, std=0.02)
+        nn.init.zeros_(self.output_proj.bias)
+        
+    def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
+        """
+        Forward pass through the visual-only QFormer
+        
+        Args:
+            x: Visual/audio features [B, T, input_dim]
+            text_tokens: Ignored (for compatibility with interface)
+            text_mask: Ignored (for compatibility with interface)
+            
+        Returns:
+            Projected features [B, num_queries, output_dim]
+        """
+        B = x.size(0)
+        
+        # Apply input normalization and projection
+        x = self.input_norm(x)
+        x = self.input_proj(x)
+        
+        # Apply temporal modeling for speech (if enabled)
+        if self.use_temporal_attention:
+            # Apply temporal convolution
+            x_temporal = x.transpose(1, 2)  # [B, D, T]
+            x_temporal = self.temporal_conv(x_temporal).transpose(1, 2)  # [B, T, D]
+            
+            # Gated mechanism to control temporal information flow
+            gate = self.temporal_gate(x)
+            x = x + gate * x_temporal
+        
+        # Expand query tokens to batch size
+        query_tokens = self.query_tokens.expand(B, -1, -1)
+        
+        # Ensure query tokens match input dtype
+        if query_tokens.dtype != x.dtype:
+            query_tokens = query_tokens.to(dtype=x.dtype)
+        
+        # Main processing through transformer layers
+        hidden_states = query_tokens
+        
+        for layer in self.layers:
+            if isinstance(layer, TransformerSelfAttentionLayer):
+                # Self-attention layer
+                hidden_states = layer(hidden_states)
+            elif isinstance(layer, TransformerCrossAttentionLayer):
+                # Cross-attention to visual features only
+                hidden_states = layer(q=hidden_states, kv=x, mask=None)
+        
+        # Final normalization and projection
+        hidden_states = self.final_norm(hidden_states)
+        output = self.output_proj(hidden_states)
+        
+        return output
+
+
+class VisualOnlyBlip2QFormer(BaseProjector):
+    """
+    Visual-only version of BLIP2QFormer without any text conditioning
+    for stable and consistent training/inference behavior.
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        output_dim: int, 
+        num_queries: int = 32,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        intermediate_size: int = 3072,
+        use_bert_config: bool = True
+    ):
+        super().__init__(input_dim, output_dim)
+        self.num_queries = num_queries
+        
+        # Query embeddings
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, input_dim))
+        nn.init.normal_(self.query_tokens, std=0.02)
+        
+        # Visual features projection and normalization
+        self.visual_proj = nn.Linear(input_dim, input_dim)
+        self.visual_norm = nn.LayerNorm(input_dim)
+        
+        # QFormer layers
+        self.layers = nn.ModuleList([
+            QFormerLayer(
+                d_model=input_dim,
+                nhead=num_heads,
+                dim_feedforward=intermediate_size if use_bert_config else input_dim * 4,
+                dropout=dropout,
+                cross_attention=True
+            ) for _ in range(num_layers)
+        ])
+        
+        # Output projection
+        self.output_proj = nn.Linear(input_dim, output_dim)
+        nn.init.normal_(self.output_proj.weight, std=0.02)
+        nn.init.zeros_(self.output_proj.bias)
+        
+    def forward(self, x, text_tokens=None, text_mask=None):
+        # Process visual features
+        visual_features = self.visual_proj(x)
+        visual_features = self.visual_norm(visual_features)
+        
+        # Create attention mask for visual features (None means all tokens are valid)
+        visual_attention_mask = None
+        
+        # Initialize query features
+        B = x.size(0)
+        query_tokens = self.query_tokens.expand(B, -1, -1)
+        query_output = query_tokens
+        
+        # Process through layers
+        for layer in self.layers:
+            # Since we only have visual modality, we pass None for text
+            query_output = layer(
+                query=query_output,
+                visual=visual_features,
+                text=None,  # No text features
+                visual_attention_mask=visual_attention_mask,
+                text_attention_mask=None  # No text attention mask
+            )
+        
+        # Project to output dimension
+        output = self.output_proj(query_output)
+        
+        return output
+
+
+class VisualOnlyCrossAttention(BaseProjector):
+    """
+    Visual-only version of CrossAttentionProjector without any text conditioning
+    for stable and consistent training/inference behavior.
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        output_dim: int, 
+        num_heads: int = 8,
+        num_layers: int = 2,
+        dropout: float = 0.1
+    ):
+        super().__init__(input_dim, output_dim)
+        
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, input_dim)
+        self.input_norm = nn.LayerNorm(input_dim)
+        
+        # Cross-attention blocks (without text conditioning)
+        self.cross_attn_blocks = nn.ModuleList([
+            CrossAttentionBlock(
+                hidden_dim=input_dim, 
+                num_heads=num_heads,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+        
+        # Output projection
+        self.output_norm = nn.LayerNorm(input_dim)
+        self.output_proj = nn.Linear(input_dim, output_dim)
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        # Standard weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+    def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
+        """
+        Forward pass with visual features only
+        
+        Args:
+            x: Visual features [B, T, input_dim]
+            text_tokens: Ignored (for compatibility)
+            text_mask: Ignored (for compatibility)
+            
+        Returns:
+            Projected features [B, T, output_dim]
+        """
+        # Process input
+        x = self.input_norm(self.input_proj(x))
+        
+        # Apply cross-attention (self-attention to visual features)
+        for block in self.cross_attn_blocks:
+            # Use visual features as both query and key/value
+            x = block(q=x, kv=x)
+        
+        # Output projection
+        x = self.output_norm(x)
+        output = self.output_proj(x)
+        
+        return output
+
+
+class VisualOnlyMultiScaleContrastive(BaseProjector):
+    """
+    Visual-only version of MultiScaleContrastiveProjector without any text conditioning
+    for stable and consistent training/inference behavior.
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        output_dim: int, 
+        hidden_dim: int = 2048,
+        num_scales: int = 3,
+        num_heads: int = 8,
+        dropout: float = 0.1
+    ):
+        super().__init__(input_dim, output_dim)
+        
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        
+        # Create multiple scales of processing
+        self.scales = nn.ModuleList()
+        for scale in range(num_scales):
+            # Scale-specific processing with different receptive fields
+            stride = 2 ** scale  # Different strides for different scales
+            
+            # For each scale, create a processing block
+            self.scales.append(nn.Sequential(
+                # Temporal convolution with scale-specific stride 
+                nn.Conv1d(
+                    hidden_dim, 
+                    hidden_dim, 
+                    kernel_size=3, 
+                    stride=stride, 
+                    padding=1,
+                    groups=num_heads
+                ),
+                nn.GELU(),
+                # Restore original dimension
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)
+            ))
+        
+        # Process each scale with self-attention
+        self.scale_attention = nn.ModuleList([
+            CrossAttentionBlock(
+                hidden_dim=hidden_dim, 
+                num_heads=num_heads,
+                dropout=dropout
+            ) for _ in range(num_scales)
+        ])
+        
+        # Fusion layer to combine all scales
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * num_scales, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Output projection
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
+        """
+        Forward pass with visual features only
+        
+        Args:
+            x: Visual features [B, T, input_dim]
+            text_tokens: Ignored (for compatibility)
+            text_mask: Ignored (for compatibility)
+            
+        Returns:
+            Projected features [B, T, output_dim]
+        """
+        B, T, _ = x.shape
+        
+        # Project input to hidden dimension
+        x = self.input_proj(x)
+        x = self.input_norm(x)
+        
+        # Process each scale
+        scale_outputs = []
+        for i, (scale_conv, scale_attn) in enumerate(zip(self.scales, self.scale_attention)):
+            # Apply scale-specific convolution
+            scale_x = x.transpose(1, 2)  # [B, D, T]
+            scale_x = scale_conv(scale_x).transpose(1, 2)  # [B, T', D]
+            
+            # Apply self-attention
+            scale_x = scale_attn(q=scale_x, kv=scale_x)
+            
+            # Resize back to original sequence length if needed
+            if scale_x.size(1) != T:
+                scale_x = F.interpolate(
+                    scale_x.transpose(1, 2),  # [B, D, T']
+                    size=T,
+                    mode='linear',
+                    align_corners=False
+                ).transpose(1, 2)  # [B, T, D]
+            
+            scale_outputs.append(scale_x)
+        
+        # Concatenate all scales
+        multi_scale = torch.cat(scale_outputs, dim=-1)
+        
+        # Fuse all scales
+        fused = self.fusion(multi_scale)
+        
+        # Final projection
+        output = self.output_proj(self.output_norm(fused))
+        
+        return output
+
+
 def get_projector(projector_name, input_dim, output_dim, **kwargs):
     """
-    Factory function to create a projector by name
-    
-    All projectors except for Linear and MLP support text-based conditioning
-    via transcript tokens. This allows for direct visual-text alignment
-    for better representation learning.
+    Factory function to create the appropriate projector based on name
     
     Args:
-        projector_name: String identifier for projector type
+        projector_name: Name/type of projector to create
         input_dim: Input dimension
-        output_dim: Output dimension 
-        **kwargs: Additional arguments to pass to projector constructor
-        
+        output_dim: Output dimension
+        **kwargs: Additional projector-specific parameters
+    
     Returns:
-        Initialized projector
+        Instantiated projector module
     """
     projector_name = projector_name.lower()
     
@@ -1745,6 +2162,49 @@ def get_projector(projector_name, input_dim, output_dim, **kwargs):
             input_dim=input_dim,
             output_dim=output_dim,
             **kwargs
+        )
+    
+    elif projector_name.lower() == "visual_only_qformer":
+        return VisualOnlyQFormer(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_queries=kwargs.get("projector_num_queries", 32),
+            num_layers=kwargs.get("projector_num_layers", 6),
+            num_heads=kwargs.get("projector_num_heads", 8),
+            intermediate_dim=kwargs.get("projector_hidden_dim", 3072),
+            dropout=kwargs.get("projector_dropout", 0.1),
+            use_temporal_attention=kwargs.get("use_temporal_attention", True),
+            temporal_window_size=kwargs.get("temporal_window_size", 5)
+        )
+    
+    elif projector_name.lower() == "visual_only_blip2_qformer":
+        return VisualOnlyBlip2QFormer(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_queries=kwargs.get("projector_num_queries", 32),
+            num_layers=kwargs.get("projector_num_layers", 6),
+            num_heads=kwargs.get("projector_num_heads", 8),
+            dropout=kwargs.get("projector_dropout", 0.1),
+            intermediate_size=kwargs.get("projector_hidden_dim", 3072)
+        )
+    
+    elif projector_name.lower() == "visual_only_cross_attention":
+        return VisualOnlyCrossAttention(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_heads=kwargs.get("projector_num_heads", 8),
+            num_layers=kwargs.get("projector_num_layers", 2),
+            dropout=kwargs.get("projector_dropout", 0.1)
+        )
+    
+    elif projector_name.lower() == "visual_only_multiscale_contrastive":
+        return VisualOnlyMultiScaleContrastive(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=kwargs.get("projector_hidden_dim", 2048),
+            num_scales=kwargs.get("num_scales", 3),
+            num_heads=kwargs.get("projector_num_heads", 8),
+            dropout=kwargs.get("projector_dropout", 0.1)
         )
     
     else:
