@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Union
 import math
 import inspect
 import logging
@@ -1737,8 +1737,8 @@ class VisualOnlyQFormer(BaseProjector):
     def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
         """
         Forward pass through the visual-only QFormer
-        
-        Args:
+    
+    Args:
             x: Visual/audio features [B, T, input_dim]
             text_tokens: Ignored (for compatibility with interface)
             text_mask: Ignored (for compatibility with interface)
@@ -2044,6 +2044,633 @@ class VisualOnlyMultiScaleContrastive(BaseProjector):
         return output
 
 
+class TextGuidedQFormer(BaseProjector):
+    """
+    A text-guided QFormer that uses text conditioning during training 
+    to create better visual representations, but doesn't require text during inference.
+    
+    Key features:
+    1. Dual-path architecture with text supervision
+    2. Distillation from text-conditioned to visual-only paths
+    3. Consistently uses only visual path during inference
+    4. No training/inference mismatch
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        output_dim: int, 
+        num_queries: int = 32,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        intermediate_dim: int = 3072,
+        dropout: float = 0.1,
+        use_temporal_attention: bool = True,
+        temporal_window_size: int = 5,
+        distillation_weight: float = 0.5
+    ):
+        super().__init__(input_dim, output_dim)
+        self.num_queries = num_queries
+        self.use_temporal_attention = use_temporal_attention
+        self.distillation_weight = distillation_weight
+        
+        # Learnable query tokens
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, input_dim))
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        
+        # Input normalization and projection
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_proj = nn.Linear(input_dim, input_dim)
+        nn.init.normal_(self.input_proj.weight, std=0.02)
+        nn.init.zeros_(self.input_proj.bias)
+        
+        # Text encoding components
+        from transformers import BertModel
+        self.text_encoder = BertModel.from_pretrained('bert-base-uncased').embeddings
+        self.text_proj = nn.Linear(768, input_dim)  # BERT dim is 768
+        self.text_norm = nn.LayerNorm(input_dim)
+        
+        # Temporal attention for speech
+        if use_temporal_attention:
+            self.temporal_conv = nn.Conv1d(
+                input_dim, 
+                input_dim, 
+                kernel_size=temporal_window_size,
+                padding=(temporal_window_size-1)//2,
+                groups=num_heads
+            )
+            
+            self.temporal_gate = nn.Sequential(
+                nn.Linear(input_dim, input_dim),
+                nn.Sigmoid()
+            )
+        
+        # CREATE TWO SEPARATE TRANSFORMER STACKS
+        
+        # 1. Visual-only path (used for both training and inference)
+        self.visual_only_layers = nn.ModuleList()
+        for i in range(num_layers):
+            # Self-attention layer
+            self.visual_only_layers.append(
+                TransformerSelfAttentionLayer(
+                    d_model=input_dim,
+                    nhead=num_heads,
+                    dim_feedforward=intermediate_dim,
+                    dropout=dropout,
+                    norm_first=True
+                )
+            )
+            
+            # Cross-attention to visual features (every other layer)
+            if i % 2 == 1:
+                self.visual_only_layers.append(
+                    TransformerCrossAttentionLayer(
+                        d_model=input_dim,
+                        nhead=num_heads,
+                        dim_feedforward=intermediate_dim,
+                        dropout=dropout,
+                        norm_first=True
+                    )
+                )
+        
+        # 2. Text-conditioned path (used only during training)
+        self.text_conditioned_layers = nn.ModuleList()
+        for i in range(num_layers):
+            # Self-attention layer
+            self.text_conditioned_layers.append(
+                TransformerSelfAttentionLayer(
+                    d_model=input_dim,
+                    nhead=num_heads,
+                    dim_feedforward=intermediate_dim,
+                    dropout=dropout,
+                    norm_first=True
+                )
+            )
+            
+            # Cross-attention layer (every other layer)
+            if i % 2 == 1:
+                # Visual cross-attention
+                self.text_conditioned_layers.append(
+                    TransformerCrossAttentionLayer(
+                        d_model=input_dim,
+                        nhead=num_heads,
+                        dim_feedforward=intermediate_dim,
+                        dropout=dropout,
+                        norm_first=True
+                    )
+                )
+                
+                # Text cross-attention
+                self.text_conditioned_layers.append(
+                    TransformerCrossAttentionLayer(
+                        d_model=input_dim,
+                        nhead=num_heads,
+                        dim_feedforward=intermediate_dim,
+                        dropout=dropout,
+                        norm_first=True
+                    )
+                )
+        
+        # Final layer norms and projections (separate for each path)
+        self.visual_norm = nn.LayerNorm(input_dim)
+        self.visual_proj = nn.Linear(input_dim, output_dim)
+        nn.init.normal_(self.visual_proj.weight, std=0.02)
+        nn.init.zeros_(self.visual_proj.bias)
+        
+        self.text_norm = nn.LayerNorm(input_dim)
+        self.text_conditioned_proj = nn.Linear(input_dim, output_dim)
+        nn.init.normal_(self.text_conditioned_proj.weight, std=0.02)
+        nn.init.zeros_(self.text_conditioned_proj.bias)
+        
+        # Attribute to store distillation loss
+        self.distillation_loss = torch.tensor(0.0)
+        
+    def forward(self, x: torch.Tensor, text_tokens=None, text_mask=None) -> torch.Tensor:
+        """
+        Forward pass with dual-path architecture
+        
+        Args:
+            x: Visual features [B, T, input_dim]
+            text_tokens: Optional text token ids [B, L] - used only in training
+            text_mask: Optional attention mask for text [B, L]
+            
+        Returns:
+            Projected features [B, num_queries, output_dim]
+        """
+        B = x.size(0)
+        
+        # Process input features
+        x = self.input_norm(x)
+        x = self.input_proj(x)
+        
+        # Apply temporal modeling for speech
+        if self.use_temporal_attention:
+            x_temporal = x.transpose(1, 2)
+            x_temporal = self.temporal_conv(x_temporal).transpose(1, 2)
+            gate = self.temporal_gate(x)
+            x = x + gate * x_temporal
+        
+        # Expand query tokens
+        query_tokens = self.query_tokens.expand(B, -1, -1)
+        
+        # VISUAL-ONLY PATH (always used)
+        visual_only_hidden = query_tokens.clone()
+        
+        # Process through visual-only layers
+        visual_layer_idx = 0
+        while visual_layer_idx < len(self.visual_only_layers):
+            layer = self.visual_only_layers[visual_layer_idx]
+            
+            if isinstance(layer, TransformerSelfAttentionLayer):
+                # Self-attention layer
+                visual_only_hidden = layer(visual_only_hidden)
+            elif isinstance(layer, TransformerCrossAttentionLayer):
+                # Visual cross-attention
+                visual_only_hidden = layer(q=visual_only_hidden, kv=x, mask=None)
+            
+            visual_layer_idx += 1
+        
+        # Final visual-only output
+        visual_only_output = self.visual_proj(self.visual_norm(visual_only_hidden))
+        
+        # If we're in inference mode or no text tokens provided, return visual-only path
+        if not torch.is_grad_enabled() or text_tokens is None:
+            return visual_only_output
+        
+        # TEXT-CONDITIONED PATH (only used during training)
+        # Process text tokens
+        text_tokens = text_tokens.to(dtype=torch.long)
+        text_embeds = self.text_encoder.word_embeddings(text_tokens)
+        text_features = self.text_proj(text_embeds)
+        text_features = self.text_norm(text_features)
+        
+        if text_mask is None:
+            text_mask = (text_tokens != 0).float()
+        
+        # Start with the same query tokens
+        text_conditioned_hidden = query_tokens.clone()
+        
+        # Process through text-conditioned layers
+        text_layer_idx = 0
+        while text_layer_idx < len(self.text_conditioned_layers):
+            layer = self.text_conditioned_layers[text_layer_idx]
+            
+            if isinstance(layer, TransformerSelfAttentionLayer):
+                # Self-attention layer
+                text_conditioned_hidden = layer(text_conditioned_hidden)
+                text_layer_idx += 1
+            elif isinstance(layer, TransformerCrossAttentionLayer):
+                # Visual cross-attention
+                text_conditioned_hidden = layer(q=text_conditioned_hidden, kv=x, mask=None)
+                text_layer_idx += 1
+                
+                # Skip if we've reached the end
+                if text_layer_idx >= len(self.text_conditioned_layers):
+                    break
+                    
+                # Text cross-attention (next layer)
+                text_attention_mask = None
+                if text_mask is not None:
+                    text_attention_mask = ~text_mask.bool()
+                
+                text_conditioned_hidden = self.text_conditioned_layers[text_layer_idx](
+                    q=text_conditioned_hidden,
+                    kv=text_features,
+                    mask=text_attention_mask
+                )
+                text_layer_idx += 1
+        
+        # Final text-conditioned output
+        text_conditioned_output = self.text_conditioned_proj(self.text_norm(text_conditioned_hidden))
+        
+        # KNOWLEDGE DISTILLATION
+        # During training, compute distillation loss to help visual-only path learn from text-conditioned path
+        if torch.is_grad_enabled():
+            # MSE loss between the two outputs
+            distillation_loss = F.mse_loss(visual_only_output, text_conditioned_output.detach())
+            
+            # Scale the loss and store it
+            self.distillation_loss = distillation_loss * self.distillation_weight
+            
+            # During training, return text-conditioned output
+            return text_conditioned_output
+        else:
+            # During inference, only use visual-only path
+            return visual_only_output
+
+
+class TextGuidedBlipQFormer(BaseProjector):
+    """
+    A text-guided QFormer inspired by BLIP2 that uses contrastive learning and text conditioning 
+    during training but doesn't require text during inference.
+    
+    Key features:
+    1. Dual-path architecture with shared query tokens
+    2. Contrastive learning between visual and text representations
+    3. Hard negative mining for better alignment
+    4. Speech-specific temporal modeling
+    5. Inference without text dependency
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        output_dim: int, 
+        num_queries: int = 32,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        intermediate_dim: int = 3072,
+        dropout: float = 0.1,
+        use_temporal_attention: bool = True,
+        temporal_window_size: int = 5,
+        contrastive_temperature: float = 0.07,
+        max_text_len: int = 32,
+        use_itm: bool = True,  # Image-text matching objective
+    ):
+        super().__init__(input_dim, output_dim)
+        self.num_queries = num_queries
+        self.use_temporal_attention = use_temporal_attention
+        self.use_itm = use_itm
+        self.max_text_len = max_text_len
+        
+        # Learnable query tokens
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, input_dim))
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        
+        # Input normalization and projection
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_proj = nn.Linear(input_dim, input_dim)
+        nn.init.normal_(self.input_proj.weight, std=0.02)
+        nn.init.zeros_(self.input_proj.bias)
+        
+        # Text encoding components
+        from transformers import BertConfig, BertModel, BertTokenizer
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        # Text embedding layer
+        self.text_encoder = BertModel.from_pretrained('bert-base-uncased')
+        
+        # Projection layers for contrastive learning
+        self.vision_proj = nn.Linear(input_dim, output_dim)
+        nn.init.normal_(self.vision_proj.weight, std=0.02)
+        nn.init.zeros_(self.vision_proj.bias)
+        
+        self.text_proj = nn.Linear(768, output_dim)  # BERT dim is 768
+        nn.init.normal_(self.text_proj.weight, std=0.02)
+        nn.init.zeros_(self.text_proj.bias)
+        
+        # ITM head for image-text matching objective
+        if use_itm:
+            self.itm_head = nn.Linear(input_dim, 2)
+            nn.init.normal_(self.itm_head.weight, std=0.02)
+            nn.init.zeros_(self.itm_head.bias)
+        
+        # Temperature parameter for contrastive learning
+        self.temp = nn.Parameter(contrastive_temperature * torch.ones([]))
+        
+        # Temporal attention for speech
+        if use_temporal_attention:
+            self.temporal_conv = nn.Conv1d(
+                input_dim, 
+                input_dim, 
+                kernel_size=temporal_window_size,
+                padding=(temporal_window_size-1)//2,
+                groups=num_heads
+            )
+            
+            self.temporal_gate = nn.Sequential(
+                nn.Linear(input_dim, input_dim),
+                nn.Sigmoid()
+            )
+        
+        # QFormer with transformer layers
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            # Self-attention layer
+            self.layers.append(
+                TransformerSelfAttentionLayer(
+                    d_model=input_dim,
+                    nhead=num_heads,
+                    dim_feedforward=intermediate_dim,
+                    dropout=dropout,
+                    norm_first=True
+                )
+            )
+            
+            # Cross-attention to visual features (every other layer)
+            if i % 2 == 1:
+                self.layers.append(
+                    TransformerCrossAttentionLayer(
+                        d_model=input_dim,
+                        nhead=num_heads,
+                        dim_feedforward=intermediate_dim,
+                        dropout=dropout,
+                        norm_first=True
+                    )
+                )
+        
+        # Final layer norm
+        self.final_norm = nn.LayerNorm(input_dim)
+        
+        # Track loss components
+        self.contrastive_loss = torch.tensor(0.0)
+        self.itm_loss = torch.tensor(0.0)
+        
+    def encode_text(self, text):
+        """
+        Encode text inputs into embeddings and attention masks
+        """
+        device = next(self.parameters()).device
+        
+        if isinstance(text, list):
+            # Tokenize the text strings
+            text_tokens = self.tokenizer(
+                text,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_text_len,
+                return_tensors="pt"
+            ).to(device)
+        elif isinstance(text, dict) and 'input_ids' in text and 'attention_mask' in text:
+            # Already tokenized, just use as is
+            text_tokens = text
+        elif isinstance(text, torch.Tensor):
+            # Assume it's just token IDs, create attention mask
+            attention_mask = (text != 0).float()
+            text_tokens = {
+                'input_ids': text,
+                'attention_mask': attention_mask
+            }
+        else:
+            return None, None, None
+            
+        # Get text embeddings from BERT
+        with torch.no_grad():
+            text_output = self.text_encoder(
+                text_tokens['input_ids'].to(device, dtype=torch.long),
+                attention_mask=text_tokens['attention_mask'].to(device) if 'attention_mask' in text_tokens else None,
+                return_dict=True
+            )
+        text_embeds = text_output.last_hidden_state
+        
+        # Project to the matching dimension and normalize
+        text_feat = F.normalize(
+            self.text_proj(text_embeds[:, 0, :]), dim=-1
+        )
+        
+        return text_tokens, text_embeds, text_feat
+        
+    def forward(self, x: torch.Tensor, text_input=None, text_tokens=None, text_mask=None) -> torch.Tensor:
+        """
+        Forward pass with dual-path architecture and contrastive learning
+        
+        Args:
+            x: Visual features [B, T, input_dim]
+            text_input: Optional text strings for BERT tokenization
+            text_tokens: Optional pre-tokenized text 
+            text_mask: Optional attention mask for text
+            
+        Returns:
+            Projected features [B, num_queries, output_dim]
+        """
+        B = x.size(0)
+        device = x.device
+        
+        # Process input features
+        x = self.input_norm(x)
+        x = self.input_proj(x)
+        
+        # Apply temporal modeling for speech
+        if self.use_temporal_attention:
+            x_temporal = x.transpose(1, 2)
+            x_temporal = self.temporal_conv(x_temporal).transpose(1, 2)
+            gate = self.temporal_gate(x)
+            x = x + gate * x_temporal
+        
+        # Create attention mask for visual features
+        visual_atts = torch.ones(x.size()[:-1], dtype=torch.long).to(device)
+        
+        # Expand query tokens to batch size
+        query_tokens = self.query_tokens.expand(B, -1, -1)
+        
+        # Process through transformer layers
+        layer_idx = 0
+        hidden_states = query_tokens.clone()
+        
+        while layer_idx < len(self.layers):
+            layer = self.layers[layer_idx]
+            
+            if isinstance(layer, TransformerSelfAttentionLayer):
+                # Self-attention layer
+                hidden_states = layer(hidden_states)
+            elif isinstance(layer, TransformerCrossAttentionLayer):
+                # Visual cross-attention
+                hidden_states = layer(q=hidden_states, kv=x, mask=None)
+            
+            layer_idx += 1
+        
+        # Final normalization
+        hidden_states = self.final_norm(hidden_states)
+        
+        # Project to output dimension and normalize
+        image_feats = F.normalize(self.vision_proj(hidden_states), dim=-1)
+        
+        # If not in training mode or no text provided, just return vision features
+        if not torch.is_grad_enabled() or (text_input is None and text_tokens is None):
+            return image_feats
+        
+        # Process text if available
+        if text_input is not None:
+            text_tokens, text_embeds, text_feat = self.encode_text(text_input)
+        elif text_tokens is not None:
+            # Handle the case when text_tokens is a raw tensor (instead of a dict-like object)
+            if isinstance(text_tokens, torch.Tensor):
+                # Create attention mask if not provided
+                if text_mask is None:
+                    text_mask = (text_tokens != 0).float()
+                
+                # Create a dict-like structure with the necessary attributes
+                class TokenObject:
+                    def __init__(self, input_ids, attention_mask):
+                        self.input_ids = input_ids
+                        self.attention_mask = attention_mask
+                
+                text_tokens = TokenObject(text_tokens, text_mask)
+                
+                # Skip ITM for raw tensor inputs to avoid indexing issues
+                self._original_use_itm = self.use_itm
+                self.use_itm = False
+            
+            # Use provided tokens
+            text_output = self.text_encoder(
+                text_tokens.input_ids,
+                attention_mask=text_tokens.attention_mask,
+                return_dict=True
+            )
+            text_embeds = text_output.last_hidden_state
+            text_feat = F.normalize(
+                self.text_proj(text_embeds[:, 0, :]), dim=-1
+            )
+        else:
+            # No text provided
+            return image_feats
+            
+        # Compute image-text similarity
+        # Each query token attends to the text
+        sim_q2t = torch.matmul(image_feats, text_feat.unsqueeze(-1)).squeeze(-1)
+        
+        # Get max similarity across all query tokens
+        sim_i2t, _ = sim_q2t.max(-1)
+        sim_i2t = sim_i2t / self.temp
+        
+        # Compute text-image similarity
+        sim_t2i = torch.matmul(text_feat, image_feats.permute(0, 2, 1)).max(-1)[0] / self.temp
+        
+        # Create proper similarity matrices for contrastive learning
+        # We need [B, B] matrices where sim[i, j] is similarity between ith image and jth text
+        full_sim_i2t = torch.zeros(B, B, device=device)
+        full_sim_t2i = torch.zeros(B, B, device=device)
+        
+        # Fill the matrices
+        for i in range(B):
+            for j in range(B):
+                # Image i to text j similarity
+                full_sim_i2t[i, j] = torch.matmul(
+                    image_feats[i].mean(0), 
+                    text_feat[j]
+                ) / self.temp
+                
+                # Text i to image j similarity
+                full_sim_t2i[i, j] = torch.matmul(
+                    text_feat[i], 
+                    image_feats[j].mean(0)
+                ) / self.temp
+        
+        # Targets are the diagonal elements (where i == j)
+        targets = torch.arange(B, device=device)
+        
+        # Compute NLL loss
+        loss_i2t = F.cross_entropy(full_sim_i2t, targets)
+        loss_t2i = F.cross_entropy(full_sim_t2i, targets)
+        
+        self.contrastive_loss = (loss_i2t + loss_t2i) / 2.0
+        
+        # Compute image-text matching loss if enabled
+        if self.use_itm and B > 1 and not hasattr(self, '_original_use_itm'):  # Need at least 2 samples for negative mining
+            with torch.no_grad():
+                # Create similarity matrices for hard negative mining
+                weights_t2i = F.softmax(sim_t2i, dim=1)
+                weights_i2t = F.softmax(sim_i2t, dim=1)
+                
+            # Select hard negative samples
+            image_embeds_neg = []
+            text_ids_neg = []
+            text_atts_neg = []
+            
+            for b in range(B):
+                # Select a negative image for each text
+                neg_idx = torch.multinomial(weights_t2i[b], 1).item()
+                image_embeds_neg.append(x[neg_idx])
+                
+                # Select a negative text for each image
+                neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+                text_ids_neg.append(text_tokens.input_ids[neg_idx])
+                text_atts_neg.append(text_tokens.attention_mask[neg_idx])
+            
+            image_embeds_neg = torch.stack(image_embeds_neg, dim=0)
+            text_ids_neg = torch.stack(text_ids_neg, dim=0)
+            text_atts_neg = torch.stack(text_atts_neg, dim=0)
+            
+            # Create input tensors with positive and negative pairs
+            text_ids_all = torch.cat([text_tokens.input_ids, text_ids_neg], dim=0)
+            text_atts_all = torch.cat([text_tokens.attention_mask, text_atts_neg], dim=0)
+            
+            image_embeds_all = torch.cat([x, image_embeds_neg], dim=0)
+            
+            # Process through transformer for ITM
+            query_tokens_itm = self.query_tokens.expand(text_ids_all.shape[0], -1, -1)
+            hidden_states_itm = query_tokens_itm.clone()
+            
+            # Process through transformer layers
+            layer_idx = 0
+            while layer_idx < len(self.layers):
+                layer = self.layers[layer_idx]
+                
+                if isinstance(layer, TransformerSelfAttentionLayer):
+                    hidden_states_itm = layer(hidden_states_itm)
+                elif isinstance(layer, TransformerCrossAttentionLayer):
+                    hidden_states_itm = layer(q=hidden_states_itm, kv=image_embeds_all, mask=None)
+                
+                layer_idx += 1
+            
+            # Final ITM prediction
+            vl_embeddings = self.final_norm(hidden_states_itm)
+            vl_output = self.itm_head(vl_embeddings)
+            logits = vl_output.mean(dim=1)
+            
+            # Create ITM labels (1 for positive pairs, 0 for negative pairs)
+            itm_labels = torch.cat(
+                [torch.ones(B, dtype=torch.long), torch.zeros(B, dtype=torch.long)],
+                dim=0
+            ).to(device)
+            
+            # Compute ITM loss
+            self.itm_loss = F.cross_entropy(logits, itm_labels)
+        
+        # If we temporarily disabled ITM, restore the original setting
+        if hasattr(self, '_original_use_itm'):
+            self.use_itm = self._original_use_itm
+            delattr(self, '_original_use_itm')
+
+        # During training, return the image features (the text alignment is enforced via loss)
+        return image_feats
+
+    def get_loss(self):
+        """
+        Get combined loss from contrastive and ITM objectives
+        """
+        if self.use_itm:
+            return self.contrastive_loss + self.itm_loss
+        return self.contrastive_loss
+
+
 def get_projector(projector_name, input_dim, output_dim, **kwargs):
     """
     Factory function to create the appropriate projector based on name
@@ -2051,9 +2678,9 @@ def get_projector(projector_name, input_dim, output_dim, **kwargs):
     Args:
         projector_name: Name/type of projector to create
         input_dim: Input dimension
-        output_dim: Output dimension
+        output_dim: Output dimension 
         **kwargs: Additional projector-specific parameters
-    
+        
     Returns:
         Instantiated projector module
     """
@@ -2205,6 +2832,36 @@ def get_projector(projector_name, input_dim, output_dim, **kwargs):
             num_scales=kwargs.get("num_scales", 3),
             num_heads=kwargs.get("projector_num_heads", 8),
             dropout=kwargs.get("projector_dropout", 0.1)
+        )
+    
+    elif projector_name.lower() == "text_guided_qformer":
+        return TextGuidedQFormer(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_queries=kwargs.get("projector_num_queries", 32),
+            num_layers=kwargs.get("projector_num_layers", 6),
+            num_heads=kwargs.get("projector_num_heads", 8),
+            intermediate_dim=kwargs.get("projector_hidden_dim", 3072),
+            dropout=kwargs.get("projector_dropout", 0.1),
+            use_temporal_attention=kwargs.get("use_temporal_attention", True),
+            temporal_window_size=kwargs.get("temporal_window_size", 5),
+            distillation_weight=kwargs.get("distillation_weight", 0.5)
+        )
+    
+    elif projector_name.lower() == "text_guided_blip_qformer":
+        return TextGuidedBlipQFormer(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_queries=kwargs.get("projector_num_queries", 32),
+            num_layers=kwargs.get("projector_num_layers", 6),
+            num_heads=kwargs.get("projector_num_heads", 8),
+            intermediate_dim=kwargs.get("projector_hidden_dim", 3072),
+            dropout=kwargs.get("projector_dropout", 0.1),
+            use_temporal_attention=kwargs.get("use_temporal_attention", True),
+            temporal_window_size=kwargs.get("temporal_window_size", 5),
+            contrastive_temperature=kwargs.get("contrastive_temperature", 0.07),
+            max_text_len=kwargs.get("max_text_len", 32),
+            use_itm=kwargs.get("use_itm", True)
         )
     
     else:

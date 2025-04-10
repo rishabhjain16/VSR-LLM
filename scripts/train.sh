@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs_combined   # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Non_CTC_L2_visual_only_qformer   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/llama2_text_guided_qformer   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -43,8 +43,8 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # Edit these variables directly to change training configuration
 # -------------------------------------------------------------
 
-# Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, etc.)
-PROJECTOR_TYPE="visual_only_qformer"
+# Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, text_guided_qformer, text_guided_blip_qformer, etc.)
+PROJECTOR_TYPE="comprehensive_qformer"
 
 # CTC configuration
 USE_CTC="false"  # Set to "true" to enable CTC loss
