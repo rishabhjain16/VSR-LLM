@@ -203,7 +203,7 @@ class VSPLLMConfig(FairseqDataclass):
         metadata={"help": "Whether to use CTC auxiliary loss during training"}
     )
     ctc_use_char_level: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Use character-level tokenization for CTC instead of word-level (recommended)"}
     )
     ctc_weight: float = field(
@@ -288,9 +288,37 @@ class HubertEncoderWrapper(FairseqEncoder):
 class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
     def __init__(self, encoder, decoder, cfg):
         super().__init__()
-        self.cfg = cfg
         self.encoder = encoder
         self.decoder = decoder
+        self.cfg = cfg
+        # Performance monitoring counters
+        self.num_updates = 0
+        self.batch_counter = 0
+        # Track which CTC flag to use in forward pass
+        self._use_ctc_in_forward = False if not hasattr(cfg, 'use_ctc') else cfg.use_ctc
+        # CTC auxiliary loss properties
+        self.use_ctc = getattr(cfg, 'use_ctc', False)
+        self.ctc_weight = getattr(cfg, 'ctc_weight', 0.3)  # Default to 30% CTC loss
+        self.ctc_use_char_level = getattr(cfg, 'ctc_use_char_level', False)
+        # Vision-language processor (will be set if using a VL model)
+        self.vl_processor = None
+        
+        # Create the appropriate projector based on configuration
+        if hasattr(cfg, 'projector_type'):
+            # Get a projector from the factory function
+            projector_args = {
+                'input_dim': cfg.encoder_embed_dim,
+                'output_dim': cfg.decoder_embed_dim,
+                'hidden_dim': getattr(cfg, 'projector_hidden_dim', None),
+                'num_layers': getattr(cfg, 'projector_num_layers', 2),
+                'num_heads': getattr(cfg, 'projector_num_heads', 8),
+                'dropout': getattr(cfg, 'projector_dropout', 0.1),
+                'num_queries': getattr(cfg, 'projector_num_queries', 32),
+            }
+            self.projector = get_projector(cfg.projector_type, **projector_args)
+        else:
+            # Fallback to a simple linear layer if no projector type specified
+            self.projector = nn.Linear(cfg.encoder_embed_dim, cfg.decoder_embed_dim)
         
         # Initialize num_updates for logging
         self.num_updates = 0
@@ -422,7 +450,31 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             bnb_4bit_compute_dtype=torch.bfloat16
         )
 
-        decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path, quantization_config=bnb_config)            
+        # Check if the model is a vision-language model (like Qwen2.5-VL)
+        is_vl_model = any(vl_model in cfg.llm_ckpt_path for vl_model in ["Qwen2.5-VL", "qwen2.5-vl", "Qwen-VL", "qwen-vl"])
+        
+        if is_vl_model:
+            # Import vision-language specific modules
+            try:
+                from transformers import AutoProcessor, AutoModelForVision2Seq
+                print(f"\n=== Loading Vision-Language model: {cfg.llm_ckpt_path} ===")
+                
+                # First load the processor which handles both text and images
+                processor = AutoProcessor.from_pretrained(cfg.llm_ckpt_path)
+                
+                # Then load the actual model
+                decoder_4bit = AutoModelForVision2Seq.from_pretrained(
+                    cfg.llm_ckpt_path,
+                    quantization_config=bnb_config
+                )
+            except Exception as e:
+                print(f"Error loading Vision-Language model: {e}")
+                print("\nPlease make sure you have the latest version of transformers installed:")
+                print("pip install git+https://github.com/huggingface/transformers accelerate")
+                raise
+        else:
+            # Standard language model loading
+            decoder_4bit = AutoModelForCausalLM.from_pretrained(cfg.llm_ckpt_path, quantization_config=bnb_config)
 
         # Use our new function to get target modules based on model architecture
         if hasattr(decoder_4bit.config, 'model_type'):
@@ -451,7 +503,15 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         decoder_4bit = get_peft_model(decoder_4bit, config)
         decoder_4bit.print_trainable_parameters()
         
-        return avhubert_llm_seq2seq_cluster_count(encoder, decoder_4bit, cfg)
+        # Create the model instance
+        model = avhubert_llm_seq2seq_cluster_count(encoder, decoder_4bit, cfg)
+        
+        # If this is a vision-language model, save the processor as an attribute
+        if is_vl_model and 'processor' in locals():
+            model.vl_processor = processor
+            print(f"=== Vision-Language processor attached to model ===")
+        
+        return model
     
     def forward(self, **kwargs):
         # Increment batch counter for logging
@@ -476,17 +536,45 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         # Get transcript information for cross-modal alignment
         labels = kwargs['target_list'].clone()
         
-        # Get labels embedding directly from the model
-        if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
-            labels_embedding = self.decoder.model.model.embed_tokens(labels)
-        elif hasattr(self.decoder, 'model'):
-            labels_embedding = self.decoder.model.embed_tokens(labels)
+        # Check if we're dealing with a vision-language model
+        is_vl_model = hasattr(self.decoder, 'config') and (
+            getattr(self.decoder.config, 'model_type', '').lower() == 'vision2seq' or
+            ('qwen' in getattr(self.decoder.config, 'model_type', '').lower() and 'vl' in getattr(self.decoder.config, 'model_type', '').lower())
+        )
+        
+        # Get labels embedding directly from the model, handling different model architectures
+        if is_vl_model:
+            # For vision-language models, embedding access might be different
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'language_model'):
+                labels_embedding = self.decoder.model.language_model.embed_tokens(labels)
+            elif hasattr(self.decoder, 'language_model'):
+                labels_embedding = self.decoder.language_model.embed_tokens(labels)
+            else:
+                # Try standard paths as fallback
+                if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                    labels_embedding = self.decoder.model.model.embed_tokens(labels)
+                elif hasattr(self.decoder, 'model'):
+                    labels_embedding = self.decoder.model.embed_tokens(labels)
+                else:
+                    labels_embedding = self.decoder.embed_tokens(labels)
         else:
-            labels_embedding = self.decoder.embed_tokens(labels)
+            # Standard language model embedding access
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                labels_embedding = self.decoder.model.model.embed_tokens(labels)
+            elif hasattr(self.decoder, 'model'):
+                labels_embedding = self.decoder.model.embed_tokens(labels)
+            else:
+                labels_embedding = self.decoder.embed_tokens(labels)
         
         # Simplified rule for text-based projectors:
         # Linear and MLP are cluster-based, everything else is text-based
         is_text_based = self.cfg.projector_type.lower() not in ['linear', 'mlp']
+        
+        # === FORCE VISUAL-ONLY DURING TRAINING ===
+        # If you want to completely disable text conditioning during training,
+        # uncomment the following line:
+        # is_text_based = False 
+        # ========================================
         
         # Exclude visual-only projectors from receiving text tokens
         is_visual_only = "visual_only" in self.cfg.projector_type.lower()
@@ -632,8 +720,25 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         target_ids = torch.full((B, T + instruction_embedding_t),-100).long().to(labels.device)
         llm_labels = torch.cat((target_ids, llm_labels), dim=1)
         
-        # Use a single code path for all models instead of model-specific branches
-        llm_out = self.decoder(inputs_embeds=llm_input, labels=llm_labels, return_dict=True)
+        # Special handling for Qwen VL models
+        is_qwen_vl = hasattr(self.decoder, 'config') and 'qwen' in getattr(self.decoder.config, 'model_type', '').lower() and 'vl' in getattr(self.decoder.config, 'model_type', '').lower()
+        
+        # Prepare decoder inputs
+        decoder_inputs = {
+            'inputs_embeds': llm_input, 
+            'labels': llm_labels, 
+            'return_dict': True
+        }
+        
+        # For Qwen VL models, add position_ids to avoid shape error
+        if is_qwen_vl:
+            # Create position_ids manually since we're not providing input_ids
+            position_ids = torch.arange(llm_input.size(1), device=llm_input.device, dtype=torch.long)
+            position_ids = position_ids.unsqueeze(0).expand(B, -1)
+            decoder_inputs['position_ids'] = position_ids
+        
+        # Use a single code path for all models
+        llm_out = self.decoder(**decoder_inputs)
         lm_loss = llm_out.loss
         
         # Calculate CTC loss if enabled and in training mode
@@ -950,16 +1055,31 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
 
         # Use a consistent approach for all models
         self.decoder.config.use_cache = True
-        outputs = self.decoder.generate(
-            inputs_embeds=llm_input,
-            top_p=top_p,
-            num_beams=num_beams,
-            max_new_tokens=128,
-            min_length=min_length,
-            repetition_penalty=repetition_penalty,
-            do_sample=True,
-            length_penalty=length_penalty,
-        )
+        
+        # Special handling for Qwen VL models
+        is_qwen_vl = hasattr(self.decoder, 'config') and 'qwen' in getattr(self.decoder.config, 'model_type', '').lower() and 'vl' in getattr(self.decoder.config, 'model_type', '').lower()
+        
+        # Prepare generation parameters
+        generate_kwargs = {
+            'inputs_embeds': llm_input,
+            'top_p': top_p,
+            'num_beams': num_beams,
+            'max_new_tokens': 256,
+            'min_length': min_length,
+            'repetition_penalty': repetition_penalty,
+            'do_sample': True,
+            'length_penalty': length_penalty,
+        }
+        
+        # For Qwen VL models, add position_ids to avoid shape error
+        if is_qwen_vl:
+            # Create position_ids manually since we're not providing input_ids
+            B = llm_input.size(0)  # batch size
+            position_ids = torch.arange(llm_input.size(1), device=llm_input.device, dtype=torch.long)
+            position_ids = position_ids.unsqueeze(0).expand(B, -1)
+            generate_kwargs['position_ids'] = position_ids
+        
+        outputs = self.decoder.generate(**generate_kwargs)
 
         return outputs
 
@@ -1361,17 +1481,45 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         # Get transcript information for cross-modal alignment
         labels = kwargs['target_list'].clone()
         
-        # Get labels embedding directly from the model
-        if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
-            labels_embedding = self.decoder.model.model.embed_tokens(labels)
-        elif hasattr(self.decoder, 'model'):
-            labels_embedding = self.decoder.model.embed_tokens(labels)
+        # Check if we're dealing with a vision-language model
+        is_vl_model = hasattr(self.decoder, 'config') and (
+            getattr(self.decoder.config, 'model_type', '').lower() == 'vision2seq' or
+            ('qwen' in getattr(self.decoder.config, 'model_type', '').lower() and 'vl' in getattr(self.decoder.config, 'model_type', '').lower())
+        )
+        
+        # Get labels embedding directly from the model, handling different model architectures
+        if is_vl_model:
+            # For vision-language models, embedding access might be different
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'language_model'):
+                labels_embedding = self.decoder.model.language_model.embed_tokens(labels)
+            elif hasattr(self.decoder, 'language_model'):
+                labels_embedding = self.decoder.language_model.embed_tokens(labels)
+            else:
+                # Try standard paths as fallback
+                if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                    labels_embedding = self.decoder.model.model.embed_tokens(labels)
+                elif hasattr(self.decoder, 'model'):
+                    labels_embedding = self.decoder.model.embed_tokens(labels)
+                else:
+                    labels_embedding = self.decoder.embed_tokens(labels)
         else:
-            labels_embedding = self.decoder.embed_tokens(labels)
+            # Standard language model embedding access
+            if hasattr(self.decoder, 'model') and hasattr(self.decoder.model, 'model'):
+                labels_embedding = self.decoder.model.model.embed_tokens(labels)
+            elif hasattr(self.decoder, 'model'):
+                labels_embedding = self.decoder.model.embed_tokens(labels)
+            else:
+                labels_embedding = self.decoder.embed_tokens(labels)
         
         # Simplified rule for text-based projectors:
         # Linear and MLP are cluster-based, everything else is text-based
         is_text_based = self.cfg.projector_type.lower() not in ['linear', 'mlp']
+        
+        # === FORCE VISUAL-ONLY DURING TRAINING ===
+        # If you want to completely disable text conditioning during training,
+        # uncomment the following line:
+        # is_text_based = False 
+        # ========================================
         
         # Exclude visual-only projectors from receiving text tokens
         is_visual_only = "visual_only" in self.cfg.projector_type.lower()
@@ -1517,8 +1665,25 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         target_ids = torch.full((B, T + instruction_embedding_t),-100).long().to(labels.device)
         llm_labels = torch.cat((target_ids, llm_labels), dim=1)
         
-        # Use a single code path for all models instead of model-specific branches
-        llm_out = self.decoder(inputs_embeds=llm_input, labels=llm_labels, return_dict=True)
+        # Special handling for Qwen VL models
+        is_qwen_vl = hasattr(self.decoder, 'config') and 'qwen' in getattr(self.decoder.config, 'model_type', '').lower() and 'vl' in getattr(self.decoder.config, 'model_type', '').lower()
+        
+        # Prepare decoder inputs
+        decoder_inputs = {
+            'inputs_embeds': llm_input, 
+            'labels': llm_labels, 
+            'return_dict': True
+        }
+        
+        # For Qwen VL models, add position_ids to avoid shape error
+        if is_qwen_vl:
+            # Create position_ids manually since we're not providing input_ids
+            position_ids = torch.arange(llm_input.size(1), device=llm_input.device, dtype=torch.long)
+            position_ids = position_ids.unsqueeze(0).expand(B, -1)
+            decoder_inputs['position_ids'] = position_ids
+        
+        # Use a single code path for all models
+        llm_out = self.decoder(**decoder_inputs)
         lm_loss = llm_out.loss
         
         # Calculate CTC loss if enabled and in training mode

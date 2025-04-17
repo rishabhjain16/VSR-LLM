@@ -1,0 +1,13 @@
+=== Lip Reading Evaluation Dataset Summary ===
+
+Number of examples: 1321
+
+Performance Metrics:
+- Average Viseme Alignment Score: 0.855 ± 0.170 (higher is better)
+- Average Phonetic Edit Distance: 4.577 ± 5.416 (lower is better)
+
+Operation Counts:
+- Match: 35084 (80.6%)
+- Substitute: 4885 (11.2%)
+- Delete: 2504 (5.8%)
+- Insert: 1057 (2.4%)
