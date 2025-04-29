@@ -322,6 +322,12 @@ def _main(cfg, output_file):
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.override.llm_ckpt_path
     )
+    
+    # Set padding side to 'left' for Qwen models as required
+    is_qwen_model = 'qwen' in cfg.override.llm_ckpt_path.lower()
+    if is_qwen_model:
+        logger.info("Setting tokenizer padding_side to 'left' for Qwen model")
+        tokenizer.padding_side = 'left'
 
     # # Ensure the pad token exists; if not, add it
     # if tokenizer.pad_token is None:

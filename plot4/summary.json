@@ -1,0 +1,33 @@
+{
+  "num_examples": 1321,
+  "avg_viseme_score": 0.8099368992675258,
+  "avg_phonetic_distance": 2.8092748549078976,
+  "viseme_score_std": 0.21808193096709985,
+  "phonetic_distance_std": 3.5351999020443,
+  "operations": {
+    "match": 34539,
+    "substitute": 5595,
+    "delete": 2339,
+    "insert": 892
+  },
+  "operations_percent": {
+    "match": 79.6471809062608,
+    "substitute": 12.90210999654099,
+    "delete": 5.393750720627234,
+    "insert": 2.0569583765709676
+  },
+  "cer": 0.19244221105527637,
+  "wer": 0.28220424671385236,
+  "semantic_similarity": 0.7218796014785767,
+  "semantic_wer": 0.22932254802831142,
+  "bertscore_precision": 0.9464149475097656,
+  "bertscore_recall": 0.9443050622940063,
+  "bertscore_f1": 0.9453012347221375,
+  "word_similarity": 0.8297555651941033,
+  "meteor_score": 0.7029536899079083,
+  "rouge1_score": 0.7365763697921454,
+  "rouge2_score": 0.6337104182576216,
+  "rougeL_score": 0.7353403196861366,
+  "sentence_bleu_score": 54.62958410594128,
+  "corpus_bleu_score": 62.80442241904519
+}

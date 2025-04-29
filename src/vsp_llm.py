@@ -1053,35 +1053,121 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
             
         llm_input = torch.cat((instruction_embedding, reduced_enc_out), dim=1) 
 
-        # Use a consistent approach for all models
-        self.decoder.config.use_cache = True
-        
         # Special handling for Qwen VL models
         is_qwen_vl = hasattr(self.decoder, 'config') and 'qwen' in getattr(self.decoder.config, 'model_type', '').lower() and 'vl' in getattr(self.decoder.config, 'model_type', '').lower()
         
-        # Prepare generation parameters
-        generate_kwargs = {
-            'inputs_embeds': llm_input,
-            'top_p': top_p,
-            'num_beams': num_beams,
-            'max_new_tokens': 256,
-            'min_length': min_length,
-            'repetition_penalty': repetition_penalty,
-            'do_sample': True,
-            'length_penalty': length_penalty,
-        }
-        
-        # For Qwen VL models, add position_ids to avoid shape error
         if is_qwen_vl:
-            # Create position_ids manually since we're not providing input_ids
-            B = llm_input.size(0)  # batch size
-            position_ids = torch.arange(llm_input.size(1), device=llm_input.device, dtype=torch.long)
+            # For Qwen VL models, skip beam search completely and use greedy search
+            # This avoids key-value sequence length mismatches
+            logger.info("Using Qwen VL-specific greedy generation method")
+            
+            # Create position_ids and attention_mask
+            B = llm_input.size(0)
+            seq_len = llm_input.size(1)
+            position_ids = torch.arange(seq_len, device=llm_input.device, dtype=torch.long)
             position_ids = position_ids.unsqueeze(0).expand(B, -1)
-            generate_kwargs['position_ids'] = position_ids
-        
-        outputs = self.decoder.generate(**generate_kwargs)
-
-        return outputs
+            attention_mask = torch.ones((B, seq_len), device=llm_input.device, dtype=torch.long)
+            
+            # Manual greedy generation to avoid beam search issues
+            with torch.no_grad():
+                # Initial forward pass with embedded inputs
+                outputs = self.decoder(
+                    inputs_embeds=llm_input,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    use_cache=True
+                )
+                
+                # Get bos token id (use 1 as default)
+                bos_token_id = getattr(self.decoder.config, "bos_token_id", 1)
+                
+                # Initialize with bos token
+                input_ids = torch.full((B, 1), bos_token_id, dtype=torch.long, device=llm_input.device)
+                generated_tokens = input_ids.clone()
+                
+                # Get eos token id
+                eos_token_id = getattr(self.decoder.config, "eos_token_id", 2)
+                
+                # Track which sequences are completed
+                done_sequences = torch.zeros(B, dtype=torch.bool, device=llm_input.device)
+                
+                # Past key values from initial forward pass
+                past_key_values = outputs.past_key_values
+                
+                # Generate tokens auto-regressively
+                max_length = 256  # Maximum new tokens to generate
+                
+                for _ in range(max_length):
+                    # Prepare for the next forward pass
+                    model_inputs = {
+                        "input_ids": input_ids,
+                        "past_key_values": past_key_values,
+                        "use_cache": True,
+                        "return_dict": True
+                    }
+                    
+                    # Add position_ids for next position
+                    next_position = seq_len + generated_tokens.size(1) - 1
+                    next_position_ids = torch.tensor([[next_position]], device=llm_input.device)
+                    model_inputs["position_ids"] = next_position_ids
+                    
+                    # Extend attention mask for the new token
+                    extended_attention_mask = torch.cat([
+                        attention_mask,
+                        torch.ones((B, generated_tokens.size(1)), dtype=torch.long, device=llm_input.device)
+                    ], dim=1)
+                    model_inputs["attention_mask"] = extended_attention_mask
+                    
+                    try:
+                        # Get next token logits
+                        outputs = self.decoder(**model_inputs)
+                        next_token_logits = outputs.logits[:, -1, :]
+                        past_key_values = outputs.past_key_values
+                        
+                        # Apply temperature for randomness
+                        next_token_logits = next_token_logits / 0.7
+                        
+                        # Get next token (greedy)
+                        next_tokens = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+                        
+                        # Update generated tokens
+                        generated_tokens = torch.cat([generated_tokens, next_tokens], dim=-1)
+                        
+                        # Check for EOS
+                        done_sequences = done_sequences | (next_tokens.squeeze(-1) == eos_token_id)
+                        if done_sequences.all():
+                            break
+                            
+                        # Update input_ids for next iteration (just the new token)
+                        input_ids = next_tokens
+                        
+                    except RuntimeError as e:
+                        # If we still get an error, log and break the loop
+                        logger.error(f"Error during Qwen VL generation: {str(e)}")
+                        break
+                
+                # Return the generated sequence
+                return generated_tokens
+            
+        else:
+            # Standard generation for non-Qwen models
+            self.decoder.config.use_cache = True
+            
+            # Prepare generation parameters
+            generate_kwargs = {
+                'inputs_embeds': llm_input,
+                'top_p': top_p,
+                'num_beams': num_beams,
+                'max_new_tokens': 256,
+                'min_length': min_length,
+                'repetition_penalty': repetition_penalty,
+                'do_sample': True,
+                'length_penalty': length_penalty,
+            }
+            
+            outputs = self.decoder.generate(**generate_kwargs)
+            return outputs
 
     def get_ctc_target(self, sample):
         return sample["target"], sample["target_lengths"]

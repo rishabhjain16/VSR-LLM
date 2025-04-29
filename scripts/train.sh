@@ -9,7 +9,7 @@
 # set variables
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data   # path to train dataset dir
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Qwen2.5-VL-7B-Instruct_lrs3   # output path to save
+OUT_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Qwen2.5-VL-7B-Instruct_lrs3_linear   # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
@@ -44,7 +44,7 @@ export PYTHONPATH="${ROOT}/fairseq:$PYTHONPATH"
 # -------------------------------------------------------------
 
 # Which projector to use (linear, mlp, qformer, visual_speech_qformer, ebranchformer_cluster, text_guided_qformer, text_guided_blip_qformer, etc.)
-PROJECTOR_TYPE="visual_speech_qformer"
+PROJECTOR_TYPE="linear"
 
 # CTC configuration
 USE_CTC="false"  # Set to "true" to enable CTC loss

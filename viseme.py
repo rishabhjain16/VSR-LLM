@@ -1,21 +1,26 @@
-import numpy as np
-import math
-from collections import Counter
-from g2p_en import G2p  # Grapheme-to-phoneme converter
-import matplotlib.pyplot as plt
-import numpy as np
-import seaborn as sns
-from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.patches import Patch  # Add this import for Patch
-from sklearn.manifold import TSNE
-import networkx as nx
 import os
-import time
 import json
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.colors import LogNorm, LinearSegmentedColormap
+from matplotlib.patches import Patch
+from collections import Counter, defaultdict
+from itertools import chain
 from datetime import datetime
-import panphon.distance  # Library for phonological features
+from g2p_en import G2p  # Grapheme-to-phoneme converter
+import panphon
+import panphon.distance
 import panphon.featuretable
 from difflib import SequenceMatcher
+import nltk
+from nltk.translate import meteor_score
+from nltk.translate.bleu_score import sentence_bleu, corpus_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
+import torch
+from sentence_transformers import SentenceTransformer
+import bert_score
 
 
 class LipReadingEvaluator:
@@ -23,333 +28,219 @@ class LipReadingEvaluator:
     
     def __init__(self, load_from_file=None):
         """Initialize the evaluator with phoneme mappings and converters"""
-        # Initialize G2P converter
-        self.g2p = G2p()
         
-        # Define comprehensive phoneme-to-viseme mapping
+        # Import essential libraries
+        try:
+            import g2p_en
+            self.g2p = g2p_en.G2p()
+        except ImportError:
+            print("ERROR: g2p_en library is required for phoneme conversion")
+            print("Install with: pip install g2p_en")
+            raise
+            
+        try:
+            import panphon
+            self.ft = panphon.featuretable.FeatureTable()
+            self.dst = panphon.distance.Distance()
+            self._has_panphon = True
+        except ImportError:
+            print("ERROR: panphon library is required for phonetic features")
+            print("Install with: pip install panphon")
+            raise
+        
+        # Define phoneme-to-viseme mapping using Microsoft's 22-category system
         self.phoneme_to_viseme = {
-            # Bilabial consonants
-            'p': 'bilabial', 'b': 'bilabial', 'm': 'bilabial',
-            # Labiodental consonants
-            'f': 'labiodental', 'v': 'labiodental',
-            # Dental consonants
-            'θ': 'dental', 'ð': 'dental',
-            # Alveolar consonants
-            't': 'alveolar', 'd': 'alveolar', 's': 'alveolar', 
-            'z': 'alveolar', 'n': 'alveolar', 'l': 'alveolar',
-            # Post-alveolar consonants
-            'ʃ': 'post-alveolar', 'ʒ': 'post-alveolar', 
-            'tʃ': 'post-alveolar', 'dʒ': 'post-alveolar',
-            # Palatal
-            'j': 'palatal', 'ɲ': 'palatal',
-            # Velar consonants
-            'k': 'velar', 'g': 'velar', 'ŋ': 'velar', 'w': 'velar',
-            # Glottal consonants
-            'h': 'glottal', 'ʔ': 'glottal',
-            # Retroflex
-            'r': 'retroflex', 'ɹ': 'retroflex', 'ɾ': 'retroflex',
-            # Vowels by position
-            # Front vowels
-            'i': 'front_vowel', 'ɪ': 'front_vowel', 'e': 'front_vowel', 
-            'ɛ': 'front_vowel', 'æ': 'front_vowel',
-            # Central vowels
-            'ə': 'central_vowel', 'ʌ': 'central_vowel', 'ɜ': 'central_vowel',
-            'ɝ': 'central_vowel', 'ɚ': 'central_vowel',
-            # Back vowels
-            'u': 'back_vowel', 'ʊ': 'back_vowel', 'o': 'back_vowel', 
-            'ɔ': 'back_vowel', 'ɑ': 'back_vowel', 'ɒ': 'back_vowel',
-            # Diphthongs
-            'eɪ': 'diphthong', 'aɪ': 'diphthong', 'ɔɪ': 'diphthong', 
-            'aʊ': 'diphthong', 'oʊ': 'diphthong', 'ɪə': 'diphthong',
-            'ʊə': 'diphthong', 'eə': 'diphthong',
-            # Special characters
-            '.': 'silence', ' ': 'silence', '-': 'silence'
+            # 0: Silence
+            '.': 0, ' ': 0, '-': 0, 
+            
+            # 1: Open/central vowels (æ, ə, ʌ)
+            'æ': 1, 'ə': 1, 'ʌ': 1,
+            
+            # 2: Open back vowels
+            'ɑ': 2, 'ɒ': 2,
+            
+            # 3: Open-mid back rounded
+            'ɔ': 3,
+            
+            # 4: Mid vowels
+            'ɛ': 4, 'ʊ': 4, 'e': 4,
+            
+            # 5: R-colored vowels
+            'ɝ': 5, 'ɚ': 5,
+            
+            # 6: Close front vowels + /j/
+            'i': 6, 'ɪ': 6, 'j': 6,
+            
+            # 7: Close back rounded + /w/
+            'u': 7, 'w': 7,
+            
+            # 8: Close-mid back rounded
+            'o': 8,
+            
+            # 9-11: Major diphthongs
+            'aʊ': 9, 'ɔɪ': 10, 'aɪ': 11,
+            'eɪ': 6, 'oʊ': 8, 'ɪə': 6,
+            'eə': 4, 'ʊə': 4,
+            
+            # 12: Glottal
+            'h': 12, 'ʔ': 12,
+            
+            # 13: Rhotic approximant
+            'ɹ': 13, 'r': 13, 'ɾ': 13,
+            
+            # 14: Lateral approximant
+            'l': 14,
+            
+            # 15: Alveolar fricatives
+            's': 15, 'z': 15,
+            
+            # 16: Post-alveolar sounds
+            'ʃ': 16, 'ʒ': 16, 'tʃ': 16, 'dʒ': 16,
+            
+            # 17: Voiced dental fricative
+            'ð': 17,
+            
+            # 18: Labiodental fricatives
+            'f': 18, 'v': 18,
+            
+            # 19: Alveolar stops, nasal + voiceless dental
+            't': 19, 'd': 19, 'n': 19, 'θ': 19,
+            
+            # 20: Velar consonants
+            'k': 20, 'g': 20, 'ŋ': 20, 'ɲ': 20,
+            
+            # 21: Bilabial consonants
+            'p': 21, 'b': 21, 'm': 21
         }
         
-        if load_from_file:
-            # Load phoneme features from file if provided
-            self.load_phoneme_features(load_from_file)
-        else:
-            # Define default phoneme features (used as fallback)
-            self.phoneme_features = self.generate_default_phoneme_features()
-            
-            # Try to generate phoneme features using panphon (preferred method)
-            try:
-                self.generate_phoneme_features_from_panphon()
-            except ImportError:
-                print("Note: panphon not available for automatic phoneme feature generation")
-                print("Using predefined feature set instead")
+        # Add viseme ID to name mapping for better readability
+        self.viseme_id_to_name = {
+            0: "SILENCE",
+            1: "VOWEL_CENTRAL",
+            2: "VOWEL_OPEN_BACK",
+            3: "VOWEL_OPEN_MID_BACK",
+            4: "VOWEL_MID",
+            5: "VOWEL_RHOTIC",
+            6: "VOWEL_CLOSE_FRONT",
+            7: "VOWEL_CLOSE_BACK",
+            8: "VOWEL_MID_BACK",
+            9: "DIPHTHONG_AW",
+            10: "DIPHTHONG_OY",
+            11: "DIPHTHONG_AY",
+            12: "CONSONANT_GLOTTAL",
+            13: "CONSONANT_RHOTIC",
+            14: "CONSONANT_LATERAL",
+            15: "CONSONANT_ALVEOLAR_FRICATIVE",
+            16: "CONSONANT_POSTALVEOLAR",
+            17: "CONSONANT_DENTAL_VOICED",
+            18: "CONSONANT_LABIODENTAL",
+            19: "CONSONANT_ALVEOLAR_DENTAL",
+            20: "CONSONANT_VELAR",
+            21: "CONSONANT_BILABIAL"
+        }
         
-        # Calculate feature weights based on information theory
-        self.feature_weights = self.calculate_information_theoretic_weights()
+        # Initialize phoneme feature cache
+        self.phoneme_features_cache = {}
         
-        # Pre-calculate phoneme similarity matrix based on information-theoretic approach
+        # Pre-calculate phoneme similarity matrix based on panphon distance
         self.similarity_cache = {}
 
-    def generate_default_phoneme_features(self):
-        """Generate default phoneme features as fallback"""
-        return {
-            # Bilabial consonants
-            'p': {'place': 1, 'manner': 'stop', 'voiced': 0},
-            'b': {'place': 1, 'manner': 'stop', 'voiced': 1},
-            'm': {'place': 1, 'manner': 'nasal', 'voiced': 1},
-            # Labiodental consonants
-            'f': {'place': 2, 'manner': 'fricative', 'voiced': 0},
-            'v': {'place': 2, 'manner': 'fricative', 'voiced': 1},
-            # Dental consonants
-            'θ': {'place': 3, 'manner': 'fricative', 'voiced': 0},
-            'ð': {'place': 3, 'manner': 'fricative', 'voiced': 1},
-            # Alveolar consonants
-            't': {'place': 4, 'manner': 'stop', 'voiced': 0},
-            'd': {'place': 4, 'manner': 'stop', 'voiced': 1},
-            's': {'place': 4, 'manner': 'fricative', 'voiced': 0},
-            'z': {'place': 4, 'manner': 'fricative', 'voiced': 1},
-            'n': {'place': 4, 'manner': 'nasal', 'voiced': 1},
-            'l': {'place': 4, 'manner': 'liquid', 'voiced': 1},
-            # Post-alveolar consonants
-            'ʃ': {'place': 5, 'manner': 'fricative', 'voiced': 0},
-            'ʒ': {'place': 5, 'manner': 'fricative', 'voiced': 1},
-            'tʃ': {'place': 5, 'manner': 'affricate', 'voiced': 0},
-            'dʒ': {'place': 5, 'manner': 'affricate', 'voiced': 1},
-            # Palatal consonants
-            'j': {'place': 5.5, 'manner': 'approximant', 'voiced': 1},
-            'ɲ': {'place': 5.5, 'manner': 'nasal', 'voiced': 1},
-            # Velar consonants
-            'k': {'place': 6, 'manner': 'stop', 'voiced': 0},
-            'g': {'place': 6, 'manner': 'stop', 'voiced': 1},
-            'ŋ': {'place': 6, 'manner': 'nasal', 'voiced': 1},
-            'w': {'place': 6, 'manner': 'approximant', 'voiced': 1},
-            # Glottal consonants
-            'h': {'place': 7, 'manner': 'fricative', 'voiced': 0},
-            'ʔ': {'place': 7, 'manner': 'stop', 'voiced': 0},
-            # Retroflex
-            'r': {'place': 4.5, 'manner': 'liquid', 'voiced': 1, 'rhotic': 1},
-            'ɹ': {'place': 4.5, 'manner': 'approximant', 'voiced': 1, 'rhotic': 1},
-            'ɾ': {'place': 4.5, 'manner': 'flap', 'voiced': 1, 'rhotic': 1},
+    def get_phoneme_features(self, phoneme):
+        """
+        Get the phonetic features for a given phoneme using panphon.
+        
+        Args:
+            phoneme: The phoneme to get features for
             
-            # Vowels
-            # Front vowels
-            'i': {'height': 1, 'backness': 1, 'rounded': 0, 'tense': 1},
-            'ɪ': {'height': 1.5, 'backness': 1, 'rounded': 0, 'tense': 0},
-            'e': {'height': 2, 'backness': 1, 'rounded': 0, 'tense': 1},
-            'ɛ': {'height': 3, 'backness': 1, 'rounded': 0, 'tense': 0},
-            'æ': {'height': 3.5, 'backness': 1, 'rounded': 0, 'tense': 0},
-            # Central vowels
-            'ə': {'height': 2.5, 'backness': 2, 'rounded': 0, 'tense': 0},
-            'ʌ': {'height': 3, 'backness': 2, 'rounded': 0, 'tense': 0},
-            'ɜ': {'height': 3, 'backness': 2, 'rounded': 0, 'tense': 0},
-            'ɝ': {'height': 3, 'backness': 2, 'rounded': 0, 'tense': 0, 'rhotic': 1},
-            'ɚ': {'height': 2.5, 'backness': 2, 'rounded': 0, 'tense': 0, 'rhotic': 1},
-            # Back vowels
-            'u': {'height': 1, 'backness': 3, 'rounded': 1, 'tense': 1},
-            'ʊ': {'height': 1.5, 'backness': 3, 'rounded': 1, 'tense': 0},
-            'o': {'height': 2, 'backness': 3, 'rounded': 1, 'tense': 1},
-            'ɔ': {'height': 3, 'backness': 3, 'rounded': 1, 'tense': 0},
-            'ɑ': {'height': 4, 'backness': 3, 'rounded': 0, 'tense': 1},
-            'ɒ': {'height': 4, 'backness': 3, 'rounded': 1, 'tense': 0},
+        Returns:
+            dict: A dictionary of phonetic features
+        """
+        # Check if we've cached this phoneme's features
+        if phoneme in self.phoneme_features_cache:
+            return self.phoneme_features_cache[phoneme]
             
-            # Diphthongs
-            'eɪ': {'start_height': 2, 'start_backness': 1, 'end_height': 1.5, 'end_backness': 1},
-            'aɪ': {'start_height': 4, 'start_backness': 2, 'end_height': 1.5, 'end_backness': 1},
-            'ɔɪ': {'start_height': 3, 'start_backness': 3, 'end_height': 1.5, 'end_backness': 1},
-            'aʊ': {'start_height': 4, 'start_backness': 2, 'end_height': 1.5, 'end_backness': 3},
-            'oʊ': {'start_height': 2, 'start_backness': 3, 'end_height': 1.5, 'end_backness': 3},
-            'ɪə': {'start_height': 1.5, 'start_backness': 1, 'end_height': 2.5, 'end_backness': 2},
-            'ʊə': {'start_height': 1.5, 'start_backness': 3, 'end_height': 2.5, 'end_backness': 2},
-            'eə': {'start_height': 2, 'start_backness': 1, 'end_height': 2.5, 'end_backness': 2}
-        }
-    
-    def generate_phoneme_features_from_panphon(self):
-        """Generate phoneme features using panphon library as primary source"""
+        # Handle special characters
+        if phoneme in ['.', ' ', '-'] or not phoneme.strip():
+            features = {'is_silence': 1}
+            self.phoneme_features_cache[phoneme] = features
+            return features
+            
+        # Try to get panphon features
         try:
-            # Initialize panphon feature table and distance calculator
-            ft = panphon.featuretable.FeatureTable()
-            dst = panphon.distance.Distance()
+            # Get feature vector from panphon
+            feature_vector = self.ft.word_to_vector_list(phoneme, numeric=True)
             
-            # Create new feature dictionary based on panphon
-            new_features = {}
-            
-            # Get all phonemes from our viseme mapping
-            phonemes = list(self.phoneme_to_viseme.keys())
-            
-            # Process each phoneme
-            for phoneme in phonemes:
-                # Skip special characters and complex multi-character phonemes
-                if phoneme in ['.', ' ', '-']:
-                    continue
-                    
-                # Skip complex phonemes except common ones we know panphon can handle
-                if len(phoneme) > 1 and not (phoneme in ['tʃ', 'dʒ', 'θ', 'ð', 'ʃ', 'ʒ', 'ŋ']):
-                    # For diphthongs and other complex phonemes, keep default features
-                    if phoneme in self.phoneme_features:
-                        new_features[phoneme] = self.phoneme_features[phoneme]
-                    continue
+            if not feature_vector:
+                # If panphon couldn't process it, create minimal features
+                features = {'unknown': 1}
+                self.phoneme_features_cache[phoneme] = features
+                return features
                 
-                try:
-                    # Get binary feature vector from panphon
-                    feature_vector = ft.word_to_vector_list(phoneme, numeric=True)
-                    
-                    if not feature_vector:
-                        continue
-                        
-                    feature_vector = feature_vector[0]  # Take first phoneme's features
-                    
-                    # Convert to dictionary with feature names
-                    feature_dict = {}
-                    for i, feature_name in enumerate(ft.names):
-                        feature_dict[feature_name] = int(feature_vector[i])
-                    
-                    # Add high-level classifications based on panphon features
-                    
-                    # Determine if vowel
-                    is_vowel = feature_dict.get('syl', 0) == 1
-                    
-                    if is_vowel:
-                        # Vowel features
-                        feature_dict['is_vowel'] = 1
-                        
-                        # Height (high, mid, low)
-                        if feature_dict.get('hi', 0) == 1:
-                            feature_dict['height'] = 1  # High
-                        elif feature_dict.get('lo', 0) == 1:
-                            feature_dict['height'] = 4  # Low
-                        else:
-                            feature_dict['height'] = 2.5  # Mid
-                            
-                        # Backness (front, central, back)
-                        if feature_dict.get('bck', 0) == 1:
-                            feature_dict['backness'] = 3  # Back
-                        elif feature_dict.get('fr', 0) == 1:
-                            feature_dict['backness'] = 1  # Front
-                        else:
-                            feature_dict['backness'] = 2  # Central
-                            
-                        # Roundedness
-                        feature_dict['rounded'] = feature_dict.get('rnd', 0)
-                    else:
-                        # Consonant features
-                        feature_dict['is_consonant'] = 1
-                        
-                        # Place of articulation
-                        if feature_dict.get('lab', 0) == 1:
-                            if feature_dict.get('dnt', 0) == 1:
-                                feature_dict['place'] = 2  # Labiodental
-                            else:
-                                feature_dict['place'] = 1  # Bilabial
-                        elif feature_dict.get('dnt', 0) == 1:
-                            feature_dict['place'] = 3  # Dental
-                        elif feature_dict.get('alv', 0) == 1:
-                            feature_dict['place'] = 4  # Alveolar
-                        elif feature_dict.get('pla', 0) == 1:
-                            feature_dict['place'] = 5  # Post-alveolar/Palatal
-                        elif feature_dict.get('vel', 0) == 1:
-                            feature_dict['place'] = 6  # Velar
-                        elif feature_dict.get('glt', 0) == 1:
-                            feature_dict['place'] = 7  # Glottal
-                        
-                        # Manner of articulation
-                        if feature_dict.get('nas', 0) == 1:
-                            feature_dict['manner'] = 'nasal'
-                        elif feature_dict.get('stp', 0) == 1:
-                            feature_dict['manner'] = 'stop'
-                        elif feature_dict.get('frc', 0) == 1:
-                            feature_dict['manner'] = 'fricative'
-                        elif feature_dict.get('lat', 0) == 1:
-                            feature_dict['manner'] = 'liquid'
-                        elif feature_dict.get('flp', 0) == 1:
-                            feature_dict['manner'] = 'flap'
-                        else:
-                            feature_dict['manner'] = 'approximant'
-                        
-                        # Voicing
-                        feature_dict['voiced'] = feature_dict.get('voi', 0)
-                        
-                    # Preserve any existing features for this phoneme
-                    if phoneme in self.phoneme_features:
-                        # Merge with existing features, preferring panphon values
-                        merged_dict = self.phoneme_features[phoneme].copy()
-                        merged_dict.update(feature_dict)
-                        feature_dict = merged_dict
-                    
-                    # Store the new feature dictionary
-                    new_features[phoneme] = feature_dict
-                    
-                except Exception as e:
-                    # Fallback to default features if available
-                    if phoneme in self.phoneme_features:
-                        new_features[phoneme] = self.phoneme_features[phoneme]
-                    print(f"Warning: Could not process phoneme '{phoneme}' with panphon: {e}")
-            
-            # Update features with panphon-derived ones, keeping defaults for any missing phonemes
-            for phoneme in self.phoneme_features:
-                if phoneme not in new_features:
-                    new_features[phoneme] = self.phoneme_features[phoneme]
-            
-            self.phoneme_features = new_features
-            print(f"Successfully generated phoneme features for {len(new_features)} phonemes using panphon")
-            return True
-            
-        except Exception as e:
-            print(f"Error generating phoneme features with panphon: {e}")
-            return False
-    
-    def enrich_features_with_panphon(self):
-        """Augment existing phoneme features using panphon library (legacy method)"""
-        try:
-            # Initialize panphon feature table
-            ft = panphon.featuretable.FeatureTable()
-            
-            # Create a distance metric
-            dst = panphon.distance.Distance()
-            
-            # Process each phoneme in our inventory
-            for phoneme in list(self.phoneme_features.keys()):
-                # Skip complex phonemes like diphthongs
-                if len(phoneme) > 1 and not (phoneme in ['tʃ', 'dʒ', 'θ', 'ð', 'ʃ', 'ʒ', 'ŋ']):
-                    continue
+            # Convert to dictionary with feature names
+            feature_dict = {}
+            for i, feature_name in enumerate(self.ft.names):
+                feature_dict[feature_name] = int(feature_vector[0][i])
                 
-                try:
-                    # Get binary feature vector
-                    features = ft.word_to_vector_list(phoneme, numeric=True)
-                    
-                    if features:
-                        features = features[0]  # Take first phoneme's features
-                        
-                        # Add these features to our existing feature set
-                        feature_dict = {}
-                        for i, feature_name in enumerate(ft.names):
-                            # Convert to binary or ternary values
-                            feature_dict[feature_name] = features[i]
-                        
-                        # Merge with existing features
-                        self.phoneme_features[phoneme].update(feature_dict)
-                except:
-                    # Skip if phoneme not recognized by panphon
-                    pass
-                    
-            print(f"Enriched phoneme features with panphon data for {len(self.phoneme_features)} phonemes")
+            # Add derived features for convenience
+            feature_dict['is_vowel'] = feature_dict.get('syl', 0) == 1
+            feature_dict['is_consonant'] = feature_dict.get('syl', 0) == 0
+            
+            # Cache and return
+            self.phoneme_features_cache[phoneme] = feature_dict
+            return feature_dict
+            
         except Exception as e:
-            print(f"Could not use panphon for feature enrichment: {e}")
-    
-    def load_phoneme_features(self, filename):
-        """Load phoneme features from a JSON file"""
+            print(f"Warning: Error getting features for '{phoneme}': {e}")
+            # Create minimal features if panphon fails
+            features = {'error': 1}
+            self.phoneme_features_cache[phoneme] = features
+            return features
+
+    def calculate_phonetic_distance(self, phoneme1, phoneme2):
+        """
+        Calculate phonetic distance between two phonemes using panphon's distance metrics.
+        
+        Args:
+            phoneme1: First phoneme
+            phoneme2: Second phoneme
+            
+        Returns:
+            float: Distance value between 0.0 (identical) and 1.0 (maximally different)
+        """
+        # Check cache to avoid recalculating
+        cache_key = (phoneme1, phoneme2)
+        if cache_key in self.similarity_cache:
+            return self.similarity_cache[cache_key]
+        
+        # Reversed key check
+        reversed_key = (phoneme2, phoneme1)
+        if reversed_key in self.similarity_cache:
+            return self.similarity_cache[reversed_key]
+        
+        # Special case: if either is silence or special character
+        if phoneme1 in ['.', ' ', '-'] or phoneme2 in ['.', ' ', '-']:
+            # Silence compared to anything is maximally different
+            distance = 1.0
+            self.similarity_cache[cache_key] = distance
+            return distance
+            
+        # Calculate distance using panphon
         try:
-            with open(filename, 'r') as f:
-                self.phoneme_features = json.load(f)
-            print(f"Loaded phoneme features from {filename}")
+            # Calculate weighted feature edit distance
+            distance = self.dst.feature_edit_distance(phoneme1, phoneme2)
+            
+            # Normalize to 0-1 range (panphon distances can be larger)
+            norm_distance = min(1.0, distance / 10.0)
+            
+            # Cache and return
+            self.similarity_cache[cache_key] = norm_distance
+            return norm_distance
+            
         except Exception as e:
-            print(f"Error loading phoneme features: {e}")
-            # Fall back to default features definition
-            self.__init__()
-    
-    def save_phoneme_features(self, filename):
-        """Save phoneme features to a JSON file"""
-        try:
-            with open(filename, 'w') as f:
-                json.dump(self.phoneme_features, f, indent=2)
-            print(f"Saved phoneme features to {filename}")
-        except Exception as e:
-            print(f"Error saving phoneme features: {e}")
+            print(f"Warning: Error calculating distance between '{phoneme1}' and '{phoneme2}': {e}")
+            # Default to maximum distance on error
+            self.similarity_cache[cache_key] = 1.0
+            return 1.0
     
     def calculate_information_theoretic_weights(self):
         """
@@ -357,11 +248,11 @@ class LipReadingEvaluator:
         using entropy and visual distinctiveness.
         """
         weights = {}
-        phoneme_inventory = list(self.phoneme_features.keys())
+        phoneme_inventory = list(self.phoneme_features_cache.keys())
         
         # For each feature type (place, manner, voiced, etc.)
         all_features = set()
-        for features in self.phoneme_features.values():
+        for features in self.phoneme_features_cache.values():
             all_features.update(features.keys())
         
         # Calculate entropy-based weights for each feature
@@ -370,8 +261,8 @@ class LipReadingEvaluator:
             # Get all values this feature takes across the phoneme inventory
             feature_values = []
             for phoneme in phoneme_inventory:
-                if feature in self.phoneme_features[phoneme]:
-                    feature_values.append(self.phoneme_features[phoneme][feature])
+                if feature in self.phoneme_features_cache[phoneme]:
+                    feature_values.append(self.phoneme_features_cache[phoneme][feature])
             
             if not feature_values:
                 continue  # Skip if no values available
@@ -410,10 +301,10 @@ class LipReadingEvaluator:
             feature_value_to_visemes = {}
             
             for phoneme in phoneme_inventory:
-                if feature not in self.phoneme_features[phoneme]:
+                if feature not in self.phoneme_features_cache[phoneme]:
                     continue
                     
-                feature_value = self.phoneme_features[phoneme][feature]
+                feature_value = self.phoneme_features_cache[phoneme][feature]
                 viseme = self.phoneme_to_viseme.get(phoneme, 'other')
                 
                 if feature_value not in feature_value_to_visemes:
@@ -604,26 +495,6 @@ class LipReadingEvaluator:
                 
             print("Generating visualizations and statistics...")
             
-            # Save results first (in case visualization fails)
-            results_file = os.path.join(output_dir, 'detailed_results.json')
-            try:
-                with open(results_file, 'w') as f:
-                    # Convert numpy arrays to lists for JSON serialization
-                    serializable_results = []
-                    for res in all_results:
-                        # Deep copy to avoid modifying the original
-                        res_copy = dict(res)
-                        # Handle non-serializable items
-                        if 'phonetic_alignment' in res_copy:
-                            res_copy['phonetic_alignment'] = [list(op) for op in res_copy['phonetic_alignment']]
-                        serializable_results.append(res_copy)
-                    
-                    json.dump(serializable_results, f, indent=2)
-                
-                print(f"Saved all results to {results_file}")
-            except Exception as e:
-                print(f"Error saving results: {e}")
-            
             # Try to generate visualizations
             try:
                 # Analyze examples
@@ -635,7 +506,6 @@ class LipReadingEvaluator:
                 return {
                     'summary': summary,
                     'visualizations': multi_visualizations,
-                    'results_file': results_file,
                     'output_dir': output_dir
                 }
             except Exception as e:
@@ -643,7 +513,6 @@ class LipReadingEvaluator:
                 import traceback
                 traceback.print_exc()
                 return {
-                    'results_file': results_file,
                     'output_dir': output_dir
                 }
         
@@ -684,10 +553,10 @@ class LipReadingEvaluator:
             alignment, edit_distance = self.calculate_phonetic_alignment(ref_phonemes, hyp_phonemes)
             print(f"  Debug: Phonetic alignment completed in {time.time() - align_start:.2f}s")
             
-            # Convert phonemes to visemes
+            # Convert phonemes to visemes using most appropriate mapping
             print(f"  Debug: Converting to visemes...")
-            ref_visemes = [self.phoneme_to_viseme.get(p, 'other') for p in ref_phonemes]
-            hyp_visemes = [self.phoneme_to_viseme.get(p, 'other') for p in hyp_phonemes]
+            ref_visemes = [self.get_closest_viseme(p) for p in ref_phonemes]
+            hyp_visemes = [self.get_closest_viseme(p) for p in hyp_phonemes]
             
             # Calculate viseme-level alignment and score
             vis_start = time.time()
@@ -882,25 +751,33 @@ class LipReadingEvaluator:
         while i < len(raw_phonemes):
             # Handle special cases for diphthongs and affricates
             if i < len(raw_phonemes) - 1:
+                # Strip stress markers from both phonemes before checking diphthongs
+                base_p1 = raw_phonemes[i].rstrip('0123456789')
+                base_p2 = raw_phonemes[i+1].rstrip('0123456789')
+                
                 # Check for potential diphthongs
-                dipth = raw_phonemes[i] + raw_phonemes[i+1]
+                dipth = base_p1 + base_p2
                 if dipth in self.phoneme_to_viseme:
                     processed_phonemes.append(dipth)
                     i += 2
                     continue
                 
                 # Check for affricates
-                if raw_phonemes[i] == 'T' and raw_phonemes[i+1] == 'S':
+                if base_p1 == 'T' and base_p2 == 'S':
                     processed_phonemes.append('tʃ')
                     i += 2
                     continue
-                if raw_phonemes[i] == 'D' and raw_phonemes[i+1] == 'Z':
+                if base_p1 == 'D' and base_p2 == 'Z':
                     processed_phonemes.append('dʒ')
                     i += 2
                     continue
             
             # Map CMU phoneme format to IPA
             phoneme = raw_phonemes[i]
+            
+            # Strip stress markers (numbers) before mapping
+            base_phoneme = phoneme.rstrip('0123456789')
+            
             # Map common CMU phonemes to IPA
             cmu_to_ipa = {
                 'AA': 'ɑ', 'AE': 'æ', 'AH': 'ʌ', 'AO': 'ɔ', 'AW': 'aʊ',
@@ -913,10 +790,11 @@ class LipReadingEvaluator:
                 'W': 'w', 'Y': 'j', 'Z': 'z', 'ZH': 'ʒ'
             }
             
-            if phoneme in cmu_to_ipa:
-                processed_phonemes.append(cmu_to_ipa[phoneme])
+            if base_phoneme in cmu_to_ipa:
+                processed_phonemes.append(cmu_to_ipa[base_phoneme])
             else:
-                processed_phonemes.append(phoneme.lower())
+                # For phonemes not in our mapping, use lowercase without stress markers
+                processed_phonemes.append(base_phoneme.lower())
             
             i += 1
             
@@ -931,14 +809,14 @@ class LipReadingEvaluator:
     
     def analyze_multiple_examples_with_results(self, all_results, output_dir):
         """
-        Analyze patterns across multiple evaluation results
+        Analyze multiple examples with their existing evaluation results
         
         Parameters:
-        - all_results: List of result dictionaries from self.evaluate()
+        - all_results: List of result dictionaries with evaluation results
         - output_dir: Directory to save visualizations
         
         Returns:
-        - Dictionary with visualization file paths
+        - Dictionary with paths to the generated visualizations
         """
         os.makedirs(output_dir, exist_ok=True)
         
@@ -947,38 +825,35 @@ class LipReadingEvaluator:
         # Dictionary to store visualization paths
         viz_files = {}
         
-        # First, create comprehensive dataset analysis dashboard (new)
-        viz_files['dataset_dashboard'] = self._create_dataset_analysis_dashboard(all_results, output_dir)
-        
         # 1. Create aggregate viseme confusion matrix
         viz_files['agg_confusion'] = self._plot_aggregate_confusion_matrix(all_results, output_dir)
         
         # 2. Error rates by viseme class
         viz_files['viseme_error_rates'] = self._plot_viseme_error_rates(all_results, output_dir)
         
-        # 3. Common substitution patterns
-        viz_files['substitution_patterns'] = self._plot_substitution_patterns(all_results, output_dir)
+        # 3. Substitution patterns (REMOVED - causes errors and not useful)
+        # viz_files['substitution_patterns'] = self._plot_substitution_patterns(all_results, output_dir)
         
-        # 4. Performance by word length
-        viz_files['word_length_performance'] = self._plot_word_length_performance(all_results, output_dir)
+        # 4. Word length vs performance
+        viz_files['word_length'] = self._plot_word_length_performance(all_results, output_dir)
         
-        # 5. Error distribution visualization
+        # 5. Error distribution
         viz_files['error_distribution'] = self._plot_error_distribution(all_results, output_dir)
         
-        # 6. Word-level analysis - NEW
-        viz_files['word_level_analysis'] = self._analyze_word_level_errors(all_results, output_dir)
+        # 6. Phoneme t-SNE (REMOVED - causes errors and not useful)
+        # viz_files['phoneme_tsne'] = self._plot_phoneme_tsne(all_results, output_dir)
         
-        # 7. NEW: Phoneme confusion t-SNE visualization
-        viz_files['phoneme_tsne'] = self._plot_phoneme_tsne(all_results, output_dir)
-        
-        # 8. NEW: Common error contexts
+        # 7. Error contexts
         viz_files['error_contexts'] = self._plot_error_contexts(all_results, output_dir)
         
-        # 9. NEW: Viseme similarity heatmap
+        # 8. Viseme similarity heatmap
         viz_files['viseme_similarity'] = self._plot_viseme_similarity_heatmap(all_results, output_dir)
         
-        # 10. NEW: Phoneme misrecognition rates
-        viz_files['phoneme_error_rates'] = self._plot_phoneme_error_rates(all_results, output_dir)
+        # 9. Individual phoneme error rates
+        viz_files['phoneme_errors'] = self._plot_phoneme_error_rates(all_results, output_dir)
+        
+        # Generate dataset summary
+        viz_files['summary'] = self.generate_dataset_summary(all_results, output_dir)
         
         return viz_files
     
@@ -1418,13 +1293,13 @@ class LipReadingEvaluator:
                     ref_phoneme = op[1]
                     hyp_phoneme = op[2]
                     
-                    # Get viseme classes
-                    ref_viseme = self.phoneme_to_viseme.get(ref_phoneme, 'other')
-                    hyp_viseme = self.phoneme_to_viseme.get(hyp_phoneme, 'other')
+                    # Get viseme classes (using closest viseme mapping)
+                    ref_viseme = self.get_closest_viseme(ref_phoneme)
+                    hyp_viseme = self.get_closest_viseme(hyp_phoneme)
                     
                     viseme_subs.append((ref_viseme, hyp_viseme))
         
-        # Get all unique viseme classes
+        # Get all unique viseme classes (should only be 0-21)
         all_visemes = sorted(set(self.phoneme_to_viseme.values()))
         
         # Create confusion matrix
@@ -1452,12 +1327,15 @@ class LipReadingEvaluator:
         # Create visualization
         plt.figure(figsize=(14, 12))
         
-        # Define custom colormap from white to dark blue
+        # Define custom colormap from white to dark blue using the newer API
         cmap = LinearSegmentedColormap.from_list('custom_cmap', ['white', '#003b6f'])
+        
+        # Create viseme labels using the viseme_id_to_name mapping for readability
+        viseme_labels = [f"{v}: {self.viseme_id_to_name[v]}" for v in all_visemes]
         
         # Plot confusion matrix
         sns.heatmap(norm_confusion, annot=True, fmt=".2f", cmap=cmap,
-                   xticklabels=all_visemes, yticklabels=all_visemes, 
+                   xticklabels=viseme_labels, yticklabels=viseme_labels, 
                    cbar_kws={'label': 'Normalized Frequency'})
         
         plt.title('Viseme Confusion Matrix', fontsize=16)
@@ -1494,7 +1372,7 @@ class LipReadingEvaluator:
             for op in result.get('phonetic_alignment', []):
                 if op[0] == 'match' or op[0] == 'substitute':
                     ref_phoneme = op[1]
-                    ref_viseme = self.phoneme_to_viseme.get(ref_phoneme, 'other')
+                    ref_viseme = self.get_closest_viseme(ref_phoneme)
                     
                     # Increment total count for this viseme
                     if ref_viseme not in viseme_counts:
@@ -1527,8 +1405,11 @@ class LipReadingEvaluator:
         error_rates = [viseme_error_rates[v] for v in visemes]
         counts = [viseme_counts[v] for v in visemes]
         
+        # Create viseme labels using the viseme_id_to_name mapping for readability
+        viseme_labels = [f"{v}: {self.viseme_id_to_name[v]}" for v in visemes]
+        
         # Plot error rates as bars
-        bars = plt.bar(visemes, error_rates, alpha=0.7)
+        bars = plt.bar(viseme_labels, error_rates, alpha=0.7)
         
         # Add count labels above bars
         for i, (bar, count) in enumerate(zip(bars, counts)):
@@ -1554,85 +1435,88 @@ class LipReadingEvaluator:
     
     def _plot_substitution_patterns(self, all_results, output_dir):
         """
-        Create network visualization of common substitution patterns
+        Visualize patterns of viseme substitutions as a heatmap
         
         Parameters:
-        - all_results: List of result dictionaries from self.evaluate()
+        - all_results: List of result dictionaries
         - output_dir: Directory to save visualization
         
         Returns:
         - Path to saved visualization
         """
-        # Extract all phoneme substitutions
-        phoneme_subs = []
-        for result in all_results:
-            for op in result.get('phonetic_alignment', []):
-                if op[0] == 'substitute':
-                    ref_phoneme = op[1]
-                    hyp_phoneme = op[2]
-                    phoneme_subs.append((ref_phoneme, hyp_phoneme))
+        try:
+            # Get all viseme substitutions from all results
+            substitutions = []
+            for result in all_results:
+                for viseme_sub in result.get('viseme_substitutions', []):
+                    ref_viseme = viseme_sub[0]
+                    hyp_viseme = viseme_sub[1]
+                    substitutions.append((ref_viseme, hyp_viseme))
+            
+            if not substitutions:
+                print("No substitutions found to visualize")
+                return None
         
-        # Count substitution frequencies
-        sub_counts = Counter(phoneme_subs)
-        
-        # Create directed graph
-        G = nx.DiGraph()
-        
-        # Add nodes and edges
-        min_count = 2  # Minimum count to include
-        max_count = max(sub_counts.values()) if sub_counts else 1
-        
-        for (ref, hyp), count in sub_counts.items():
-            if count >= min_count:
-                # Add nodes with viseme class information
-                ref_viseme = self.phoneme_to_viseme.get(ref, 'other')
-                hyp_viseme = self.phoneme_to_viseme.get(hyp, 'other')
-                
-                G.add_node(ref, viseme=ref_viseme)
-                G.add_node(hyp, viseme=hyp_viseme)
-                
-                # Add edge with count information
-                G.add_edge(ref, hyp, weight=count, width=1 + 4 * (count / max_count))
-        
-        # Create visualization if we have edges
-        if G.number_of_edges() > 0:
+            # Count substitution frequencies
+            substitution_counts = {}
+            for ref, hyp in substitutions:
+                if (ref, hyp) not in substitution_counts:
+                    substitution_counts[(ref, hyp)] = 0
+                substitution_counts[(ref, hyp)] += 1
+            
+            # Get unique viseme classes
+            unique_visemes = set()
+            for ref, hyp in substitutions:
+                unique_visemes.add(ref)
+                unique_visemes.add(hyp)
+            
+            # Sort viseme classes for consistency
+            unique_visemes = sorted(unique_visemes)
+            
+            # Create mapping of viseme to index
+            viseme_to_index = {v: i for i, v in enumerate(unique_visemes)}
+            
+            # Create empty matrix
+            n = len(unique_visemes)
+            matrix = np.zeros((n, n))
+            
+            # Fill matrix with substitution counts
+            for (ref, hyp), count in substitution_counts.items():
+                ref_idx = viseme_to_index[ref]
+                hyp_idx = viseme_to_index[hyp]
+                matrix[ref_idx, hyp_idx] = count
+            
+            # Create viseme labels for better readability
+            viseme_labels = [f"{v}: {self.viseme_id_to_name[v]}" for v in unique_visemes]
+            
+            # Create figure
             plt.figure(figsize=(14, 12))
             
-            # Set up node positions using spring layout
-            pos = nx.spring_layout(G, k=0.3, iterations=50)
+            # Create heatmap with log scale for better visualization
+            norm = LogNorm(vmin=1, vmax=max(1, np.max(matrix)))
+            im = plt.imshow(matrix, norm=norm, cmap='viridis')
             
-            # Create viseme-based color map
-            viseme_classes = sorted(set(nx.get_node_attributes(G, 'viseme').values()))
-            color_map = plt.cm.get_cmap('tab20', len(viseme_classes))
-            viseme_colors = {v: color_map(i) for i, v in enumerate(viseme_classes)}
+            # Add colorbar
+            cbar = plt.colorbar(im)
+            cbar.set_label('Substitution Count (log scale)')
             
-            # Get node colors based on viseme class
-            node_colors = [viseme_colors[G.nodes[n]['viseme']] for n in G.nodes]
+            # Configure tick labels
+            plt.xticks(range(n), viseme_labels, rotation=90)
+            plt.yticks(range(n), viseme_labels)
             
-            # Draw nodes
-            nx.draw_networkx_nodes(G, pos, node_size=500, node_color=node_colors, alpha=0.8)
+            plt.xlabel('Hypothesis Viseme')
+            plt.ylabel('Reference Viseme')
+            plt.title('Viseme Substitution Patterns', fontsize=16)
             
-            # Draw edges with varying width based on count
-            edge_widths = [G[u][v]['width'] for u, v in G.edges]
-            nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.6, 
-                                  edge_color='gray', arrowsize=15)
+            # Add text annotations for counts
+            for i in range(n):
+                for j in range(n):
+                    count = matrix[i, j]
+                    if count >= 3:  # Only show significant counts
+                        plt.text(j, i, int(count), ha='center', va='center', 
+                                color='white' if count > 10 else 'black',
+                                fontsize=8)
             
-            # Draw labels
-            nx.draw_networkx_labels(G, pos, font_size=12, font_family='sans-serif')
-            
-            # Add edge labels (counts)
-            edge_labels = {(u, v): f"{G[u][v]['weight']}" for u, v in G.edges}
-            nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
-            
-            # Add legend for viseme classes
-            legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
-                                         markerfacecolor=viseme_colors[v], markersize=10, 
-                                         label=v) for v in viseme_classes]
-            plt.legend(handles=legend_elements, title="Viseme Classes", 
-                      loc='upper left', bbox_to_anchor=(1.05, 1))
-            
-            plt.title('Common Phoneme Substitution Patterns', fontsize=16)
-            plt.axis('off')
             plt.tight_layout()
             
             # Save figure
@@ -1641,7 +1525,8 @@ class LipReadingEvaluator:
             plt.close()
             
             return output_file
-        else:
+        except Exception as e:
+            print(f"Error creating substitution patterns visualization: {e}")
             return None
     
     def _plot_word_length_performance(self, all_results, output_dir):
@@ -1750,7 +1635,7 @@ class LipReadingEvaluator:
 
     def _plot_phoneme_tsne(self, all_results, output_dir):
         """
-        Create t-SNE visualization of phoneme similarity based on confusion patterns
+        Create t-SNE visualization of phoneme relationships
         
         Parameters:
         - all_results: List of result dictionaries
@@ -1760,94 +1645,18 @@ class LipReadingEvaluator:
         - Path to saved visualization
         """
         try:
-            # Extract all phoneme substitutions
-            phoneme_subs = []
-            all_phonemes = set()
+            # Skip this visualization as it doesn't work well with numeric viseme IDs
+            print("Skipping t-SNE visualization as it's not compatible with numeric viseme IDs")
+            return None
             
-            for result in all_results:
-                for op in result.get('phonetic_alignment', []):
-                    if op[0] == 'substitute':
-                        ref_phoneme = op[1]
-                        hyp_phoneme = op[2]
-                        phoneme_subs.append((ref_phoneme, hyp_phoneme))
-                        all_phonemes.add(ref_phoneme)
-                        all_phonemes.add(hyp_phoneme)
-            
-            # Only proceed if we have enough data
-            if len(all_phonemes) < 5 or len(phoneme_subs) < 10:
-                print("Not enough phoneme substitution data for t-SNE visualization")
-                return None
-            
-            # Create co-occurrence matrix for substitutions
-            phonemes_list = sorted(list(all_phonemes))
-            phoneme_to_idx = {p: i for i, p in enumerate(phonemes_list)}
-            
-            # Initialize co-occurrence matrix
-            cooc_matrix = np.zeros((len(phonemes_list), len(phonemes_list)))
-            
-            # Fill co-occurrence matrix
-            for ref, hyp in phoneme_subs:
-                ref_idx = phoneme_to_idx[ref]
-                hyp_idx = phoneme_to_idx[hyp]
-                cooc_matrix[ref_idx, hyp_idx] += 1
-                cooc_matrix[hyp_idx, ref_idx] += 1  # Make symmetric
-            
-            # Add diagonal values (self-similarity)
-            np.fill_diagonal(cooc_matrix, cooc_matrix.max())
-            
-            # Normalize matrix
-            row_sums = cooc_matrix.sum(axis=1).reshape(-1, 1)
-            row_sums[row_sums == 0] = 1  # Avoid division by zero
-            norm_matrix = cooc_matrix / row_sums
-            
-            # Apply t-SNE
-            tsne = TSNE(n_components=2, perplexity=min(5, len(phonemes_list)-1), 
-                       random_state=42, learning_rate=200)
-            tsne_results = tsne.fit_transform(norm_matrix)
-            
-            # Create visualization
-            plt.figure(figsize=(12, 10))
-            
-            # Get viseme classes for coloring
-            phoneme_visemes = [self.phoneme_to_viseme.get(p, 'other') for p in phonemes_list]
-            viseme_classes = sorted(list(set(phoneme_visemes)))
-            
-            # Create colormap
-            cmap = plt.cm.get_cmap('tab20', len(viseme_classes))
-            viseme_to_color = {v: cmap(i) for i, v in enumerate(viseme_classes)}
-            point_colors = [viseme_to_color[v] for v in phoneme_visemes]
-            
-            # Plot points
-            plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=point_colors, alpha=0.7, s=100)
-            
-            # Add labels
-            for i, phoneme in enumerate(phonemes_list):
-                plt.annotate(phoneme, (tsne_results[i, 0], tsne_results[i, 1]), 
-                            fontsize=10, ha='center', va='center')
-            
-            # Add legend for viseme classes
-            handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=viseme_to_color[v], 
-                                 markersize=10, label=v) for v in viseme_classes]
-            plt.legend(handles=handles, title="Viseme Classes", 
-                      loc='best', frameon=True, framealpha=0.8)
-            
-            plt.title("Phoneme Similarity Space (t-SNE)", fontsize=16)
-            plt.grid(alpha=0.3)
-            plt.tight_layout()
-            
-            # Save figure
-            output_file = os.path.join(output_dir, 'phoneme_tsne.png')
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            return output_file
+            # Rest of the function...
         except Exception as e:
             print(f"Error creating t-SNE visualization: {e}")
             return None
 
     def _plot_error_contexts(self, all_results, output_dir):
         """
-        Analyze and visualize common error contexts (what phonemes often appear before/after errors)
+        Create visualization of phoneme contexts around errors
         
         Parameters:
         - all_results: List of result dictionaries
@@ -1857,62 +1666,93 @@ class LipReadingEvaluator:
         - Path to saved visualization
         """
         try:
-            # Extract contexts around errors
-            pre_error_contexts = []
-            post_error_contexts = []
+            # Extract all errors (substitutions)
+            error_contexts = []
             
             for result in all_results:
                 alignment = result.get('phonetic_alignment', [])
+                
+                # Loop through alignment operations
                 for i, op in enumerate(alignment):
-                    # Look for substitutions, insertions, deletions
-                    if op[0] != 'match':
-                        # Get pre-context (1 phoneme before error)
-                        if i > 0 and alignment[i-1][0] == 'match':
-                            pre_error_contexts.append(alignment[i-1][1])
+                    if op[0] == 'substitute':
+                        # Find context (previous and next phonemes)
+                        pre_idx = max(0, i-2)
+                        post_idx = min(len(alignment)-1, i+2)
                         
-                        # Get post-context (1 phoneme after error)
-                        if i < len(alignment) - 1 and alignment[i+1][0] == 'match':
-                            post_error_contexts.append(alignment[i+1][1])
+                        pre_phonemes = []
+                        post_phonemes = []
+                        
+                        # Get preceding phonemes
+                        for j in range(pre_idx, i):
+                            if alignment[j][0] == 'match' or alignment[j][0] == 'substitute':
+                                pre_phonemes.append(alignment[j][1])
+                        
+                        # Get following phonemes
+                        for j in range(i+1, post_idx+1):
+                            if j < len(alignment) and (alignment[j][0] == 'match' or alignment[j][0] == 'substitute'):
+                                post_phonemes.append(alignment[j][1])
+                        
+                        # Add context to list
+                        error_contexts.append({
+                            'phoneme': op[1],
+                            'pre': pre_phonemes,
+                            'post': post_phonemes
+                        })
             
-            # Only proceed if we have enough data
-            if len(pre_error_contexts) < 5 or len(post_error_contexts) < 5:
-                print("Not enough context data for error context visualization")
-                return None
+            # Count frequency of phonemes before and after errors
+            pre_counts = Counter()
+            post_counts = Counter()
             
-            # Count frequencies
-            pre_counter = Counter(pre_error_contexts)
-            post_counter = Counter(post_error_contexts)
+            for ctx in error_contexts:
+                for p in ctx['pre']:
+                    pre_counts[p] += 1
+                for p in ctx['post']:
+                    post_counts[p] += 1
             
-            # Get most common contexts
+            # Get most common phonemes in each position
             top_n = 15
-            most_common_pre = pre_counter.most_common(top_n)
-            most_common_post = post_counter.most_common(top_n)
-        
-            # Create figure
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+            pre_top = [p for p, _ in pre_counts.most_common(top_n)]
+            post_top = [p for p, _ in post_counts.most_common(top_n)]
             
-            # Plot pre-error contexts
-            pre_labels = [p for p, _ in most_common_pre]
-            pre_counts = [c for _, c in most_common_pre]
-            pre_visemes = [self.phoneme_to_viseme.get(p, 'other') for p in pre_labels]
-            pre_colors = plt.cm.tab10([hash(v) % 10 for v in pre_visemes])
+            # Convert to viseme classes for coloring
+            pre_labels = pre_top
+            pre_visemes = [self.phoneme_to_viseme.get(p, -1) for p in pre_labels]  # Use -1 for 'other'
             
-            ax1.barh(range(len(pre_labels)), pre_counts, color=pre_colors)
+            post_labels = post_top
+            post_visemes = [self.phoneme_to_viseme.get(p, -1) for p in post_labels]  # Use -1 for 'other'
+            
+            # Create visualization
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
+            
+            # Get counts for plotting
+            pre_values = [pre_counts[p] for p in pre_labels]
+            post_values = [post_counts[p] for p in post_labels]
+            
+            # Create viseme-based color mapping using the newer API
+            viseme_classes = sorted(set(pre_visemes + post_visemes))
+            cmap = plt.colormaps['tab20']
+            
+            # Create color arrays
+            pre_colors = [cmap(viseme_classes.index(v) % 20) for v in pre_visemes]
+            post_colors = [cmap(viseme_classes.index(v) % 20) for v in post_visemes]
+            
+            # Plot horizontal bar charts
+            ax1.barh(range(len(pre_labels)), pre_values, color=pre_colors, alpha=0.7)
+            ax2.barh(range(len(post_labels)), post_values, color=post_colors, alpha=0.7)
+            
+            # Add viseme info to labels
+            pre_labels_with_viseme = [f"{p} ({v})" for p, v in zip(pre_labels, pre_visemes)]
+            post_labels_with_viseme = [f"{p} ({v})" for p, v in zip(post_labels, post_visemes)]
+            
+            # Set labels
             ax1.set_yticks(range(len(pre_labels)))
-            ax1.set_yticklabels([f"{p} ({v})" for p, v in zip(pre_labels, pre_visemes)])
+            ax1.set_yticklabels(pre_labels_with_viseme)
             ax1.set_title("Phonemes Before Errors", fontsize=14)
             ax1.set_xlabel("Count", fontsize=12)
             ax1.grid(alpha=0.3, axis='x')
             
-            # Plot post-error contexts
-            post_labels = [p for p, _ in most_common_post]
-            post_counts = [c for _, c in most_common_post]
-            post_visemes = [self.phoneme_to_viseme.get(p, 'other') for p in post_labels]
-            post_colors = plt.cm.tab10([hash(v) % 10 for v in post_visemes])
-            
-            ax2.barh(range(len(post_labels)), post_counts, color=post_colors)
             ax2.set_yticks(range(len(post_labels)))
-            ax2.set_yticklabels([f"{p} ({v})" for p, v in zip(post_labels, post_visemes)])
+            ax2.set_yticklabels(post_labels_with_viseme)
             ax2.set_title("Phonemes After Errors", fontsize=14)
             ax2.set_xlabel("Count", fontsize=12)
             ax2.grid(alpha=0.3, axis='x')
@@ -1951,11 +1791,48 @@ class LipReadingEvaluator:
             # Initialize similarity matrix
             sim_matrix = np.zeros((n_visemes, n_visemes))
             
-            # Fill similarity matrix based on feature similarity or substitution patterns
+            # Add perfect similarity along diagonal (each viseme is identical to itself)
+            for i in range(n_visemes):
+                sim_matrix[i, i] = 1.0
             
-            # Method 1: Based on phoneme features
-            for v1 in viseme_classes:
-                for v2 in viseme_classes:
+            # Enhance similarity matrix with data from substitutions in results
+            substitution_counts = {}
+            total_counts = {}
+            
+            # Count viseme substitutions from results
+            for result in all_results:
+                for op, idx1, idx2 in result.get('viseme_alignment', []):
+                    if op == 'substitute':
+                        # Add to substitution counter
+                        if (idx1, idx2) not in substitution_counts:
+                            substitution_counts[(idx1, idx2)] = 0
+                        substitution_counts[(idx1, idx2)] += 1
+                        
+                        # Track total occurrences of first viseme
+                        if idx1 not in total_counts:
+                            total_counts[idx1] = 0
+                        total_counts[idx1] += 1
+            
+            # Use substitution patterns to enhance similarity matrix
+            # (more frequent substitutions = more similar visemes)
+            for (v1, v2), count in substitution_counts.items():
+                if v1 in viseme_to_idx and v2 in viseme_to_idx and v1 in total_counts:
+                    # Calculate similarity based on substitution frequency
+                    # (normalized by total occurrences of the first viseme)
+                    i, j = viseme_to_idx[v1], viseme_to_idx[v2]
+                    similarity = count / total_counts[v1]
+                    
+                    # Update similarity matrix (capped at 0.8 to preserve diagonal dominance)
+                    sim_matrix[i, j] = min(0.8, similarity)
+                    sim_matrix[j, i] = min(0.8, similarity)  # Make it symmetric
+            
+            # Fill in remaining similarities based on phonetic features
+            for i, v1 in enumerate(viseme_classes):
+                for j, v2 in enumerate(viseme_classes):
+                    # Skip if already set from substitutions or diagonal
+                    if sim_matrix[i, j] > 0:
+                        continue
+                        
                     # Get phonemes for each viseme
                     v1_phonemes = [p for p, v in self.phoneme_to_viseme.items() if v == v1]
                     v2_phonemes = [p for p, v in self.phoneme_to_viseme.items() if v == v2]
@@ -1964,35 +1841,64 @@ class LipReadingEvaluator:
                     if not v1_phonemes or not v2_phonemes:
                         continue
                     
-                    # Calculate average distance between all phoneme pairs
+                    # Calculate average distance between sample phoneme pairs
+                    # (limit to a few samples for efficiency)
+                    sample_p1 = v1_phonemes[:3]  # Take up to 3 phonemes from each viseme
+                    sample_p2 = v2_phonemes[:3]
+                    
                     total_dist = 0
                     count = 0
                     
-                    for p1 in v1_phonemes:
-                        for p2 in v2_phonemes:
+                    for p1 in sample_p1:
+                        for p2 in sample_p2:
                             try:
-                                if p1 in self.phoneme_features and p2 in self.phoneme_features:
                                     dist = self.calculate_phonetic_distance(p1, p2)
                                     total_dist += dist
                                     count += 1
-                            except:
+                            except Exception as e:
                                 pass
                     
                     # Compute average distance and convert to similarity
                     if count > 0:
                         avg_dist = total_dist / count
                         # Convert distance to similarity (1 - distance)
-                        sim_matrix[viseme_to_idx[v1], viseme_to_idx[v2]] = 1.0 - avg_dist
+                        # Cap at 0.7 to keep distinction from substitution-based similarity
+                        sim_matrix[i, j] = min(0.7, 1.0 - avg_dist)
+            
+            # Apply contextual adjustment - similar viseme groups should have higher similarity
+            viseme_groups = {
+                'vowels': [1, 2, 3, 4, 5, 6, 7, 8],        # All vowels
+                'diphthongs': [9, 10, 11],                 # All diphthongs
+                'front_consonants': [17, 18, 19, 21],      # Front-articulated consonants
+                'back_consonants': [12, 13, 14, 15, 16, 20] # Back-articulated consonants
+            }
+            
+            # Boost similarity within groups
+            for group_name, group_members in viseme_groups.items():
+                for v1 in group_members:
+                    for v2 in group_members:
+                        if v1 != v2 and v1 in viseme_to_idx and v2 in viseme_to_idx:
+                            i, j = viseme_to_idx[v1], viseme_to_idx[v2]
+                            # Boost similarity by 0.2 but keep below 0.9
+                            sim_matrix[i, j] = min(0.9, sim_matrix[i, j] + 0.2)
             
             # Create visualization
-            plt.figure(figsize=(12, 10))
+            plt.figure(figsize=(14, 12))
             
             # Create custom colormap from white to dark blue
             cmap = LinearSegmentedColormap.from_list('custom_cmap', ['#f7fbff', '#08306b'])
             
+            # Create viseme labels for the plot
+            viseme_labels = []
+            for v in viseme_classes:
+                if v in self.viseme_id_to_name:
+                    viseme_labels.append(f"{v}: {self.viseme_id_to_name[v]}")
+                else:
+                    viseme_labels.append(f"Other ({v})")
+            
             # Plot similarity matrix
             sns.heatmap(sim_matrix, annot=True, fmt=".2f", cmap=cmap,
-                       xticklabels=viseme_classes, yticklabels=viseme_classes, 
+                       xticklabels=viseme_labels, yticklabels=viseme_labels, 
                        cbar_kws={'label': 'Similarity'})
             
             plt.title('Viseme Similarity Heatmap', fontsize=16)
@@ -2011,6 +1917,8 @@ class LipReadingEvaluator:
             return output_file
         except Exception as e:
             print(f"Error creating viseme similarity heatmap: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _plot_phoneme_error_rates(self, all_results, output_dir):
@@ -2066,11 +1974,15 @@ class LipReadingEvaluator:
             labels = top_phonemes
             rates = [error_rates[p] for p in top_phonemes]
             counts = [phoneme_counts[p] for p in top_phonemes]
-            visemes = [self.phoneme_to_viseme.get(p, 'other') for p in top_phonemes]
+            visemes = [self.get_closest_viseme(p) for p in top_phonemes]
+            
+            # Create viseme labels for better readability
+            viseme_labels = [f"{v}: {self.viseme_id_to_name[v]}" for v in visemes]
             
             # Create color mapping based on viseme classes
             unique_visemes = sorted(set(visemes))
-            viseme_to_color = {v: plt.cm.tab20(i % 20) for i, v in enumerate(unique_visemes)}
+            cmap = plt.colormaps['tab20'] 
+            viseme_to_color = {v: cmap(i % 20) for i, v in enumerate(unique_visemes)}
             colors = [viseme_to_color[v] for v in visemes]
             
             # Plot error rates
@@ -2082,8 +1994,8 @@ class LipReadingEvaluator:
                         f"{count}", ha='center', va='bottom', fontsize=9)
             
             # Add viseme labels
-            for i, (label, viseme) in enumerate(zip(labels, visemes)):
-                plt.text(i, -0.03, f"{viseme}", rotation=45, ha='right', fontsize=8, alpha=0.7)
+            for i, (label, viseme_label) in enumerate(zip(labels, viseme_labels)):
+                plt.text(i, -0.03, f"{viseme_label}", rotation=45, ha='right', fontsize=8, alpha=0.7)
             
             # Formatting
             plt.xticks(range(len(labels)), labels)
@@ -2094,8 +2006,10 @@ class LipReadingEvaluator:
             plt.grid(axis='y', linestyle='--', alpha=0.7)
             
             # Add legend for viseme classes
-            legend_elements = [Patch(facecolor=viseme_to_color[v], label=v) 
+            legend_elements = [Patch(facecolor=viseme_to_color[v], 
+                                    label=f"{v}: {self.viseme_id_to_name[v]}") 
                               for v in unique_visemes]
+            
             plt.legend(handles=legend_elements, title="Viseme Classes", 
                       loc='upper right')
             
@@ -2163,6 +2077,202 @@ class LipReadingEvaluator:
         total_ops = sum(op_counts.values())
         summary['operations_percent'] = {k: (v / total_ops) * 100 for k, v in op_counts.items()} if total_ops > 0 else {k: 0 for k in op_counts}
         
+        # Calculate Character Error Rate (CER)
+        total_chars = 0
+        char_errors = 0
+        for result in all_results:
+            if 'reference' in result and 'hypothesis' in result:
+                ref = result['reference']
+                hyp = result['hypothesis']
+                total_chars += len(ref)
+                # Calculate character-level edit distance
+                char_edit_distance = nltk.edit_distance(ref, hyp)
+                char_errors += char_edit_distance
+        
+        cer = char_errors / total_chars if total_chars > 0 else 0
+        summary['cer'] = cer
+        
+        # Calculate Word Error Rate (WER)
+        total_words = 0
+        word_errors = 0
+        for result in all_results:
+            if 'reference' in result and 'hypothesis' in result:
+                ref_words = result['reference'].split()
+                hyp_words = result['hypothesis'].split()
+                total_words += len(ref_words)
+                # Calculate word-level edit distance
+                word_edit_distance = nltk.edit_distance(ref_words, hyp_words)
+                word_errors += word_edit_distance
+        
+        wer = word_errors / total_words if total_words > 0 else 0
+        summary['wer'] = wer
+        
+        # Extract references and hypotheses for batch processing
+        references = []
+        hypotheses = []
+        
+        for result in all_results:
+            if 'reference' in result and 'hypothesis' in result:
+                references.append(result['reference'])
+                hypotheses.append(result['hypothesis'])
+        
+        # Load model for semantic similarity metrics (if needed)
+        try:
+            semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+            
+            # Calculate Semantic Similarity
+            ref_embeddings = semantic_model.encode(references)
+            hyp_embeddings = semantic_model.encode(hypotheses)
+            
+            # Compute cosine similarity between reference and hypothesis embeddings
+            semantic_similarities = []
+            for i in range(len(references)):
+                ref_emb = ref_embeddings[i]
+                hyp_emb = hyp_embeddings[i]
+                
+                # Compute cosine similarity
+                similarity = np.dot(ref_emb, hyp_emb) / (np.linalg.norm(ref_emb) * np.linalg.norm(hyp_emb))
+                semantic_similarities.append(similarity)
+            
+            avg_semantic_similarity = np.mean(semantic_similarities)
+            summary['semantic_similarity'] = float(avg_semantic_similarity)
+            
+            # Calculate Semantic WER (percentage of incorrect words based on semantic threshold)
+            semantic_wer_threshold = 0.7  # Threshold for semantic similarity
+            semantic_errors = 0
+            
+            for ref, hyp in zip(references, hypotheses):
+                ref_words = ref.split()
+                hyp_words = hyp.split()
+                
+                # Skip empty sequences
+                if len(ref_words) == 0:
+                    continue
+                
+                # Calculate word-by-word semantic similarity
+                word_errors = 0
+                for ref_word in ref_words:
+                    # Check if any word in hypothesis is semantically similar to reference word
+                    word_found = False
+                    for hyp_word in hyp_words:
+                        # Calculate semantic similarity between words
+                        try:
+                            ref_word_emb = semantic_model.encode([ref_word])[0]
+                            hyp_word_emb = semantic_model.encode([hyp_word])[0]
+                            word_sim = np.dot(ref_word_emb, hyp_word_emb) / (np.linalg.norm(ref_word_emb) * np.linalg.norm(hyp_word_emb))
+                            
+                            if word_sim > semantic_wer_threshold:
+                                word_found = True
+                                break
+                        except:
+                            pass
+                    
+                    if not word_found:
+                        word_errors += 1
+                
+                semantic_errors += word_errors
+            
+            semantic_wer = semantic_errors / total_words if total_words > 0 else 0
+            summary['semantic_wer'] = float(semantic_wer)
+            
+        except Exception as e:
+            print(f"Warning: Could not calculate semantic metrics: {str(e)}")
+            summary['semantic_similarity'] = 0.0
+            summary['semantic_wer'] = 0.0
+        
+        # Calculate BERTScore
+        try:
+            # Calculate BERTScore
+            P, R, F1 = bert_score.score(hypotheses, references, lang="en", verbose=False)
+            
+            summary['bertscore_precision'] = float(torch.mean(P).item())
+            summary['bertscore_recall'] = float(torch.mean(R).item())
+            summary['bertscore_f1'] = float(torch.mean(F1).item())
+        except Exception as e:
+            print(f"Warning: Could not calculate BERTScore: {str(e)}")
+            summary['bertscore_precision'] = 0.0
+            summary['bertscore_recall'] = 0.0
+            summary['bertscore_f1'] = 0.0
+        
+        # Calculate word similarity (using SequenceMatcher)
+        word_similarities = []
+        for ref, hyp in zip(references, hypotheses):
+            similarity = SequenceMatcher(None, ref, hyp).ratio()
+            word_similarities.append(similarity)
+        
+        summary['word_similarity'] = float(np.mean(word_similarities))
+        
+        # Calculate METEOR score
+        try:
+            meteor_scores = []
+            for ref, hyp in zip(references, hypotheses):
+                ref_tokens = [ref.split()]  # METEOR expects a list of reference tokenized sentences
+                hyp_tokens = hyp.split()
+                
+                score = meteor_score.meteor_score(ref_tokens, hyp_tokens)
+                meteor_scores.append(score)
+            
+            summary['meteor_score'] = float(np.mean(meteor_scores))
+        except Exception as e:
+            print(f"Warning: Could not calculate METEOR score: {str(e)}")
+            summary['meteor_score'] = 0.0
+        
+        # Calculate ROUGE scores
+        try:
+            scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+            
+            rouge1_scores = []
+            rouge2_scores = []
+            rougeL_scores = []
+            
+            for ref, hyp in zip(references, hypotheses):
+                scores = scorer.score(ref, hyp)
+                
+                rouge1_scores.append(scores['rouge1'].fmeasure)
+                rouge2_scores.append(scores['rouge2'].fmeasure)
+                rougeL_scores.append(scores['rougeL'].fmeasure)
+            
+            summary['rouge1_score'] = float(np.mean(rouge1_scores))
+            summary['rouge2_score'] = float(np.mean(rouge2_scores))
+            summary['rougeL_score'] = float(np.mean(rougeL_scores))
+        except Exception as e:
+            print(f"Warning: Could not calculate ROUGE scores: {str(e)}")
+            summary['rouge1_score'] = 0.0
+            summary['rouge2_score'] = 0.0
+            summary['rougeL_score'] = 0.0
+        
+        # Calculate BLEU scores
+        try:
+            # Get smoothing function for BLEU
+            smoothie = SmoothingFunction().method1
+            
+            # Sentence BLEU - Average of sentence-level BLEU scores
+            sentence_bleu_scores = []
+            for ref, hyp in zip(references, hypotheses):
+                ref_tokens = [ref.split()]  # BLEU expects a list of reference tokenized sentences
+                hyp_tokens = hyp.split()
+                
+                # Skip empty sequences
+                if len(hyp_tokens) == 0 or all(len(r) == 0 for r in ref_tokens):
+                    continue
+                
+                # Use smoothing function to handle cases with no n-gram overlaps
+                score = sentence_bleu(ref_tokens, hyp_tokens, smoothing_function=smoothie)
+                sentence_bleu_scores.append(score)
+            
+            summary['sentence_bleu_score'] = float(np.mean(sentence_bleu_scores) * 100)  # Convert to percentage
+            
+            # Corpus BLEU - BLEU score over the entire corpus
+            tokenized_refs = [[r.split()] for r in references]  # List of lists of tokenized references
+            tokenized_hyps = [h.split() for h in hypotheses]  # List of tokenized hypotheses
+            
+            corpus_bleu_score = corpus_bleu(tokenized_refs, tokenized_hyps, smoothing_function=smoothie)
+            summary['corpus_bleu_score'] = float(corpus_bleu_score * 100)  # Convert to percentage
+        except Exception as e:
+            print(f"Warning: Could not calculate BLEU scores: {str(e)}")
+            summary['sentence_bleu_score'] = 0.0
+            summary['corpus_bleu_score'] = 0.0
+        
         # Save summary to file
         summary_file = os.path.join(output_dir, 'summary.json')
         with open(summary_file, 'w') as f:
@@ -2175,112 +2285,29 @@ class LipReadingEvaluator:
             f.write(f"Number of examples: {summary['num_examples']}\n\n")
             f.write("Performance Metrics:\n")
             f.write(f"- Average Viseme Alignment Score: {summary['avg_viseme_score']:.3f} ± {summary['viseme_score_std']:.3f} (higher is better)\n")
-            f.write(f"- Average Phonetic Edit Distance: {summary['avg_phonetic_distance']:.3f} ± {summary['phonetic_distance_std']:.3f} (lower is better)\n\n")
+            f.write(f"- Average Phonetic Edit Distance: {summary['avg_phonetic_distance']:.3f} ± {summary['phonetic_distance_std']:.3f} (lower is better)\n")
+            f.write(f"- Character Error Rate (CER): {summary['cer']:.3f} (lower is better)\n")
+            f.write(f"- Word Error Rate (WER): {summary['wer']:.3f} (lower is better)\n")
+            f.write(f"- Semantic WER: {summary['semantic_wer']:.3f} (lower is better)\n")
+            f.write(f"- Semantic Similarity: {summary['semantic_similarity']:.3f} (higher is better)\n\n")
+            
+            f.write("Text Similarity Metrics:\n")
+            f.write(f"- BERTScore Precision: {summary['bertscore_precision']:.3f}\n")
+            f.write(f"- BERTScore Recall: {summary['bertscore_recall']:.3f}\n")
+            f.write(f"- BERTScore F1: {summary['bertscore_f1']:.3f}\n")
+            f.write(f"- Word Similarity: {summary['word_similarity']:.3f}\n")
+            f.write(f"- METEOR Score: {summary['meteor_score']:.3f}\n")
+            f.write(f"- ROUGE-1 Score: {summary['rouge1_score']:.3f}\n")
+            f.write(f"- ROUGE-2 Score: {summary['rouge2_score']:.3f}\n")
+            f.write(f"- ROUGE-L Score: {summary['rougeL_score']:.3f}\n")
+            f.write(f"- Sentence BLEU Score: {summary['sentence_bleu_score']:.2f}\n")
+            f.write(f"- Corpus BLEU Score: {summary['corpus_bleu_score']:.2f}\n\n")
+            
             f.write("Operation Counts:\n")
             for op, count in op_counts.items():
                 f.write(f"- {op.capitalize()}: {count} ({summary['operations_percent'][op]:.1f}%)\n")
         
         return summary
-
-    def calculate_phonetic_distance(self, phoneme1, phoneme2):
-        """
-        Calculate phonetic distance between two phonemes using their feature vectors
-        with a more generalized approach based on linguistic features.
-        
-        This uses a weighted feature-based distance metric that takes into account
-        the importance of different features for visual speech perception.
-        """
-        # Check cache to avoid recalculating
-        cache_key = (phoneme1, phoneme2)
-        if cache_key in self.similarity_cache:
-            return self.similarity_cache[cache_key]
-        
-        # Reversed key check
-        reversed_key = (phoneme2, phoneme1)
-        if reversed_key in self.similarity_cache:
-            return self.similarity_cache[reversed_key]
-        
-        # Special case: if either is not in our phoneme inventory
-        if phoneme1 not in self.phoneme_features or phoneme2 not in self.phoneme_features:
-            # Default to maximum distance
-            return 1.0
-        
-        # Try to use panphon's sophisticated distance function first
-        try:
-            dst = panphon.distance.Distance()
-            # Calculate weighted feature edit distance
-            dist = dst.feature_edit_distance(phoneme1, phoneme2)
-            # Normalize to 0-1 range (panphon distances can be larger)
-            norm_dist = min(1.0, dist / 10.0)
-            # Cache and return
-            self.similarity_cache[cache_key] = norm_dist
-            return norm_dist
-        except:
-            # Fall back to our custom feature-based distance
-            pass
-        
-        # Get feature dictionaries
-        features1 = self.phoneme_features[phoneme1]
-        features2 = self.phoneme_features[phoneme2]
-        
-        # Collect all features from both phonemes
-        all_features = set(features1.keys()) | set(features2.keys())
-        
-        # Calculate weighted distance
-        total_distance = 0.0
-        total_weight = 0.0
-        
-        for feature in all_features:
-            # Skip features missing weight information
-            if feature not in self.feature_weights:
-                continue
-                
-            weight = self.feature_weights[feature]
-            
-            # Get feature values (default to None if missing)
-            value1 = features1.get(feature, None)
-            value2 = features2.get(feature, None)
-            
-            # Skip if either phoneme doesn't have this feature
-            if value1 is None or value2 is None:
-                continue
-                
-            # Calculate feature-specific distance
-            feature_dist = 0.0
-            if isinstance(value1, (int, float)) and isinstance(value2, (int, float)):
-                # Numeric features - normalize by typical range
-                if feature == 'place':
-                    # Place of articulation (1-7 scale)
-                    feature_dist = abs(value1 - value2) / 6.0
-                elif feature == 'height' or feature == 'backness':
-                    # Vowel features (typically 1-4 or 1-3 scales)
-                    feature_dist = abs(value1 - value2) / 3.0
-                else:
-                    # Binary or other numeric features
-                    feature_dist = abs(value1 - value2)
-            elif value1 == value2:
-                # Matching categorical features
-                feature_dist = 0.0
-            else:
-                # Non-matching categorical features
-                feature_dist = 1.0
-            
-            # Add weighted contribution to total distance
-            total_distance += weight * feature_dist
-            total_weight += weight
-        
-        # Normalize by total weight
-        if total_weight > 0:
-            normalized_distance = total_distance / total_weight
-        else:
-            # If no weighted features were compared, use viseme comparison
-            # Same viseme = more similar
-            normalized_distance = 0.0 if self.phoneme_to_viseme.get(phoneme1) == self.phoneme_to_viseme.get(phoneme2) else 1.0
-        
-        # Cache result for future lookups
-        self.similarity_cache[cache_key] = normalized_distance
-        
-        return normalized_distance
 
     def _calculate_word_alignment(self, seq1, seq2):
         """
@@ -2560,6 +2587,1113 @@ class LipReadingEvaluator:
         
         return alignment, dp[m][n]
 
+    def get_closest_viseme(self, phoneme):
+        """
+        Map any phoneme to the closest viseme in Microsoft's 22-category system,
+        even if it's not explicitly defined in the mapping.
+        
+        Args:
+            phoneme: The phoneme to map
+            
+        Returns:
+            int: The viseme ID (0-21) that best matches this phoneme
+            
+        Raises:
+            ValueError: If the phoneme cannot be mapped to any viseme category
+        """
+        # First check if the phoneme is already in our mapping
+        if phoneme in self.phoneme_to_viseme:
+            return self.phoneme_to_viseme[phoneme]
+        
+        # Handle phonemes with stress markers (e.g., "ow2", "ae1")
+        # First try stripping any trailing digits
+        base_phoneme = phoneme.rstrip('0123456789')
+        if base_phoneme and base_phoneme in self.phoneme_to_viseme:
+            return self.phoneme_to_viseme[base_phoneme]
+            
+        # If it's a special character, map to silence
+        if not phoneme.isalpha():
+            return 0  # silence
+            
+        # For consonants, map based on place of articulation
+        consonant_features = {
+            # Bilabial: p, b, m
+            'bilabial': ['p', 'b', 'm'],
+            # Labiodental: f, v
+            'labiodental': ['f', 'v'],
+            # Dental: θ, ð
+            'dental': ['θ', 'ð', 'th', 'dh'],
+            # Alveolar: t, d, s, z, n, l
+            'alveolar_stop': ['t', 'd', 'n'],
+            'alveolar_fricative': ['s', 'z'],
+            'alveolar_liquid': ['l'],
+            # Post-alveolar: ʃ, ʒ, tʃ, dʒ
+            'postalveolar': ['ʃ', 'ʒ', 'tʃ', 'dʒ', 'sh', 'zh', 'ch', 'j'],
+            # Retroflex/rhotic: r, ɹ, ɾ
+            'retroflex': ['r', 'ɹ', 'ɾ'],
+            # Palatal: j
+            'palatal': ['j', 'y'],
+            # Velar: k, g, ŋ, w
+            'velar': ['k', 'g', 'ŋ', 'ng', 'w'],
+            # Glottal: h, ʔ
+            'glottal': ['h', 'ʔ']
+        }
+        
+        # Vowel features
+        vowel_features = {
+            # Front vowels: i, ɪ, e, ɛ, æ
+            'front_close': ['i', 'ɪ', 'y'],
+            'front_mid': ['e', 'ɛ', 'ə'],
+            'front_open': ['æ', 'a'],
+            # Central vowels: ə, ʌ, ɜ
+            'central': ['ə', 'ʌ', 'ɜ', 'ɐ'],
+            # R-colored: ɝ, ɚ
+            'r_colored': ['ɝ', 'ɚ', 'ɻ'],
+            # Back vowels: u, ʊ, o, ɔ, ɑ, ɒ
+            'back_close': ['u', 'ʊ'],
+            'back_mid': ['o', 'ɔ'],
+            'back_open': ['ɑ', 'ɒ']
+        }
+        
+        # Diphthongs
+        diphthongs = {
+            'diphthong_a': ['aɪ', 'aj'],
+            'diphthong_o': ['ɔɪ', 'oj'],
+            'diphthong_au': ['aʊ', 'aw']
+        }
+        
+        # Clean the phoneme for comparison
+        clean_phoneme = phoneme.lower().strip()
+        
+        # Check consonants
+        for group, phonemes in consonant_features.items():
+            if any(clean_phoneme == p or clean_phoneme.startswith(p) for p in phonemes):
+                if group == 'bilabial':
+                    return 21  # p, b, m
+                elif group == 'labiodental':
+                    return 18  # f, v
+                elif group == 'dental':
+                    if clean_phoneme == 'ð' or clean_phoneme == 'dh':
+                        return 17  # ð
+                    else:
+                        return 19  # θ with alveolar stops
+                elif group == 'alveolar_stop' or group == 'alveolar_fricative':
+                    if clean_phoneme in ['s', 'z']:
+                        return 15  # s, z
+                    else:
+                        return 19  # t, d, n, θ
+                elif group == 'alveolar_liquid':
+                    return 14  # l
+                elif group == 'postalveolar':
+                    return 16  # ʃ, ʒ, tʃ, dʒ
+                elif group == 'retroflex':
+                    return 13  # ɹ
+                elif group == 'palatal':
+                    return 6   # j with front vowels
+                elif group == 'velar':
+                    if clean_phoneme == 'w':
+                        return 7   # w with /u/
+                    else:
+                        return 20  # k, g, ŋ
+                elif group == 'glottal':
+                    return 12  # h
+        
+        # Check vowels
+        for group, phonemes in vowel_features.items():
+            if any(clean_phoneme == p or clean_phoneme.startswith(p) for p in phonemes):
+                if group == 'front_close' or group == 'palatal':
+                    return 6   # i, ɪ, j
+                elif group == 'front_mid':
+                    return 4   # ɛ, e
+                elif group == 'front_open':
+                    return 1   # æ, a
+                elif group == 'central':
+                    return 1   # ə, ʌ
+                elif group == 'r_colored':
+                    return 5   # ɝ
+                elif group == 'back_close':
+                    return 7   # u, ʊ
+                elif group == 'back_mid':
+                    return 8   # o, ɔ
+                elif group == 'back_open':
+                    return 2   # ɑ
+        
+        # Check diphthongs
+        for group, phonemes in diphthongs.items():
+            if any(clean_phoneme == p or clean_phoneme.startswith(p) for p in phonemes):
+                if group == 'diphthong_a':
+                    return 11  # aɪ
+                elif group == 'diphthong_o':
+                    return 10  # ɔɪ
+                elif group == 'diphthong_au':
+                    return 9   # aʊ
+        
+        # Raise an error if we can't categorize the phoneme
+        raise ValueError(f"Could not map phoneme '{phoneme}' to any viseme category")
+
+# Add this class after the LipReadingEvaluator class, before the main() function
+
+class ModelComparator:
+    """
+    Class for comparing the performance of two different models on visual speech recognition tasks.
+    Takes in two JSON files containing evaluation results and creates comparison visualizations.
+    """
+    
+    def __init__(self, json_file1, json_file2, model1_name=None, model2_name=None):
+        """
+        Initialize the ModelComparator with two JSON result files
+        
+        Parameters:
+        - json_file1: Path to the first model's JSON results file
+        - json_file2: Path to the second model's JSON results file
+        - model1_name: Name to use for the first model (default: derived from filename)
+        - model2_name: Name to use for the second model (default: derived from filename)
+        """
+        self.json_file1 = json_file1
+        self.json_file2 = json_file2
+        
+        # Set model names based on filenames if not provided
+        if model1_name is None:
+            self.model1_name = os.path.basename(os.path.dirname(json_file1))
+        else:
+            self.model1_name = model1_name
+            
+        if model2_name is None:
+            self.model2_name = os.path.basename(os.path.dirname(json_file2))
+        else:
+            self.model2_name = model2_name
+        
+        # Load data from JSON files
+        self.load_data()
+    
+    def load_data(self):
+        """Load data from the JSON files"""
+        try:
+            # Load summary data
+            with open(self.json_file1, 'r') as f:
+                data1 = json.load(f)
+                
+            with open(self.json_file2, 'r') as f:
+                data2 = json.load(f)
+            
+            # Initialize summary dictionaries
+            self.summary1 = {}
+            self.summary2 = {}
+            self.examples1 = []
+            self.examples2 = []
+            
+            # Check if this is a hypo-xxxxx.json file (contains 'ref' and 'hypo' arrays)
+            # or a summary.json file (contains metrics directly)
+            if 'ref' in data1 and 'hypo' in data1:
+                # This is a hypothesis file with references and hypotheses
+                print(f"Detected hypothesis file format. Processing examples...")
+                
+                # Extract references and hypotheses
+                refs1 = data1.get('ref', [])
+                hyps1 = data1.get('hypo', [])
+                utt_ids1 = data1.get('utt_id', [])
+                
+                refs2 = data2.get('ref', [])
+                hyps2 = data2.get('hypo', [])
+                utt_ids2 = data2.get('utt_id', [])
+                
+                # Make sure we have matching references and hypotheses
+                if len(refs1) != len(hyps1) or len(refs2) != len(hyps2):
+                    print(f"Warning: Mismatch in number of references and hypotheses")
+                
+                # Create examples for each model
+                for i in range(min(len(refs1), len(hyps1))):
+                    utt_id = utt_ids1[i] if i < len(utt_ids1) else f"example_{i}"
+                    self.examples1.append({
+                        'reference': refs1[i],
+                        'hypothesis': hyps1[i],
+                        'utt_id': utt_id
+                    })
+                
+                for i in range(min(len(refs2), len(hyps2))):
+                    utt_id = utt_ids2[i] if i < len(utt_ids2) else f"example_{i}"
+                    self.examples2.append({
+                        'reference': refs2[i],
+                        'hypothesis': hyps2[i],
+                        'utt_id': utt_id
+                    })
+                
+                # Calculate metrics for both models
+                self._calculate_metrics_from_examples()
+                
+            else:
+                # This is a summary.json file
+                self.summary1 = data1
+                self.summary2 = data2
+                
+                # Check if we have examples data
+                if 'examples' in self.summary1:
+                    self.examples1 = self.summary1['examples']
+                
+                if 'examples' in self.summary2:
+                    self.examples2 = self.summary2['examples']
+            
+            print(f"Loaded data from {self.json_file1} and {self.json_file2}")
+            print(f"Model 1: {len(self.examples1)} examples, Model 2: {len(self.examples2)} examples")
+            
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            self.summary1 = {}
+            self.summary2 = {}
+            self.examples1 = []
+            self.examples2 = []
+    
+    def _calculate_metrics_from_examples(self):
+        """Calculate metrics from examples when using hypothesis files"""
+        try:
+            # Calculate metrics for model 1
+            self._calculate_model_metrics(self.examples1, self.summary1)
+            
+            # Calculate metrics for model 2
+            self._calculate_model_metrics(self.examples2, self.summary2)
+            
+        except Exception as e:
+            print(f"Error calculating metrics: {e}")
+    
+    def _calculate_model_metrics(self, examples, summary):
+        """Calculate metrics for a single model from its examples"""
+        if not examples:
+            return
+        
+        # Extract references and hypotheses
+        references = [ex['reference'] for ex in examples]
+        hypotheses = [ex['hypothesis'] for ex in examples]
+        
+        # Calculate Character Error Rate (CER)
+        total_chars = sum(len(ref) for ref in references)
+        char_errors = sum(nltk.edit_distance(ref, hyp) for ref, hyp in zip(references, hypotheses))
+        cer = char_errors / total_chars if total_chars > 0 else 0
+        summary['cer'] = cer
+        
+        # Calculate Word Error Rate (WER)
+        ref_words = [ref.split() for ref in references]
+        hyp_words = [hyp.split() for hyp in hypotheses]
+        total_words = sum(len(words) for words in ref_words)
+        word_errors = sum(nltk.edit_distance(ref, hyp) for ref, hyp in zip(ref_words, hyp_words))
+        wer = word_errors / total_words if total_words > 0 else 0
+        summary['wer'] = wer
+        
+        # Calculate word similarity (using SequenceMatcher)
+        word_similarities = [SequenceMatcher(None, ref, hyp).ratio() for ref, hyp in zip(references, hypotheses)]
+        summary['word_similarity'] = float(np.mean(word_similarities))
+        
+        try:
+            # Calculate METEOR score
+            meteor_scores = []
+            for ref, hyp in zip(references, hypotheses):
+                ref_tokens = [ref.split()]  # METEOR expects a list of reference tokenized sentences
+                hyp_tokens = hyp.split()
+                score = meteor_score.meteor_score(ref_tokens, hyp_tokens)
+                meteor_scores.append(score)
+            summary['meteor_score'] = float(np.mean(meteor_scores))
+        except Exception as e:
+            print(f"Warning: Could not calculate METEOR score: {e}")
+            summary['meteor_score'] = 0.0
+        
+        try:
+            # Calculate ROUGE scores
+            scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+            rouge1_scores = []
+            rouge2_scores = []
+            rougeL_scores = []
+            for ref, hyp in zip(references, hypotheses):
+                scores = scorer.score(ref, hyp)
+                rouge1_scores.append(scores['rouge1'].fmeasure)
+                rouge2_scores.append(scores['rouge2'].fmeasure)
+                rougeL_scores.append(scores['rougeL'].fmeasure)
+            summary['rouge1_score'] = float(np.mean(rouge1_scores))
+            summary['rouge2_score'] = float(np.mean(rouge2_scores))
+            summary['rougeL_score'] = float(np.mean(rougeL_scores))
+        except Exception as e:
+            print(f"Warning: Could not calculate ROUGE scores: {e}")
+            summary['rouge1_score'] = 0.0
+            summary['rouge2_score'] = 0.0
+            summary['rougeL_score'] = 0.0
+        
+        try:
+            # Calculate BLEU scores
+            smoothie = SmoothingFunction().method1
+            # Sentence BLEU
+            sentence_bleu_scores = []
+            for ref, hyp in zip(references, hypotheses):
+                ref_tokens = [ref.split()]
+                hyp_tokens = hyp.split()
+                if not hyp_tokens or not ref_tokens[0]:
+                    continue
+                score = sentence_bleu(ref_tokens, hyp_tokens, smoothing_function=smoothie)
+                sentence_bleu_scores.append(score)
+            summary['sentence_bleu_score'] = float(np.mean(sentence_bleu_scores) * 100)
+            
+            # Corpus BLEU
+            tokenized_refs = [[r.split()] for r in references]
+            tokenized_hyps = [h.split() for h in hypotheses]
+            corpus_bleu_score = corpus_bleu(tokenized_refs, tokenized_hyps, smoothing_function=smoothie)
+            summary['corpus_bleu_score'] = float(corpus_bleu_score * 100)
+        except Exception as e:
+            print(f"Warning: Could not calculate BLEU scores: {e}")
+            summary['sentence_bleu_score'] = 0.0
+            summary['corpus_bleu_score'] = 0.0
+        
+        try:
+            # Calculate BERTScore
+            P, R, F1 = bert_score.score(hypotheses, references, lang="en", verbose=False)
+            summary['bertscore_precision'] = float(torch.mean(P).item())
+            summary['bertscore_recall'] = float(torch.mean(R).item())
+            summary['bertscore_f1'] = float(torch.mean(F1).item())
+        except Exception as e:
+            print(f"Warning: Could not calculate BERTScore: {e}")
+            summary['bertscore_precision'] = 0.0
+            summary['bertscore_recall'] = 0.0
+            summary['bertscore_f1'] = 0.0
+        
+        try:
+            # Calculate Semantic similarity
+            semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+            ref_embeddings = semantic_model.encode(references)
+            hyp_embeddings = semantic_model.encode(hypotheses)
+            
+            # Compute cosine similarity
+            semantic_similarities = []
+            for i in range(len(references)):
+                ref_emb = ref_embeddings[i]
+                hyp_emb = hyp_embeddings[i]
+                similarity = np.dot(ref_emb, hyp_emb) / (np.linalg.norm(ref_emb) * np.linalg.norm(hyp_emb))
+                semantic_similarities.append(similarity)
+            
+            summary['semantic_similarity'] = float(np.mean(semantic_similarities))
+            
+            # Calculate Semantic WER (simple approximation)
+            semantic_wer = 1.0 - summary['semantic_similarity']
+            summary['semantic_wer'] = float(semantic_wer)
+        except Exception as e:
+            print(f"Warning: Could not calculate semantic metrics: {e}")
+            summary['semantic_similarity'] = 0.0
+            summary['semantic_wer'] = 0.0
+        
+        # Add viseme alignment score and phonetic edit distance calculation
+        try:
+            print("Calculating viseme alignment and phonetic edit distance metrics...")
+            evaluator = LipReadingEvaluator()
+            
+            viseme_scores = []
+            phonetic_distances = []
+            
+            # Process each example pair
+            for ref, hyp in zip(references, hypotheses):
+                if not ref or not hyp:
+                    continue
+                    
+                # Calculate metrics using LipReadingEvaluator
+                results = evaluator.evaluate_pair(ref, hyp)
+                
+                # Extract scores
+                if 'viseme_alignment_score' in results:
+                    viseme_scores.append(results['viseme_alignment_score'])
+                
+                if 'phonetic_edit_distance' in results:
+                    phonetic_distances.append(results['phonetic_edit_distance'])
+            
+            # Calculate average scores if we have enough data
+            if viseme_scores:
+                summary['viseme_alignment_score'] = float(np.mean(viseme_scores))
+            else:
+                summary['viseme_alignment_score'] = 0.0
+                
+            if phonetic_distances:
+                summary['phonetic_edit_distance'] = float(np.mean(phonetic_distances))
+            else:
+                summary['phonetic_edit_distance'] = 0.0
+                
+        except Exception as e:
+            print(f"Warning: Could not calculate viseme and phonetic metrics: {e}")
+            import traceback
+            traceback.print_exc()
+            summary['viseme_alignment_score'] = 0.0
+            summary['phonetic_edit_distance'] = 0.0
+    
+    def create_comparison_plots(self, output_dir):
+        """
+        Create all comparison plots and save them to the output directory
+        
+        Parameters:
+        - output_dir: Directory to save visualizations
+        
+        Returns:
+        - Dictionary with paths to created visualizations
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"\nCreating model comparison visualizations in: {output_dir}")
+        
+        # Dictionary to store visualization paths
+        viz_files = {}
+        
+        # 1. Error Rate Comparison Bar Chart
+        viz_files['error_rates'] = self.plot_error_rate_comparison(output_dir)
+        
+        # 2. Per-Example Performance Scatter (if we have example data)
+        if self.examples1 and self.examples2:
+            viz_files['performance_scatter'] = self.plot_performance_scatter(output_dir)
+        
+        # 3. Confusion Matrix Difference (if available in data)
+        if all(key in self.summary1 for key in ['confusion_matrix', 'viseme_classes']) and \
+           all(key in self.summary2 for key in ['confusion_matrix', 'viseme_classes']):
+            viz_files['confusion_diff'] = self.plot_confusion_matrix_difference(output_dir)
+        
+        # 4. Word Error Analysis
+        viz_files['word_error'] = self.plot_word_error_analysis(output_dir)
+        
+        # 5. Length-Based Performance Curves (if we have example data)
+        if self.examples1 and self.examples2:
+            viz_files['length_curves'] = self.plot_length_performance_curves(output_dir)
+        
+        # Create comparison summary
+        viz_files['summary'] = self.generate_comparison_summary(output_dir)
+        
+        return viz_files
+    
+    def plot_error_rate_comparison(self, output_dir):
+        """
+        Create bar chart comparing error rates between models
+        
+        Parameters:
+        - output_dir: Directory to save visualization
+        
+        Returns:
+        - Path to saved visualization
+        """
+        try:
+            # Define metrics to compare (lower is better)
+            lower_better_metrics = [
+                ('wer', 'Word Error Rate'),
+                ('cer', 'Character Error Rate'),
+                ('semantic_wer', 'Semantic WER'),
+                ('phonetic_edit_distance', 'Phonetic Edit Distance')
+            ]
+            
+            # Define metrics to compare (higher is better)
+            higher_better_metrics = [
+                ('bertscore_f1', 'BERTScore F1'),
+                ('semantic_similarity', 'Semantic Similarity'),
+                ('word_similarity', 'Word Similarity'),
+                ('viseme_alignment_score', 'Viseme Alignment Score'),
+                ('meteor_score', 'METEOR Score'),
+                ('rouge1_score', 'ROUGE-1'),
+                ('sentence_bleu_score', 'BLEU Score')
+            ]
+            
+            # Create figure with subplots for each metric type
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 8))
+            
+            # Plot metrics where lower is better
+            self._plot_metrics_group(ax1, lower_better_metrics, 'Error Rates (Lower is Better)')
+            
+            # Plot metrics where higher is better
+            self._plot_metrics_group(ax2, higher_better_metrics, 'Similarity Scores (Higher is Better)')
+            
+            # Add overall title
+            fig.suptitle(f'Model Comparison: {self.model1_name} vs. {self.model2_name}', fontsize=16)
+            
+            plt.tight_layout()
+            
+            # Save figure
+            output_file = os.path.join(output_dir, 'error_rate_comparison.png')
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"Error creating error rate comparison: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _plot_metrics_group(self, ax, metrics, title):
+        """Helper method to plot a group of metrics on an axis"""
+        # Get values for each metric
+        labels = []
+        model1_values = []
+        model2_values = []
+        
+        for metric_key, metric_name in metrics:
+            # Only include metrics that exist in both summaries
+            if metric_key in self.summary1 and metric_key in self.summary2:
+                # Extract scalar values only
+                val1 = self.summary1[metric_key]
+                val2 = self.summary2[metric_key]
+                
+                # Skip if not a scalar value
+                if isinstance(val1, (list, dict, np.ndarray)) or isinstance(val2, (list, dict, np.ndarray)):
+                    continue
+                    
+                labels.append(metric_name)
+                model1_values.append(val1)
+                model2_values.append(val2)
+        
+        if not labels:
+            ax.text(0.5, 0.5, "No metrics available", ha='center', va='center')
+            ax.set_title(title)
+            return
+        
+        # Convert to numpy arrays to ensure consistent types
+        model1_values = np.array(model1_values)
+        model2_values = np.array(model2_values)
+        
+        # Set width of bars
+        bar_width = 0.35
+        x = np.arange(len(labels))
+        
+        # Create bars
+        ax.bar(x - bar_width/2, model1_values, bar_width, label=self.model1_name, color='royalblue')
+        ax.bar(x + bar_width/2, model2_values, bar_width, label=self.model2_name, color='darkorange')
+        
+        # Add labels and legend
+        ax.set_title(title)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha='right')
+        ax.legend()
+        
+        # Add value labels on bars
+        for i, v in enumerate(model1_values):
+            ax.text(i - bar_width/2, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+        
+        for i, v in enumerate(model2_values):
+            ax.text(i + bar_width/2, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    def plot_performance_scatter(self, output_dir):
+        """
+        Create a scatter plot showing performance on individual examples
+        
+        Parameters:
+        - output_dir: Directory to save visualization
+        
+        Returns:
+        - Path to saved visualization
+        """
+        try:
+            # Need examples for both models
+            if not self.examples1 or not self.examples2:
+                print("Warning: Not enough example data for performance scatter plot")
+                return None
+                
+            # Check for minimum number of examples
+            min_examples = 5
+            if len(self.examples1) < min_examples or len(self.examples2) < min_examples:
+                print(f"Warning: Need at least {min_examples} examples for meaningful performance scatter")
+                print(f"Found: Model 1: {len(self.examples1)}, Model 2: {len(self.examples2)}")
+                return None
+            
+            # Calculate scores for each example if not already present
+            # Use word similarity as our metric since it's less expensive than semantic metrics
+            scores1 = []
+            scores2 = []
+            references = []
+            
+            # We need matching references, so build a common set
+            common_refs = {}
+            
+            # First build dictionary of utt_id -> reference and scores
+            for ex in self.examples1:
+                if 'utt_id' in ex and 'reference' in ex and 'hypothesis' in ex:
+                    utt_id = ex['utt_id']
+                    ref = ex['reference']
+                    hyp = ex['hypothesis']
+                    
+                    # Calculate similarity score if not already present
+                    if 'word_similarity' not in ex:
+                        score = SequenceMatcher(None, ref, hyp).ratio()
+                    else:
+                        score = ex['word_similarity']
+                        
+                    common_refs[utt_id] = {
+                        'reference': ref,
+                        'model1_score': score,
+                        'model1_hyp': hyp
+                    }
+            
+            # Now match with model 2 and keep only common references
+            for ex in self.examples2:
+                if 'utt_id' in ex and 'reference' in ex and 'hypothesis' in ex:
+                    utt_id = ex['utt_id']
+                    if utt_id in common_refs:
+                        ref = ex['reference']
+                        hyp = ex['hypothesis']
+                        
+                        # Calculate similarity score if not already present
+                        if 'word_similarity' not in ex:
+                            score = SequenceMatcher(None, ref, hyp).ratio()
+                        else:
+                            score = ex['word_similarity']
+                            
+                        common_refs[utt_id]['model2_score'] = score
+                        common_refs[utt_id]['model2_hyp'] = hyp
+            
+            # Keep only entries that have both model scores
+            valid_examples = [
+                item for item in common_refs.values() 
+                if 'model1_score' in item and 'model2_score' in item
+            ]
+            
+            # Extract scores
+            if not valid_examples:
+                print("Warning: No matching examples between models. Cannot create performance scatter.")
+                return None
+                
+            scores1 = [item['model1_score'] for item in valid_examples]
+            scores2 = [item['model2_score'] for item in valid_examples]
+            references = [item['reference'] for item in valid_examples]
+            
+            # Create scatter plot
+            plt.figure(figsize=(10, 10))
+            plt.scatter(scores1, scores2, alpha=0.6)
+            
+            # Add diagonal line
+            max_score = max(max(scores1), max(scores2)) if scores1 and scores2 else 1.0
+            plt.plot([0, max_score], [0, max_score], 'r--')
+            
+            # Add labels and title
+            plt.xlabel(f'{self.model1_name} Score')
+            plt.ylabel(f'{self.model2_name} Score')
+            plt.title(f'Per-Example Performance Comparison')
+            
+            # Count points above/below diagonal
+            better1 = sum(1 for a, b in zip(scores1, scores2) if a > b)
+            better2 = sum(1 for a, b in zip(scores1, scores2) if b > a)
+            equal = sum(1 for a, b in zip(scores1, scores2) if a == b)
+            
+            # Add annotated regions
+            plt.annotate(f'{self.model1_name} better\n({better1} examples)', 
+                       xy=(0.75, 0.25), xycoords='axes fraction',
+                       ha='center', va='center', fontsize=12)
+            
+            plt.annotate(f'{self.model2_name} better\n({better2} examples)', 
+                       xy=(0.25, 0.75), xycoords='axes fraction',
+                       ha='center', va='center', fontsize=12)
+            
+            # Add stats in the corner
+            avg_diff = np.mean([a - b for a, b in zip(scores1, scores2)])
+            plt.figtext(0.02, 0.02, 
+                      f'Average score difference: {avg_diff:.4f}\n' +
+                      f'Equal performance: {equal} examples',
+                      ha='left', fontsize=10)
+            
+            # Save the figure
+            output_file = os.path.join(output_dir, 'per_example_performance.png')
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"Error creating performance scatter plot: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def plot_confusion_matrix_difference(self, output_dir):
+        """
+        Create a heatmap showing the difference between confusion matrices
+        
+        Parameters:
+        - output_dir: Directory to save visualization
+        
+        Returns:
+        - Path to saved visualization
+        """
+        try:
+            # Get confusion matrices
+            cm1 = np.array(self.summary1['confusion_matrix'])
+            cm2 = np.array(self.summary2['confusion_matrix'])
+            
+            # Get viseme classes
+            classes1 = self.summary1['viseme_classes']
+            classes2 = self.summary2['viseme_classes']
+            
+            # Ensure dimensions match
+            if cm1.shape != cm2.shape or classes1 != classes2:
+                print("Warning: Confusion matrices or classes don't match between models")
+                return None
+            
+            # Calculate the difference (Model1 - Model2)
+            diff_matrix = cm1 - cm2
+            
+            # Create visualization
+            plt.figure(figsize=(12, 10))
+            
+            # Use a diverging colormap centered at 0
+            cmap = plt.cm.RdBu_r
+            
+            # Determine the maximum absolute difference for symmetrical color scaling
+            vmax = max(abs(np.min(diff_matrix)), abs(np.max(diff_matrix)))
+            vmin = -vmax
+            
+            # Create heatmap
+            im = plt.imshow(diff_matrix, cmap=cmap, vmin=vmin, vmax=vmax)
+            
+            # Add colorbar
+            cbar = plt.colorbar(im)
+            cbar.set_label(f'{self.model1_name} - {self.model2_name}')
+            
+            # Add labels and ticks
+            plt.xlabel('Predicted Viseme')
+            plt.ylabel('True Viseme')
+            plt.title('Confusion Matrix Difference')
+            
+            # Set tick labels
+            plt.xticks(range(len(classes1)), classes1, rotation=90)
+            plt.yticks(range(len(classes1)), classes1)
+            
+            # Add text annotations
+            for i in range(len(classes1)):
+                for j in range(len(classes1)):
+                    value = diff_matrix[i, j]
+                    if abs(value) > vmax/10:  # Only show significant differences
+                        text_color = 'white' if abs(value) > vmax/2 else 'black'
+                        plt.text(j, i, f'{value:.1f}', ha='center', va='center', 
+                                color=text_color, fontsize=8)
+            
+            plt.tight_layout()
+            
+            # Save figure
+            output_file = os.path.join(output_dir, 'confusion_matrix_difference.png')
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"Error creating confusion matrix difference: {e}")
+            return None
+    
+    def plot_word_error_analysis(self, output_dir):
+        """
+        Create visualization showing error analysis by word
+        
+        Parameters:
+        - output_dir: Directory to save visualization
+        
+        Returns:
+        - Path to saved visualization
+        """
+        try:
+            # We need at least some examples for both models
+            if not self.examples1 or not self.examples2:
+                print("Warning: Not enough example data for word error analysis")
+                return None
+            
+            # Set a minimum threshold for useful analysis
+            min_examples = 5
+            if len(self.examples1) < min_examples or len(self.examples2) < min_examples:
+                print(f"Warning: Need at least {min_examples} examples for meaningful word error analysis")
+                print(f"Found: Model 1: {len(self.examples1)}, Model 2: {len(self.examples2)}")
+                return None
+                
+            # Extract references and hypotheses
+            refs1 = [ex.get('reference', '') for ex in self.examples1]
+            hyps1 = [ex.get('hypothesis', '') for ex in self.examples1]
+            
+            refs2 = [ex.get('reference', '') for ex in self.examples2]
+            hyps2 = [ex.get('hypothesis', '') for ex in self.examples2]
+            
+            # Get missing words for each model
+            missing_words1 = Counter()
+            missing_words2 = Counter()
+            
+            for ref, hyp in zip(refs1, hyps1):
+                if not ref or not hyp:  # Skip empty examples
+                    continue
+                ref_words = set(ref.lower().split())
+                hyp_words = set(hyp.lower().split())
+                for word in ref_words - hyp_words:
+                    missing_words1[word] += 1
+                    
+            for ref, hyp in zip(refs2, hyps2):
+                if not ref or not hyp:  # Skip empty examples
+                    continue
+                ref_words = set(ref.lower().split())
+                hyp_words = set(hyp.lower().split())
+                for word in ref_words - hyp_words:
+                    missing_words2[word] += 1
+            
+            # If we don't have enough missing words, can't do analysis
+            if len(missing_words1) < 3 or len(missing_words2) < 3:
+                print("Warning: Not enough missed words for word error analysis")
+                return None
+            
+            # Get top N words from each
+            top_n = min(15, max(len(missing_words1), len(missing_words2)))
+            common_words = set([w for w, _ in missing_words1.most_common(top_n)] + 
+                              [w for w, _ in missing_words2.most_common(top_n)])
+            
+            # Create a comparison of these common words
+            words = list(common_words)
+            model1_counts = [missing_words1.get(w, 0) for w in words]
+            model2_counts = [missing_words2.get(w, 0) for w in words]
+            
+            # Create a horizontal bar chart
+            plt.figure(figsize=(12, max(8, len(words) * 0.3)))
+            
+            # Sort by total error count
+            total_counts = [a + b for a, b in zip(model1_counts, model2_counts)]
+            sorted_indices = np.argsort(total_counts)[::-1]  # Descending order
+            
+            words = [words[i] for i in sorted_indices]
+            model1_counts = [model1_counts[i] for i in sorted_indices]
+            model2_counts = [model2_counts[i] for i in sorted_indices]
+            
+            # Limit to top 15 for readability
+            if len(words) > 15:
+                words = words[:15]
+                model1_counts = model1_counts[:15]
+                model2_counts = model2_counts[:15]
+            
+            # Plot horizontal bars
+            y_pos = np.arange(len(words))
+            
+            plt.barh(y_pos - 0.2, model1_counts, 0.4, label=self.model1_name, color='royalblue')
+            plt.barh(y_pos + 0.2, model2_counts, 0.4, label=self.model2_name, color='darkorange')
+            
+            plt.yticks(y_pos, words)
+            plt.xlabel('Number of Errors')
+            plt.title('Most Frequently Missed Words by Model')
+            plt.legend()
+            
+            plt.grid(axis='x', alpha=0.3)
+            plt.tight_layout()
+            
+            # Save figure
+            output_file = os.path.join(output_dir, 'word_error_analysis.png')
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"Error creating word error analysis: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def plot_length_performance_curves(self, output_dir):
+        """
+        Create visualization showing performance by utterance length
+        
+        Parameters:
+        - output_dir: Directory to save visualization
+        
+        Returns:
+        - Path to saved visualization
+        """
+        try:
+            # Need examples for both models
+            if not self.examples1 or not self.examples2:
+                print("Warning: Not enough example data for length performance curves")
+                return None
+                
+            # Check for minimum number of examples
+            min_examples = 10
+            if len(self.examples1) < min_examples or len(self.examples2) < min_examples:
+                print(f"Warning: Need at least {min_examples} examples for meaningful length curves")
+                print(f"Found: Model 1: {len(self.examples1)}, Model 2: {len(self.examples2)}")
+                return None
+            
+            # Group examples by length
+            length_scores1 = defaultdict(list)
+            length_scores2 = defaultdict(list)
+            
+            # Process examples from model 1
+            for ex in self.examples1:
+                if 'reference' in ex and 'hypothesis' in ex:
+                    # Use word similarity as our metric if not already present
+                    if 'word_similarity' not in ex:
+                        score = SequenceMatcher(None, ex['reference'], ex['hypothesis']).ratio()
+                    else:
+                        score = ex['word_similarity']
+                        
+                    length = len(ex['reference'].split())
+                    length_scores1[length].append(score)
+            
+            # Process examples from model 2
+            for ex in self.examples2:
+                if 'reference' in ex and 'hypothesis' in ex:
+                    # Use word similarity as our metric if not already present
+                    if 'word_similarity' not in ex:
+                        score = SequenceMatcher(None, ex['reference'], ex['hypothesis']).ratio()
+                    else:
+                        score = ex['word_similarity']
+                        
+                    length = len(ex['reference'].split())
+                    length_scores2[length].append(score)
+            
+            # Get all lengths that have enough examples
+            min_per_length = 3  # Minimum examples per length bucket
+            all_lengths = sorted(set(
+                length for length, scores in chain(length_scores1.items(), length_scores2.items())
+                if len(scores) >= min_per_length
+            ))
+            
+            if not all_lengths:
+                print("Warning: Not enough examples per length category")
+                return None
+            
+            # Calculate mean and std for each length
+            mean1 = [np.mean(length_scores1.get(l, [])) if length_scores1.get(l, []) else np.nan for l in all_lengths]
+            std1 = [np.std(length_scores1.get(l, [])) if len(length_scores1.get(l, [])) > 1 else 0 for l in all_lengths]
+            mean2 = [np.mean(length_scores2.get(l, [])) if length_scores2.get(l, []) else np.nan for l in all_lengths]
+            std2 = [np.std(length_scores2.get(l, [])) if len(length_scores2.get(l, [])) > 1 else 0 for l in all_lengths]
+            
+            # Count examples for each length
+            counts1 = [len(length_scores1.get(l, [])) for l in all_lengths]
+            counts2 = [len(length_scores2.get(l, [])) for l in all_lengths]
+            
+            # Create visualization
+            plt.figure(figsize=(14, 8))
+            
+            # Plot mean with error bands
+            plt.errorbar(all_lengths, mean1, yerr=std1, fmt='o-', capsize=5, 
+                        label=self.model1_name, color='royalblue')
+            plt.errorbar(all_lengths, mean2, yerr=std2, fmt='s-', capsize=5, 
+                        label=self.model2_name, color='darkorange')
+            
+            # Add count annotations
+            for i, (l, m1, m2, c1, c2) in enumerate(zip(all_lengths, mean1, mean2, counts1, counts2)):
+                if not np.isnan(m1) and c1 > 0:
+                    plt.annotate(f'n={c1}', (l, m1), xytext=(0, 10), 
+                                textcoords='offset points', ha='center', fontsize=8)
+                if not np.isnan(m2) and c2 > 0:
+                    plt.annotate(f'n={c2}', (l, m2), xytext=(0, -20), 
+                                textcoords='offset points', ha='center', fontsize=8)
+            
+            # Add labels and title
+            plt.xlabel('Utterance Length (words)')
+            plt.ylabel('Word Similarity')
+            plt.title('Performance by Utterance Length')
+            plt.legend()
+            
+            # Format axis
+            plt.grid(alpha=0.3)
+            plt.xticks(all_lengths)
+            
+            plt.tight_layout()
+            
+            # Save figure
+            output_file = os.path.join(output_dir, 'length_performance_curves.png')
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"Error creating length performance curves: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def generate_comparison_summary(self, output_dir):
+        """
+        Generate a comparative summary of model performance
+        
+        Parameters:
+        - output_dir: Directory to save summary
+        
+        Returns:
+        - Path to saved summary
+        """
+        try:
+            # Create a summary dictionary
+            comparison = {
+                'model1_name': self.model1_name,
+                'model2_name': self.model2_name,
+                'metrics_comparison': {},
+                'examples_count': len(self.examples1) if self.examples1 else 0,
+                'model1_json': self.json_file1,
+                'model2_json': self.json_file2
+            }
+            
+            # Compare all metrics available in both summaries
+            for key in set(self.summary1.keys()) & set(self.summary2.keys()):
+                # Skip non-numeric values and complex structures
+                if isinstance(self.summary1[key], (int, float)) and isinstance(self.summary2[key], (int, float)):
+                    val1 = self.summary1[key]
+                    val2 = self.summary2[key]
+                    diff = val1 - val2
+                    percent_diff = diff / val2 * 100 if val2 != 0 else 0
+                    
+                    comparison['metrics_comparison'][key] = {
+                        'model1_value': val1,
+                        'model2_value': val2,
+                        'difference': diff,
+                        'percent_difference': percent_diff
+                    }
+            
+            # Save to JSON file
+            output_file = os.path.join(output_dir, 'model_comparison_summary.json')
+            with open(output_file, 'w') as f:
+                json.dump(comparison, f, indent=2)
+            
+            # Also create human-readable text summary
+            text_file = os.path.join(output_dir, 'model_comparison_summary.txt')
+            with open(text_file, 'w') as f:
+                f.write(f"=== Model Comparison: {self.model1_name} vs {self.model2_name} ===\n\n")
+                
+                f.write("Performance Metrics Comparison:\n")
+                f.write("-" * 80 + "\n")
+                f.write(f"{'Metric':<30} | {self.model1_name:<15} | {self.model2_name:<15} | {'Difference':<15} | {'% Diff':<10}\n")
+                f.write("-" * 80 + "\n")
+                
+                for key, values in comparison['metrics_comparison'].items():
+                    better_indicator = ""
+                    
+                    # Determine which model is better (lower is better for error rates)
+                    if key in ['wer', 'cer', 'semantic_wer']:
+                        better_indicator = "↑" if values['difference'] > 0 else "↓"
+                    else:
+                        better_indicator = "↓" if values['difference'] > 0 else "↑"
+                    
+                    f.write(f"{key:<30} | {values['model1_value']:<15.4f} | {values['model2_value']:<15.4f} | {values['difference']:<15.4f} | {values['percent_difference']:<9.2f}% {better_indicator}\n")
+                
+                f.write("-" * 80 + "\n\n")
+                
+                f.write("Summary:\n")
+                # Count metrics where each model is better
+                model1_better = 0
+                model2_better = 0
+                
+                for key, values in comparison['metrics_comparison'].items():
+                    if key in ['wer', 'cer', 'semantic_wer']:
+                        if values['difference'] < 0:
+                            model1_better += 1
+                        elif values['difference'] > 0:
+                            model2_better += 1
+                    else:
+                        if values['difference'] > 0:
+                            model1_better += 1
+                        elif values['difference'] < 0:
+                            model2_better += 1
+                
+                f.write(f"- {self.model1_name} performs better on {model1_better} metrics\n")
+                f.write(f"- {self.model2_name} performs better on {model2_better} metrics\n")
+                
+                # Add overall conclusion
+                if model1_better > model2_better:
+                    f.write(f"\nOverall: {self.model1_name} outperforms {self.model2_name} on the majority of metrics.\n")
+                elif model2_better > model1_better:
+                    f.write(f"\nOverall: {self.model2_name} outperforms {self.model1_name} on the majority of metrics.\n")
+                else:
+                    f.write(f"\nOverall: {self.model1_name} and {self.model2_name} perform similarly across metrics.\n")
+            
+            return text_file
+            
+        except Exception as e:
+            print(f"Error generating comparison summary: {e}")
+            return None
+
 # Update main function to include JSON file processing
 def main():
     evaluator = LipReadingEvaluator()
@@ -2573,6 +3707,15 @@ def main():
     parser.add_argument('--save-features', type=str, help='Save phoneme features to JSON file', default=None)
     parser.add_argument('--max-samples', type=int, help='Maximum number of samples to process', default=None)
     parser.add_argument('--example', action='store_true', help='Run with example data')
+    
+    # Add model comparison arguments
+    parser.add_argument('--compare', action='store_true', help='Compare two models')
+    parser.add_argument('--model1', type=str, help='First model summary.json file')
+    parser.add_argument('--model2', type=str, help='Second model summary.json file')
+    parser.add_argument('--model1-name', type=str, help='Name for the first model', default=None)
+    parser.add_argument('--model2-name', type=str, help='Name for the second model', default=None)
+    parser.add_argument('--comparison-output', type=str, help='Output directory for comparison visualizations', default=None)
+    
     args = parser.parse_args()
     
     # Load custom phoneme features if specified
@@ -2583,8 +3726,39 @@ def main():
     if args.save_features:
         evaluator.save_phoneme_features(args.save_features)
     
+    # Handle model comparison if requested
+    if args.compare:
+        if not args.model1 or not args.model2:
+            print("Error: Both --model1 and --model2 must be specified for comparison")
+            return
+        
+        # Create comparison output directory if not specified
+        if not args.comparison_output:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            args.comparison_output = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                             "plots", f"model_comparison_{timestamp}")
+        
+        # Create model comparator
+        print(f"Comparing models: {args.model1} vs {args.model2}")
+        comparator = ModelComparator(
+            args.model1, 
+            args.model2,
+            model1_name=args.model1_name,
+            model2_name=args.model2_name
+        )
+        
+        # Create comparison visualizations
+        comparison_results = comparator.create_comparison_plots(args.comparison_output)
+        
+        print(f"\nComparison complete. Results saved to: {args.comparison_output}")
+        print("Generated visualizations:")
+        for viz_type, file_path in comparison_results.items():
+            if file_path:
+                print(f"- {viz_type}: {os.path.basename(file_path)}")
+    
     # Process JSON file if provided
-    if args.json:
+    elif args.json:
         results = evaluator.analyze_json_dataset(args.json, args.output, args.max_samples)
         if results:
             print(f"\nAnalysis complete. Output saved to: {results['output_dir']}")

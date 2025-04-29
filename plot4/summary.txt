@@ -1,0 +1,29 @@
+=== Lip Reading Evaluation Dataset Summary ===
+
+Number of examples: 1321
+
+Performance Metrics:
+- Average Viseme Alignment Score: 0.810 ± 0.218 (higher is better)
+- Average Phonetic Edit Distance: 2.809 ± 3.535 (lower is better)
+- Character Error Rate (CER): 0.192 (lower is better)
+- Word Error Rate (WER): 0.282 (lower is better)
+- Semantic WER: 0.229 (lower is better)
+- Semantic Similarity: 0.722 (higher is better)
+
+Text Similarity Metrics:
+- BERTScore Precision: 0.946
+- BERTScore Recall: 0.944
+- BERTScore F1: 0.945
+- Word Similarity: 0.830
+- METEOR Score: 0.703
+- ROUGE-1 Score: 0.737
+- ROUGE-2 Score: 0.634
+- ROUGE-L Score: 0.735
+- Sentence BLEU Score: 54.63
+- Corpus BLEU Score: 62.80
+
+Operation Counts:
+- Match: 34539 (79.6%)
+- Substitute: 5595 (12.9%)
+- Delete: 2339 (5.4%)
+- Insert: 892 (2.1%)
