@@ -1,0 +1,53 @@
+{
+  "num_examples": 1321,
+  "standard": {
+    "avg_viseme_score": 0.8099368992675258,
+    "avg_phonetic_distance": 4.3352733141208315,
+    "avg_phonetic_score": 0.8534799805275776
+  },
+  "weighted": {
+    "avg_viseme_score": 0.8728191383615798,
+    "avg_phonetic_distance": 4.3352733141208315,
+    "avg_phonetic_score": 0.8534799805275776
+  },
+  "comparison": {
+    "avg_viseme_score_difference": 0.06288223909405388,
+    "max_viseme_score_improvement": 0.47408346265918455,
+    "avg_phonetic_score_difference": 0.0,
+    "max_phonetic_score_improvement": 0.0,
+    "percent_viseme_improved": 55.8667676003028,
+    "percent_viseme_unchanged": 44.1332323996972,
+    "percent_viseme_worse": 0.0,
+    "percent_phonetic_improved": 0.0,
+    "percent_phonetic_unchanged": 100.0,
+    "percent_phonetic_worse": 0.0
+  },
+  "additional_metrics": {
+    "character_error_rate": 0.19244221105527637,
+    "word_error_rate": 0.28220424671385236,
+    "word_similarity": 0.8297555651941033,
+    "meteor_score": 0.7029536899079083,
+    "rouge1_score": 0.7365763697921454,
+    "rouge2_score": 0.6337104182576216,
+    "rougeL_score": 0.7353403196861366,
+    "sentence_bleu_score": 0.5462958410594128,
+    "bertscore_precision": 0.9464149475097656,
+    "bertscore_recall": 0.9443050622940063,
+    "bertscore_f1": 0.9453012347221375,
+    "semantic_similarity": 0.7218796317187123,
+    "semantic_wer": 0.2781203682812877
+  },
+  "character_error_rate": 0.19244221105527637,
+  "word_error_rate": 0.28220424671385236,
+  "word_similarity": 0.8297555651941033,
+  "meteor_score": 0.7029536899079083,
+  "rouge1_score": 0.7365763697921454,
+  "rouge2_score": 0.6337104182576216,
+  "rougeL_score": 0.7353403196861366,
+  "sentence_bleu_score": 0.5462958410594128,
+  "bertscore_precision": 0.9464149475097656,
+  "bertscore_recall": 0.9443050622940063,
+  "bertscore_f1": 0.9453012347221375,
+  "semantic_similarity": 0.7218796317187123,
+  "semantic_wer": 0.2781203682812877
+}
