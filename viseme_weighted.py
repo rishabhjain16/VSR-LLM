@@ -1187,7 +1187,7 @@ class WeightedLipReadingEvaluator(LipReadingEvaluator):
         
         # Create confusion matrices
         if std_substitutions and all_visemes:
-            # Standard approach matrix
+            # Standard approach matrix   
             std_true, std_pred = zip(*std_substitutions)
             std_cm = confusion_matrix(std_true, std_pred, labels=all_visemes)
             std_cm_norm = std_cm.astype('float') / std_cm.sum(axis=1)[:, np.newaxis]
