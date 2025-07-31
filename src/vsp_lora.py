@@ -20,6 +20,8 @@ MODEL_TYPE_TO_TARGET_MODULES = {
     'phi3': ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
     'falcon': ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
     'qwen': ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    'qwen2_5_vl': ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    'vision2seq': ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], 
     'gpt_neox': ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
     'gptj': ["q_proj", "v_proj", "k_proj", "out_proj", "fc_in", "fc_out"],
     'mpt': ["Wqkv", "out_proj", "fc1", "fc2"],
@@ -71,6 +73,16 @@ def get_target_modules(model_or_type: Union[str, PreTrainedModel], verbose: bool
         # Get model type
         if hasattr(model_or_type, 'config') and hasattr(model_or_type.config, 'model_type'):
             model_type = model_or_type.config.model_type.lower()
+            
+            # Special case for vision-language models
+            if model_type == "vision2seq" or "qwen" in model_type and "vl" in model_type:
+                if verbose:
+                    logger.info(f"Detected vision-language model type: {model_type}")
+                # Use vision2seq modules or qwen_vl specific ones if available
+                if "qwen" in model_type and "vl" in model_type:
+                    return MODEL_TYPE_TO_TARGET_MODULES.get("qwen2_5_vl", MODEL_TYPE_TO_TARGET_MODULES["vision2seq"])
+                else:
+                    return MODEL_TYPE_TO_TARGET_MODULES["vision2seq"]
             
             # Check if we have predefined target modules for this model type
             if model_type in MODEL_TYPE_TO_TARGET_MODULES:

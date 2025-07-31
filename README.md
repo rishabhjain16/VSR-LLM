@@ -68,12 +68,6 @@ The code will automatically:
 - `llama`: LLaMA, LLaMA-2, LLaMA-3 models
 - `mistral`: Mistral models
 - `vicuna`: Vicuna models
-- `falcon`: Falcon models
-- `mpt`: MPT models
-- `bloom`: BLOOM models
-- `opt`: OPT models
-- `gpt-neox`: GPT-NeoX models
-- `gpt2`: GPT-2 models
 
 ## Data preprocessing
 Follow [Auto-AVSR preparation](https://github.com/mpc001/auto_avsr/tree/main/preparation) to preprocess the LRS3 dataset.\

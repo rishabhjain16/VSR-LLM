@@ -322,6 +322,12 @@ def _main(cfg, output_file):
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.override.llm_ckpt_path
     )
+    
+    # Set padding side to 'left' for Qwen models as required
+    is_qwen_model = 'qwen' in cfg.override.llm_ckpt_path.lower()
+    if is_qwen_model:
+        logger.info("Setting tokenizer padding_side to 'left' for Qwen model")
+        tokenizer.padding_side = 'left'
 
     # # Ensure the pad token exists; if not, add it
     # if tokenizer.pad_token is None:
@@ -403,7 +409,7 @@ def _main(cfg, output_file):
             model.half()
 
     # Load dataset (possibly sharded)
-    cfg.dataset.batch_size = 2
+    cfg.dataset.batch_size = 4
     cfg.dataset.max_tokens = 2000
     itr = task.get_batch_iterator(
         dataset=task.dataset(cfg.dataset.gen_subset),
@@ -475,6 +481,7 @@ def _main(cfg, output_file):
         # Get CTC emissions if enabled
         ctc_decoded = []
         if hasattr(model, 'cfg') and model.cfg.use_ctc:
+            model.cfg.use_ctc = False   #FORCE CTC OFF
             output = model.encoder(**sample["net_input"])
             
             # Ensure CTC head projector is on the same device as features
