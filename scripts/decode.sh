@@ -13,12 +13,11 @@ MODEL_SRC=${ROOT}/src
 
 # Set the path to your Llama 3 model here
 #LLM_PATH=${ROOT}/checkpoints/vicuna-7b-v1.5    # path to vicuna checkpoint
-LLM_PATH=${ROOT}/checkpoints/Qwen2.5-VL-7B-Instruct
+LLM_PATH=${ROOT}/checkpoints/Llama-3.2-1B
 #LLM_PATH=${ROOT}/checkpoints/Meta-Llama-3-8B    # path to Llama 3 model
 
-DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data     # path to test dataset dir
-#DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_clean/data_lrs2
-#DATA_ROOT=/home/rishabh/Desktop/Datasets/test_lrs2/lrs2/lrs2_video_seg16s/data_lrs2
+# DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data     # path to test dataset dir
+DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/WildVSR/test_data
 
 # Note: For different models, you may need to manually modify:
@@ -28,18 +27,13 @@ DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs3/433h_data     # path to test datas
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/test_lrs2/lrs2/lrs2_video_seg16s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2/auto/lrs2/lrs2_video_seg24s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
-
-MODEL_PATH=/home/rishabh/Desktop/Experiments/VSR-LLM/checkpoints/trained/Qwen2.5-VL-7B-Instruct_lrs3_linear/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
-#MODEL_PATH=${ROOT}/checkpoints/OG/checkpoint_finetune.pt
+#MODEL_PATH=/home/rishabh/Desktop/Experiments/fixing_VSRLLM/VSR-LLM/checkpoints/llama3.2_1b_lrs2/4bit_freeze/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
+MODEL_PATH=/home/rishabh/Desktop/Experiments/fixing_VSRLLM/VSR-LLM/checkpoints/llama3.2_1b_lrs2/4bit_freeze_new/checkpoints/checkpoint_7_30000.pt
 #MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
 #MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
-##MODEL_PATH=/home/rjain/experiments/VSR-LLM/checkpoints/checkpoint_finetune.pt
-#MODEL_PATH=/home/rjain/experiments/VSR-LLM/checkpoints/checkpoint_vicuna_lrs3_50k.pt
-#MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_l3Prompt/checkpoints/checkpoint_best.pt
-#MODEL_PATH=/home/rishabh/Desktop/Experiments/VSP-LLM/output_ckps/output_AV_VOX_433_with_Llama-3.2-1B_Training2_lrs3_70000updates_UnordodoxPromptNew_bs4/checkpoints/checkpoint_best.pt
 
 
-OUT_PATH=${ROOT}/checkpoints/decode/decode_Qwen2.5-VL-7B-Instruct  # output path to save results
+OUT_PATH=${ROOT}/checkpoints/decode/decode_Llama-3.2-1B_4bit_freeze_new_L2_L2  # output path to save results
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test_mytrained_lora_32
 #OUT_PATH=${ROOT}/checkpoints/decode/decode_test
 

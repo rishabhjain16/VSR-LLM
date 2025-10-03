@@ -7,14 +7,16 @@
 
 
 # set variables
-DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data   # path to train dataset dir
+#DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data   # path to train dataset dir
+DATA_PATH=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
 
-OUT_PATH=/home/rishabh/Desktop/Experiments/fixing_VSRLLM/VSR-LLM/checkpoints/trained  # output path to save
+
+OUT_PATH=/home/rishabh/Desktop/Experiments/fixing_VSRLLM/VSR-LLM/checkpoints/llama3.2_1b_lrs2/4bit_freeze_new  # output path to save
 
 ROOT=$(dirname "$(dirname "$(readlink -fm "$0")")")
 SRC=${ROOT}/src
 
-HF_MODEL_ID="meta-llama/Llama-2-7b-hf" # HuggingFace model ID
+HF_MODEL_ID="meta-llama/Llama-3.2-1B" # HuggingFace model ID
 CHECKPOINT_DIR="${ROOT}/checkpoints"
 
 # Check if the model exists locally, if not download it

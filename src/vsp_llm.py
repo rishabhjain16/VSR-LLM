@@ -1212,10 +1212,10 @@ class avhubert_llm_seq2seq_cluster_count(BaseFairseqModel):
         self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
         
         # Log when set_num_updates is called (helps debugging frequency)
-        logger.info(f"set_num_updates called with update {num_updates}, grad_enabled={torch.is_grad_enabled()}")
+        #logger.info(f"set_num_updates called with update {num_updates}, grad_enabled={torch.is_grad_enabled()}")
         
         # Log CTC status (not tied to batch counter to ensure visibility)
-        logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
+        #logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
         
         return self.num_updates
 
@@ -1924,9 +1924,9 @@ class VSP_LLM_With_CTC(avhubert_llm_seq2seq_cluster_count):
         self._use_ctc_in_forward = torch.is_grad_enabled() and self.cfg.use_ctc
         
         # Log when set_num_updates is called (helps debugging frequency)
-        logger.info(f"set_num_updates called with update {num_updates}, grad_enabled={torch.is_grad_enabled()}")
+        #logger.info(f"set_num_updates called with update {num_updates}, grad_enabled={torch.is_grad_enabled()}")
         
         # Log CTC status (not tied to batch counter to ensure visibility)
-        logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
+        #logger.info(f"CTC usage status at update {num_updates}: {self._use_ctc_in_forward} (training={self.training}, grad_enabled={torch.is_grad_enabled()})")
         
         return self.num_updates

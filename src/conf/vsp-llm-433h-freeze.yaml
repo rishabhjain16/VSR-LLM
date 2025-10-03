@@ -32,7 +32,7 @@ task:
   single_target: true
   fine_tuning: true
   stack_order_audio: 4
-  max_sample_size: 500
+  max_sample_size: 1000
   modalities: ["video"]
   image_aug: true
   pad_audio: true
@@ -45,7 +45,7 @@ dataset:
   validate_interval: 1
   train_subset: train
   valid_subset: valid
-  batch_size: 2
+  batch_size: 4
 
 criterion:
   _name: decoder_only_language_modeling_loss

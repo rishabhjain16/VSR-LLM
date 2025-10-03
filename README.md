@@ -1,11 +1,13 @@
-# VSP-LLM (Visual Speech Processing incorporated with LLMs)
+# VSR-LLM (Visual Speech Recognition incorporated with LLMs)
 
 
 ## Introduction
 
-WORK IN PROGRESS
-This code is Forked from: https://github.com/Sally-SH/VSP-LLM
-We are working to update it for specific usecase of using Avhubert for Visucal Speech Recognition
+### WORK IN PROGRESS
+
+This code is Forked from: https://github.com/Sally-SH/VSP-LLM.
+
+We are working to update it for specific usecase of using Avhubert for Visual Speech Recognition
 ## Model checkpoint
 
 You can find checkpoint of our model in [here](https://drive.google.com/drive/folders/1aBnm8XOWlRAGjPwcK2mYEGd8insNCx13?usp=sharing).
@@ -34,7 +36,6 @@ pip install protobuf==3.20
 - Download AV-HuBERT pre-trained model `AV-HuBERT Large (LSR3 + VoxCeleb2)` from [here](http://facebookresearch.github.io/av_hubert).
 - Download your preferred LLM from Hugging Face. The code supports multiple LLMs:
   - LLaMA models: [LLaMA-2-7b](https://huggingface.co/meta-llama/Llama-2-7b-hf), [LLaMA-3](https://huggingface.co/meta-llama/Llama-3-8b-hf)
-  - Mistral models: [Mistral-7B](https://huggingface.co/mistralai/Mistral-7B-v0.1)
   - And other compatible LLMs from Hugging Face
 
 Move the AV-HuBERT pre-trained model checkpoint and the LLM checkpoint to [`checkpoints`](checkpoints/).
@@ -45,29 +46,6 @@ This codebase now supports using different LLMs from Hugging Face. To use a diff
 
 1. Download your preferred LLM from Hugging Face
 2. Specify the LLM type and path in your configuration:
-
-```bash
-# For training
-python train.py ... \
-  --llm-ckpt-path /path/to/your/llm \
-  --llm-type llama3  # or mistral, vicuna, etc.
-
-# For decoding
-python decode.py ... \
-  --llm-ckpt-path /path/to/your/llm \
-  --llm-type llama3  # or mistral, vicuna, etc.
-```
-
-The code will automatically:
-- Detect the appropriate embedding dimensions for the model
-- Configure the tokenizer correctly for the model
-- Set up the right LoRA configuration for fine-tuning
-
-### Supported LLM Types
-
-- `llama`: LLaMA, LLaMA-2, LLaMA-3 models
-- `mistral`: Mistral models
-- `vicuna`: Vicuna models
 
 ## Data preprocessing
 Follow [Auto-AVSR preparation](https://github.com/mpc001/auto_avsr/tree/main/preparation) to preprocess the LRS3 dataset.\
@@ -115,43 +93,5 @@ The test manifest is provided in [`labels`](labels/). You need to replace the pa
 cd src/dataset
 python replace_path.py --lrs3 /path/to/lrs3
 ```
-Then modified test amanifest is saved in [`dataset`](src/dataset/)
+Then modified test manifest is saved in [`dataset`](src/dataset/)
 
-## Training
-
-Open the training script ([`scripts/train.sh`](https://github.com/Sally-SH/VSP-LLM/blob/main/scripts/train.sh)) and replace these variables:
-
-```bash
-# path to train dataset dir
-DATA_PATH=???
-
-# path where output trained models will be located
-OUT_PATH=???
-```
-
-Run the training script:
-
-```bash
-$ bash scripts/train.sh
-```
-
-## Decoding
-
-Open the decoding script ([`scripts/decode.sh`](https://github.com/Sally-SH/VSP-LLM/blob/main/scripts/decode.sh)) and replace these variables:
-
-```bash
-# language direction (e.g 'en' for VSR task / 'en-es' for En to Es VST task)
-LANG=???
-
-# path to the trained model
-MODEL_PATH=???
-
-# path where decoding results and scores will be located
-OUT_PATH=???
-```
-
-Run the decoding script:
-
-```bash
-$ bash scripts/decode.sh
-```
