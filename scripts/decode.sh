@@ -20,17 +20,12 @@ LLM_PATH=${ROOT}/checkpoints/Llama-3.2-1B
 DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/WildVSR/test_data
 
-# Note: For different models, you may need to manually modify:
-# - src/vsp_llm.py: target_modules, lora_r, lora_alpha for the specific model architecture
-# - Default values are set for Llama models and should work with Llama 3
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_clean/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/test_lrs2/lrs2/lrs2_video_seg16s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2/auto/lrs2/lrs2_video_seg24s/data_lrs2
 #DATA_ROOT=/home/rishabh/Desktop/Datasets/lrs2_rf/lrs2/lrs2_video_seg16s/data_lrs2
 #MODEL_PATH=/home/rishabh/Desktop/Experiments/fixing_VSRLLM/VSR-LLM/checkpoints/llama3.2_1b_lrs2/4bit_freeze/checkpoints/checkpoint_best.pt   # path to trained model with Llama 3
 MODEL_PATH=/home/rishabh/Desktop/Experiments/fixing_VSRLLM/VSR-LLM/checkpoints/llama3.2_1b_lrs2/4bit_freeze_new/checkpoints/checkpoint_7_30000.pt
-#MODEL_PATH=${ROOT}/checkpoints/checkpoint_finetune.pt  # path to trained model
-#MODEL_PATH=/home/rijain@ad.mee.tcd.ie/Experiments/vsr-llm/checkpoints/checkpoint_finetune.pt
 
 
 OUT_PATH=${ROOT}/checkpoints/decode/decode_Llama-3.2-1B_4bit_freeze_new_L2_L2  # output path to save results
