@@ -168,6 +168,6 @@ checkpoints/
 decode/
 
 # Ignore everything in scripts/ except train.sh and decode.sh
-scripts/
+scripts/*
 !scripts/train.sh
 !scripts/decode.sh
