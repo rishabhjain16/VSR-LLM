@@ -57,35 +57,6 @@ Follow the steps in [`clustering`](src/clustering/) to create:
 The `label_rate` is the same as the feature frame rate used for clustering,
 which is 25Hz for AV-HuBERT features by default.
 
-### Dataset layout
-
-    .
-    ├── lrs3
-    │     ├── lrs3_video_seg24s               # Preprocessed video and audio data
-    │     └── lrs3_text_seg24s                # Preprocessed text data
-    ├── muavic_dataset                        # Mix of VSR data and VST(En-X) data
-    │     ├── train.tsv                       # List of audio and video path for training
-    │     ├── train.wrd                       # List of target label for training
-    │     ├── train.cluster_counts            # List of clusters to deduplicate speech units in training
-    │     ├── test.tsv                        # List of audio and video path for testing
-    │     ├── test.wrd                        # List of target label for testing
-    │     └── test.cluster_counts             # List of clusters to deduplicate speech units in testing
-    └── test_data
-          ├── vsr
-          │    └── en
-          │        ├── test.tsv 
-          │        ├── test.wrd  
-          │        └── test.cluster_counts           
-          └── vst
-               └── en
-                   ├── es
-                   :   ├── test.tsv
-                   :   ├── test.wrd 
-                   :   └── test.cluster_counts
-                   └── pt
-                       ├── test.tsv
-                       ├── test.wrd 
-                       └── test.cluster_counts
 
 ### Test data
 The test manifest is provided in [`labels`](labels/). You need to replace the path of the LRS3 in the manifest file with your preprocessed LRS3 dataset path using the following command:
