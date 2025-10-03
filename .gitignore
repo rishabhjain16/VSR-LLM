@@ -169,3 +169,4 @@ decode/
 
 scripts/
 *.sh
+/scripts/
